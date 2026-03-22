@@ -1,181 +1,107 @@
-# 内网资产态势感知平台 V1
+# 内网资产态势感知平台项目总览
 
-一个面向测试环境的资产态势感知平台，围绕“发现 -> 识别 -> 校验 -> 修复 -> 观测”闭环构建，提供桌面端控制台、后端任务编排与配套规则治理能力。
+本仓库包含桌面端平台、后端服务和独立 Flutter 移动端两部分，统一服务于“发现 -> 识别 -> 校验 -> 修复 -> 观测”的内网资产态势感知闭环。
 
-## 核心能力
-- 资产发现：CIDR 探测、主机存活识别、端口与服务指纹采集
-- 资产管理：资产台账自动更新、标签管理、详情页纵深分析
-- 信息采集：SSH 授权验证、主机级信息采集与最近采集结果回看
-- 风险识别：规则库匹配、风险分级、热点资产与趋势聚合
-- 漏洞修复：Runner 安装、修复会话编排、任务输出追踪
-- 智能体协同：站内自治助手 Haor，支持页面理解、UI 代理、后端编排与审批控制
-- 平台观测：CPU、内存、磁盘、网络实时指标与统一日志中心
-- 移动配套：发现队列、高危风险与设备异常告警流的移动端总览能力
+## 项目结构
 
-## 目录
-- `backend/` FastAPI + SQLAlchemy + Celery，负责 API、任务编排、规则执行与智能体服务
-- `frontend/` Next.js + Ant Design，提供桌面端控制台与 Haor 前端运行时
-- `infra/` Docker Compose、本地 PostgreSQL 初始化与 settings helper
-- `docs/` 架构、API、数据库与运行说明
+- `situational-awareness/`
+  - 桌面端与平台主工程
+  - 包含 `frontend/`、`backend/`、`infra/`、`docs/`
+- `situational-awareness-mobile/`
+  - 独立 Flutter 移动端工程
+  - 面向值班巡检、现场排障、移动查看与轻量操作
 
-## 技术栈
-- 前端：Next.js 15、React 19、TypeScript、Ant Design 5
-- 后端：FastAPI、SQLAlchemy 2、Celery、Redis、PostgreSQL、Alembic
-- 安全与智能：SSH 凭据加密、规则库、可切换 LLM provider、Haor 站内自治助手
+## 组成说明
 
-## 当前模块
-- 总览页：平台实时监控、发现队列、风险热点资产、风险态势波形
-- 扫描发起台：提交 CIDR 任务，自动进入主机发现、端口与风险校验流水线
-- 资产列表/详情：查看资产、端口、SSH 授权、信息采集和风险发现
-- 修复工作台：资产级修复入口、Runner 安装与修复会话管理
-- 漏洞库：YAML 真源规则检索、导入导出、启停与索引治理
-- 任务中心/日志：任务详情、事件日志、平台运行日志统一查看
-- Haor：全站可调起的站内自治助手，会话、审批、任务状态与流式反馈全链路联动
+### 1. 桌面端平台
+
+桌面端是主控制台，负责承载完整治理链路，适合资产运营、风险研判、任务排查、规则维护和修复编排等重操作场景。
+
+- 前端：Next.js 15 + React 19 + TypeScript + Ant Design 5
+- 后端：FastAPI + SQLAlchemy + Celery + Redis + PostgreSQL
+- 能力范围：
+  - 总览大屏与平台实时监控
+  - 扫描发起台与发现流水线
+  - 资产列表、资产详情、SSH 授权与信息采集
+  - 风险识别、热点资产、风险态势
+  - 修复工作台、Runner 安装、修复会话推进
+  - 漏洞库、规则导入导出、索引治理
+  - 任务中心、日志中心
+  - Haor 站内自治助手
+
+详细说明见：[situational-awareness/README.md](/root/Desktop/Project/situational-awareness/README.md)
+
+### 2. 移动端
+
+移动端不是桌面端的完整复制，而是面向手机场景的“运维分析端”，重点解决离开工位后的快速查看、告警确认、轻量触发和现场联动。
+
+- 技术栈：Flutter + Riverpod + go_router + dio
+- 能力范围：
+  - 登录 / 初始化管理员
+  - 总览、资产、任务、风险、我的
+  - 资产详情、任务详情、风险详情、发现任务详情
+  - `admin` 可见修复工作台
+  - 移动 Haor 助手入口
+  - Android 前台 WebSocket 实时提醒 + 本地通知 + 后台定时同步
+
+详细说明见：[situational-awareness-mobile/README.md](/root/Desktop/Project/situational-awareness-mobile/README.md)
+
+## 桌面端与移动端分工
+
+| 维度 | 桌面端 | 移动端 |
+| --- | --- | --- |
+| 使用场景 | 日常治理、深度分析、运营编排 | 值班巡检、现场排障、碎片化确认 |
+| 主要设备 | PC 浏览器 | Android 手机 / 模拟器 |
+| 复杂操作 | 完整支持 | 仅保留高频轻量入口 |
+| 规则库治理 | 支持 | 不承载 |
+| 漏洞修复编排 | 完整支持 | 仅 `admin` 轻量跟进 |
+| 实时提醒 | 页面内可视化与日志联动 | WebSocket + 本地通知 |
+| Haor | 完整站内自治助手 | 移动端助手入口与会话联动 |
+
+## 联调关系
+
+- 桌面端和移动端默认共用 `situational-awareness/backend` 这套后端
+- 桌面端前端通过 Next.js 代理访问 `/api/v1/*`
+- 移动端通过 `API_BASE_URL` 直连后端 `http://<host>:8000/api/v1`
+- 若桌面端 Docker 已启动，移动端只需连通后端地址即可，不需要额外启动第二套服务
 
 ## 快速开始
-1. 按需修改环境变量文件
-```bash
-vi backend/.env.example
-vi frontend/.env.example
-```
-> 当前 `docker compose` 默认直接读取 `backend/.env.example` 和 `frontend/.env.example`。
 
-2. 启动开发环境
+### 1. 启动桌面端与后端
+
 ```bash
-cd infra
+cd /root/Desktop/Project/situational-awareness/infra
 docker compose up -d --build
 ```
 
-3. 首次访问初始化管理员
-- 打开前端登录页后，若系统尚未初始化，会自动切换到“初始化管理员”表单
-- 初始化成功后会自动登录进入总览页
+启动后默认入口：
 
-4. 访问入口
-- 前端：http://localhost:3000
-- 后端：http://localhost:8000/docs
-- PostgreSQL：`localhost:5432`
-- Redis：`localhost:6379`
-- 前端默认通过 Next.js 代理把 `/api/v1/*` 转发到后端容器，无需手工填写 `NEXT_PUBLIC_API_BASE`
+- 桌面端：http://localhost:3000
+- 后端文档：http://localhost:8000/docs
+- 健康检查：http://localhost:8000/health
 
-## 常用开发命令
-- 启动全部服务：
+### 2. 运行移动端
+
 ```bash
-cd infra
-docker compose up -d --build
-```
-- 查看容器状态：
-```bash
-cd infra
-docker compose ps
-```
-- 查看后端日志：
-```bash
-docker logs -f sa-backend
-```
-- 查看 worker 日志：
-```bash
-docker logs -f sa-worker
-```
-- 停止并移除容器：
-```bash
-cd infra
-docker compose down
+cd /root/Desktop/Project/situational-awareness-mobile
+flutter pub get
+flutter run --dart-define=API_BASE_URL=http://<宿主机局域网IP>:8000/api/v1
 ```
 
-## Docker 开发模式
-- Docker Compose 默认以开发模式启动：
-  - 前端服务使用 `next dev`
-  - 后端服务使用 `uvicorn --reload`
-  - 前后端源码目录都会挂载到容器内，适合本地联调
-- 前端开发容器启动时会自动安装依赖到容器卷，避免宿主机残留的 `node_modules` 污染运行环境
-- 默认访问地址：
-  - 前端开发入口：`http://localhost:3000`
-  - 后端文档：`http://localhost:8000/docs`
-- 前端开发模式会把 `node_modules` 与 `.next` 缓存留在容器卷内，不污染项目目录。
-- 若需要从局域网访问前端开发入口，请在前端环境变量中设置 `NEXT_ALLOWED_DEV_ORIGINS`，填入完整来源列表，例如：
-```bash
-NEXT_ALLOWED_DEV_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://192.168.10.131:3000
-```
-- 如需临时验证生产式前端构建，可额外启动预览入口：
-```bash
-cd infra
-docker compose --profile prod up -d --build frontend-prod
-```
-- 生产式前端预览地址为 `http://localhost:3001`。
+说明：
 
-## Haor 说明
-- Haor 不是普通聊天机器人，而是站内自治助手
-- 前端会为其提供当前页面路由、业务语义、可见动作、表单与 DOM 上下文
-- Haor 可在白名单范围内执行站内 UI 动作，并把结果回传后端继续决策
-- 复杂写操作进入后端编排链，低风险动作可自动推进，高风险动作进入审批
-- `mock` 模式下会保留完整链路，但不会真正执行高风险写动作
+- Android 模拟器同机联调可优先使用 `http://10.0.2.2:8000/api/v1`
+- 真机联调必须使用宿主机局域网地址，不能写 `127.0.0.1`
 
-## 说明
-- 前端用户可见文案默认使用中文；仅保留 `IP / CIDR / CVE / CWE / YAML / JSON / SSH / nmap` 等必要技术缩写。
-- 当前扫描分层执行：
-  - `liveness` 默认模式：`nmap_icmp`
-  - `liveness` 默认命令：`nmap -sn -PE -n -T5 --min-rate 100000 <cidr> -oX -`
-  - 扫描阶段不再发起任何主动 DNS 查询；纯探活阶段默认只返回存活 IP
-  - `full_port_scan` 在 `full` 模式下优先使用 `nmap -Pn -n -T5 --min-rate 100000 --open -p- <ip> -oX -`
-  - `liveness_ports` 仅在 `hybrid` 模式下生效，默认值：`22,80,443,8080,8443`
-  - `service` 服务识别端口默认：`Top1000 TCP 端口 + 自定义重点端口 + 高位后门特征端口`
-  - `high_backdoor` 后门特征高位端口默认：`1337,4444,...,65000`
-- 命中后门特征端口时，平台会跳过版本识别并将版本字段置空，仅保留端口与服务名识别结果。
-- 若运行 `nmap_icmp` 模式时缺少 `nmap`、命令超时或 XML 解析失败，主机发现任务会直接失败，不会静默回退到逐 IP `ping`。
-- 扫描阶段保留的主机名只来自被动证据，例如已有资产主机名、协议探测得到的 `hostname_hint`、TLS 证书或 HTTP 响应中的名称。
-- 本机资产排除不再依赖 hostname 的 DNS 反查；如需稳定排除平台自身，请显式配置 `LOCAL_ASSET_IPS` 或写入 runtime hints。
-- 若容器内可用 `nmap`，低置信、仅端口猜测或缺少产品/版本的端口会自动触发定向 `-sV --version-intensity 7` XML 补扫。
-- `nmap -sV` 与 NSE 默认超时均为 `8` 秒，超时后仅跳过当前富化，不阻塞整轮扫描。
-- 服务识别优先使用被动 banner + 轻量协议探测，当前已覆盖 `ssh/ftp/http/https/redis/mysql/postgresql/smtp/pop3/imap/telnet/memcached/rpcbind/irc/java-rmi/ajp13/rexec/rlogin/rsh`，不足时再回退到 nmap。
-- 扫描端口模式和三类端口都可通过后端环境变量覆盖：
-  - `DISCOVERY_PORTSET_MODE`
-  - `DISCOVERY_TOP_PORTS_LIMIT`
-  - `DISCOVERY_LIVENESS_PORTS`
-  - `DISCOVERY_LIVENESS_MODE`
-  - `DISCOVERY_NMAP_MIN_RATE`
-  - `DISCOVERY_NMAP_LIVENESS_TIMEOUT_SECONDS`
-  - `DISCOVERY_NMAP_FULL_SCAN_TIMEOUT_SECONDS`
-  - `DISCOVERY_NMAP_TIMEOUT_SECONDS`
-  - `DISCOVERY_NSE_TIMEOUT_SECONDS`
-  - `DISCOVERY_SERVICE_PORTS`
-  - `DISCOVERY_HIGH_BACKDOOR_PORTS`
-- `DISCOVERY_PORTSET_MODE` 支持：
-  - `curated`：仅扫描自定义重点端口与高位后门特征端口
-  - `top1000_plus_custom`：默认模式，扫描 Top1000 TCP 端口并叠加自定义重点端口与高位后门特征端口
-  - `full`：扫描 `1-65535`
-- `DISCOVERY_TOP_PORTS_LIMIT` 默认 `1000`。
-- `DISCOVERY_NMAP_VERSION_INTENSITY` 默认 `7`，用于控制 nmap 版本探测强度。
-- 端口配置采用逗号分隔的离散端口列表（例如 `10001,20001,30001,40001,50001`）。
-- 风险规则初始位于 `backend/app/rules/risk_rules.yaml`。
-- 漏洞库页面现支持：
-  - YAML/JSON 规则导入预检与正式导入
-  - 按选中规则或当前筛选条件导出 YAML/JSON
-  - 批量启用/停用规则
-  - 规则索引健康检查与手动重建
-- LLM 默认 `mock`，可通过后端环境变量切换 provider。
-- 扫描任务已内置去重：同一 CIDR 若已有排队中或运行中的任务，将复用已有任务而不重复创建。
-- Docker Compose 默认使用前端代理转发：
-  - 浏览器请求同源 `/api/v1/*`
-  - Next.js 再转发到 `BACKEND_INTERNAL_URL=http://backend:8000`
-- 只有前端独立部署到 Docker 外时，才需要显式设置 `NEXT_PUBLIC_API_BASE` 指向外部后端地址。
+## 推荐阅读顺序
+
+1. 先看本文件，快速理解桌面端和移动端的整体分工
+2. 再看桌面端说明：[situational-awareness/README.md](/root/Desktop/Project/situational-awareness/README.md)
+3. 最后看移动端说明：[situational-awareness-mobile/README.md](/root/Desktop/Project/situational-awareness-mobile/README.md)
 
 ## 相关文档
-- 架构说明：[docs/architecture.md](docs/architecture.md)
-- API 契约：[docs/api-contract.md](docs/api-contract.md)
-- 数据库结构：[docs/database-schema.md](docs/database-schema.md)
-- 运行手册：[docs/runbook.md](docs/runbook.md)
 
-## 数据库迁移
-- 后端目录已提供 `backend/alembic.ini`，可直接执行 Alembic：
-```bash
-docker exec sa-backend sh -lc 'cd /app && alembic upgrade head'
-```
-- 现有应用启动仍会保留 `create_all()` 兜底，但推荐把结构变更收敛到 Alembic。
-- 当前迁移链已补齐对现有 schema 的幂等保护，适用于已由应用初始化过的数据库和全新数据库。
-
-## CORS 预检排查
-- 开发环境默认 `CORS_ALLOW_ALL=true`，允许 `localhost/127.0.0.1/局域网IP` 访问后端 API。
-- 若前端出现 `NetworkError when attempting to fetch resource` 且后端有 `OPTIONS ... 400`，优先检查后端容器读取的环境变量：
-  - `CORS_ALLOW_ALL=true`，或
-  - `CORS_ALLOW_ALL=false` 且 `CORS_ALLOW_ORIGINS` 包含当前前端实际来源（完整协议+主机+端口）。
-- 生产环境建议关闭全放开模式：`CORS_ALLOW_ALL=false`，并显式设置 `CORS_ALLOW_ORIGINS` 白名单。
+- 架构说明：[situational-awareness/docs/architecture.md](/root/Desktop/Project/situational-awareness/docs/architecture.md)
+- API 契约：[situational-awareness/docs/api-contract.md](/root/Desktop/Project/situational-awareness/docs/api-contract.md)
+- 数据库结构：[situational-awareness/docs/database-schema.md](/root/Desktop/Project/situational-awareness/docs/database-schema.md)
+- 运行手册：[situational-awareness/docs/runbook.md](/root/Desktop/Project/situational-awareness/docs/runbook.md)
