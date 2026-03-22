@@ -1,0 +1,314 @@
+.login-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+  padding: 28px;
+}
+
+.login-backdrop {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 10% 14%, rgba(79, 161, 255, 0.18), transparent 28%),
+    radial-gradient(circle at 85% 18%, rgba(45, 212, 191, 0.16), transparent 26%),
+    radial-gradient(circle at 50% 100%, rgba(191, 219, 254, 0.22), transparent 32%);
+  pointer-events: none;
+}
+
+.login-backdrop::after {
+  content: "";
+  position: absolute;
+  inset: 8% 10%;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.76) 0%, transparent 58%);
+  filter: blur(52px);
+  opacity: 0.8;
+}
+
+.login-grid {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(420px, 0.92fr);
+  width: min(1180px, 100%);
+  min-height: 720px;
+  overflow: hidden;
+  border-radius: 36px;
+  border: 1px solid rgba(138, 170, 206, 0.24);
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 36px 80px rgba(54, 87, 122, 0.16);
+  backdrop-filter: blur(24px);
+}
+
+.login-side-panel.ant-card,
+.login-form-panel.ant-card {
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.login-side-panel .ant-card-body,
+.login-form-panel .ant-card-body {
+  height: 100%;
+  padding: 0 !important;
+}
+
+.login-side-panel {
+  position: relative;
+  padding: 40px !important;
+  display: flex !important;
+  flex-direction: column;
+  justify-content: space-between;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(245, 250, 255, 0.78)),
+    radial-gradient(circle at top right, rgba(96, 165, 250, 0.18), transparent 32%),
+    radial-gradient(circle at left center, rgba(45, 212, 191, 0.12), transparent 28%) !important;
+}
+
+.login-side-panel::after {
+  content: "";
+  position: absolute;
+  inset: 24px;
+  border-radius: 28px;
+  border: 1px solid rgba(166, 193, 223, 0.2);
+  pointer-events: none;
+}
+
+.login-side-top,
+.login-side-notes {
+  position: relative;
+  z-index: 1;
+}
+
+.login-badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.login-status-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(112, 161, 217, 0.18);
+  background: rgba(255, 255, 255, 0.78);
+  color: #47637e;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.login-side-title.ant-typography {
+  margin: 0 !important;
+  color: #17324d !important;
+  font-size: clamp(40px, 5vw, 60px) !important;
+  line-height: 1.04 !important;
+  letter-spacing: -0.04em;
+}
+
+.login-side-description.ant-typography {
+  max-width: 620px;
+  margin: 18px 0 0 !important;
+  color: #58708a !important;
+  font-size: 16px;
+  line-height: 1.85;
+}
+
+.login-metric-grid {
+  margin-top: 28px;
+}
+
+.login-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 20px;
+}
+
+.login-feature-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px;
+  border-radius: 22px;
+  border: 1px solid rgba(173, 199, 227, 0.24);
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 16px 30px rgba(60, 90, 125, 0.08);
+}
+
+.login-feature-card strong {
+  color: #1d3854;
+  font-size: 15px;
+}
+
+.login-feature-card span {
+  color: #667d95;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.login-side-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 30px;
+}
+
+.console-stage-item {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+  padding: 16px 18px;
+  border-radius: 22px;
+  border: 1px solid rgba(173, 199, 227, 0.22);
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 14px 28px rgba(60, 90, 125, 0.07);
+}
+
+.console-stage-item span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.18), rgba(45, 212, 191, 0.18));
+  color: #21538a;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.console-stage-item .ant-typography {
+  color: #193651 !important;
+}
+
+.console-stage-item p {
+  margin: 6px 0 0;
+  color: #6a8097;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.login-form-panel {
+  padding: 40px !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 251, 255, 0.96)),
+    rgba(255, 255, 255, 0.92) !important;
+}
+
+.login-form-stack {
+  width: 100%;
+  height: 100%;
+  justify-content: center;
+}
+
+.login-form-header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.login-form-kicker.brand-kicker {
+  color: #4a7cb5 !important;
+}
+
+.login-form-title.ant-typography {
+  margin: 0 !important;
+  color: #17324d !important;
+  font-size: 34px !important;
+  line-height: 1.08 !important;
+  letter-spacing: -0.03em;
+}
+
+.login-form-description.ant-typography {
+  color: #627a93 !important;
+  line-height: 1.7;
+}
+
+.login-form .ant-form-item {
+  margin-bottom: 16px;
+}
+
+.login-form .ant-input-affix-wrapper,
+.login-form .ant-input,
+.login-form .ant-input-password {
+  border-radius: 18px !important;
+}
+
+.login-input-icon {
+  color: #6f88a2;
+}
+
+.login-submit-button.ant-btn {
+  height: 48px;
+  border-radius: 18px !important;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.login-secondary-button.ant-btn {
+  height: 46px;
+  border-radius: 18px !important;
+  border-color: rgba(138, 170, 206, 0.28) !important;
+  color: #2d4f75 !important;
+  background: rgba(248, 251, 255, 0.96) !important;
+}
+
+.login-divider.ant-divider {
+  margin: 2px 0 0 !important;
+  color: #8aa0b7 !important;
+  font-size: 12px;
+}
+
+.login-form-footer {
+  text-align: center;
+  padding-top: 6px;
+}
+
+.login-form-footer .ant-typography {
+  font-size: 12px;
+}
+
+@media (max-width: 1100px) {
+  .login-grid {
+    grid-template-columns: 1fr;
+    max-width: 760px;
+  }
+
+  .login-side-panel {
+    min-height: 0;
+    padding-bottom: 24px !important;
+  }
+}
+
+@media (max-width: 768px) {
+  .login-shell {
+    padding: 16px;
+  }
+
+  .login-grid {
+    min-height: 0;
+    border-radius: 28px;
+  }
+
+  .login-side-panel {
+    display: none !important;
+  }
+
+  .login-form-panel {
+    padding: 28px !important;
+  }
+
+  .login-form-title.ant-typography {
+    font-size: 28px !important;
+  }
+}

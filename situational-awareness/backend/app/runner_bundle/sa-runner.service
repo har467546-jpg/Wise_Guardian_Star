@@ -1,0 +1,14 @@
+[Unit]
+Description=Situational Awareness Host Runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/sa-runner/launcher.sh
+Restart=always
+RestartSec=5
+WorkingDirectory=/opt/sa-runner
+
+[Install]
+WantedBy=multi-user.target

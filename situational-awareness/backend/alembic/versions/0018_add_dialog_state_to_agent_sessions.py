@@ -1,0 +1,35 @@
+"""add dialog state to haor sessions
+
+Revision ID: 0018_agent_dialog_state
+Revises: 0017_agent_working_context
+Create Date: 2026-03-17
+"""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+
+revision: str = "0018_agent_dialog_state"
+down_revision: str | None = "0017_agent_working_context"
+branch_labels: Sequence[str] | None = None
+depends_on: Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.add_column(
+        "agent_sessions",
+        sa.Column(
+            "dialog_state_json",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+            server_default=sa.text("'{}'::jsonb"),
+        ),
+    )
+    op.alter_column("agent_sessions", "dialog_state_json", server_default=None)
+
+
+def downgrade() -> None:
+    op.drop_column("agent_sessions", "dialog_state_json")

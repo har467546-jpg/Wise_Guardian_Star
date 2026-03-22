@@ -1,0 +1,124 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: sa-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: assetdb
+      POSTGRES_USER: asset
+      POSTGRES_PASSWORD: asset
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  redis:
+    image: redis:7
+    container_name: sa-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: sa-backend
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
+    env_file:
+      - path: ../backend/.env.example
+        required: true
+      - path: ../backend/.env.runtime
+        required: false
+    environment:
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend:/app
+
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: sa-worker
+    restart: unless-stopped
+    env_file:
+      - path: ../backend/.env.example
+        required: true
+      - path: ../backend/.env.runtime
+        required: false
+    depends_on:
+      - postgres
+      - redis
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report", "--loglevel=info"]
+    volumes:
+      - ../backend:/app
+
+  settings-helper:
+    build:
+      context: ./settings-helper
+      dockerfile: Dockerfile
+    container_name: sa-settings-helper
+    restart: unless-stopped
+    env_file:
+      - path: ../backend/.env.example
+        required: true
+      - path: ../backend/.env.runtime
+        required: false
+    depends_on:
+      - backend
+    volumes:
+      - ..:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      target: dev
+    container_name: sa-frontend
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-lc",
+        "DEPS_HASH=$$(sha256sum package.json package-lock.json | sha256sum | awk '{print $$1}'); if [ ! -f node_modules/.deps-hash ] || [ \"$$(cat node_modules/.deps-hash 2>/dev/null)\" != \"$$DEPS_HASH\" ]; then npm ci --no-audit --fund=false && printf '%s' \"$$DEPS_HASH\" > node_modules/.deps-hash; fi; rm -rf /app/.next/* 2>/dev/null || true; npm run dev",
+      ]
+    env_file:
+      - ../frontend/.env.example
+    environment:
+      NEXT_ALLOWED_DEV_ORIGINS: ${NEXT_ALLOWED_DEV_ORIGINS:-localhost,127.0.0.1,192.168.*.*,10.*.*.*,172.*.*.*}
+      WATCHPACK_POLLING: ${WATCHPACK_POLLING:-true}
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+      - /app/.next
+
+  frontend-prod:
+    profiles: ["prod"]
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      target: runner
+    container_name: sa-frontend-prod
+    restart: unless-stopped
+    command: ["npm", "run", "start"]
+    env_file:
+      - ../frontend/.env.example
+    depends_on:
+      - backend
+    ports:
+      - "3001:3000"
+
+volumes:
+  pgdata:

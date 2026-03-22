@@ -1,0 +1,1537 @@
+"use client";
+
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { Badge, Button, Input, message } from "antd";
+
+import { getStoredToken, type StoredUserRole } from "@/lib/auth";
+import { collectBrowserContext, executeUIActions } from "@/lib/haor-browser-runtime";
+import { formatDateTime, getTaskEventTypeLabel, getTaskTypeLabel, localizeTaskMessage } from "@/lib/ui-text";
+import {
+  approveHaorSession,
+  buildHaorSessionStreamUrl,
+  getHaorSession,
+  getTask,
+  getTaskEvents,
+  interruptHaorSession,
+  postHaorMessage,
+  postHaorStep,
+  resetHaorSession,
+} from "@/services/api";
+import type {
+  AgentActionUpdateEvent,
+  AgentAssistantDeltaEvent,
+  AgentBrowserContext,
+  AgentErrorEvent,
+  AgentMessage,
+  AgentPageContext,
+  AgentPlanPendingEvent,
+  AgentProposedAction,
+  AgentSession,
+  AgentStreamServerEnvelope,
+  AgentTaskUpdateEvent,
+  AgentTurnDoneEvent,
+  AgentTurnStartedEvent,
+  AgentUIAction,
+  AgentUIActionsRequestedEvent,
+} from "@/types/agent";
+import type { TaskEvent, TaskRunDetail } from "@/types/task";
+
+type HaorAgentDrawerProps = {
+  userRole: StoredUserRole;
+};
+
+type StreamFeedItem = {
+  id: string;
+  badge?: string | null;
+  content: string;
+  role: "assistant";
+  sender: string;
+  time: string;
+  tone?: "action" | "error" | "plan" | "task";
+};
+
+type DraftAssistantMessage = {
+  turnId: string;
+  content: string;
+  messageType: AgentMessage["message_type"];
+};
+
+type PendingUserMessage = {
+  clientMessageId: string;
+  content: string;
+  createdAt: string;
+  status: "sending" | "failed";
+};
+
+type AssistantPlaceholder = {
+  key: string;
+  badge?: string | null;
+  content: string;
+  tone?: "action" | "error" | "plan" | "task";
+};
+
+type ChatBubbleProps = {
+  actions?: ReactNode;
+  badge?: string | null;
+  content: string;
+  metaNote?: string | null;
+  role: "assistant" | "user";
+  sender: string;
+  stateTone?: "failed" | "pending";
+  time: string;
+  tone?: "action" | "error" | "plan" | "task";
+};
+
+function ChatBubble({ actions, badge, content, metaNote, role, sender, stateTone, time, tone }: ChatBubbleProps) {
+  const bubbleClasses = ["haor-chat-bubble", `haor-chat-bubble-${role}`];
+  if (role === "assistant" && tone) {
+    bubbleClasses.push(`haor-chat-bubble-${tone}`);
+  }
+  if (stateTone) {
+    bubbleClasses.push(`haor-chat-bubble-is-${stateTone}`);
+  }
+
+  return (
+    <article className={`haor-chat-row haor-chat-row-${role}`}>
+      <div className={`haor-chat-avatar haor-chat-avatar-${role}`}>{role === "user" ? "你" : "H"}</div>
+      <div className="haor-chat-stack">
+        <div className="haor-chat-sender">{sender}</div>
+        <div className={bubbleClasses.join(" ")}>
+          {badge ? <span className="haor-chat-badge">{badge}</span> : null}
+          <pre className="haor-chat-bubble-body">{content}</pre>
+          {actions ? <div className="haor-chat-bubble-actions">{actions}</div> : null}
+        </div>
+        <div className="haor-chat-bubble-meta">
+          <span>{time}</span>
+          {metaNote ? (
+            <span className={`haor-chat-bubble-meta-note ${stateTone ? `haor-chat-bubble-meta-note-${stateTone}` : ""}`}>
+              {metaNote}
+            </span>
+          ) : null}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function normalizeStatus(status: string | null | undefined) {
+  return String(status || "").trim().toLowerCase();
+}
+
+function buildPageContext(pathname: string, searchParams: URLSearchParams | null): AgentPageContext {
+  const query: Record<string, string> = {};
+  if (searchParams) {
+    searchParams.forEach((value, key) => {
+      query[key] = value;
+    });
+  }
+
+  const segments = pathname.split("/").filter(Boolean);
+  let assetId = query.assetId || query.asset_id || "";
+  let findingId = query.findingId || query.finding_id || "";
+  let taskId = query.taskId || query.task_id || "";
+
+  if (!assetId && segments[0] === "assets" && segments[1]) {
+    assetId = segments[1];
+  }
+  if (!assetId && segments[0] === "remediation" && segments[1]) {
+    assetId = segments[1];
+  }
+  if (!taskId && segments[0] === "tasks" && segments[1]) {
+    taskId = segments[1];
+  }
+
+  return {
+    pathname,
+    query,
+    asset_id: assetId || null,
+    finding_id: findingId || null,
+    task_id: taskId || null,
+  };
+}
+
+function buildPageContextFromLocation(): AgentPageContext {
+  if (typeof window === "undefined") {
+    return { pathname: "/", query: {} };
+  }
+  return buildPageContext(window.location.pathname || "/", new URLSearchParams(window.location.search));
+}
+
+function statusLabel(status: string | null | undefined): string {
+  switch (normalizeStatus(status)) {
+    case "waiting_approval":
+      return "待确认";
+    case "running":
+      return "执行中";
+    case "completed":
+    case "success":
+      return "已完成";
+    case "failed":
+    case "failure":
+      return "失败";
+    case "canceled":
+      return "已取消";
+    default:
+      return "会话中";
+  }
+}
+
+function toProposedActions(session: AgentSession | null): AgentProposedAction[] {
+  const raw = session?.pending_plan_json?.proposed_write_actions;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.filter((item): item is AgentProposedAction => Boolean(item && typeof item === "object" && "action_type" in item)) as AgentProposedAction[];
+}
+
+function toPendingUiActions(session: AgentSession | null): AgentUIAction[] {
+  const raw = session?.browser_runtime_json?.pending_ui_actions;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.filter((item): item is AgentUIAction => Boolean(item && typeof item === "object" && "action_type" in item)) as AgentUIAction[];
+}
+
+function toBrowserRuntime(session: AgentSession | null): Record<string, unknown> {
+  return session?.browser_runtime_json && typeof session.browser_runtime_json === "object" ? session.browser_runtime_json : {};
+}
+
+function isTerminalTaskStatus(status: string | null | undefined) {
+  const normalized = normalizeStatus(status);
+  return normalized === "success" || normalized === "failure" || normalized === "canceled";
+}
+
+function isActiveTaskStatus(status: string | null | undefined) {
+  const normalized = normalizeStatus(status);
+  return normalized === "pending" || normalized === "running" || normalized === "retry";
+}
+
+function messageBadgeText(message: AgentMessage): string | null {
+  if (message.role === "user") {
+    return null;
+  }
+  switch (String(message.message_type || "").trim().toLowerCase()) {
+    case "clarifying":
+      return "追问";
+    case "plan":
+      return "计划";
+    case "task_update":
+      return "任务";
+    case "action_update":
+      return "动作";
+    case "error":
+      return "错误";
+    default:
+      return null;
+  }
+}
+
+function messageTone(message: AgentMessage): "action" | "error" | "plan" | "task" | undefined {
+  switch (String(message.message_type || "").trim().toLowerCase()) {
+    case "plan":
+      return "plan";
+    case "task_update":
+      return "task";
+    case "action_update":
+      return "action";
+    case "error":
+      return "error";
+    default:
+      return undefined;
+  }
+}
+
+function planTargetLabel(action: AgentProposedAction): string | null {
+  const params = action.params || {};
+  const assetId = typeof params.asset_id === "string" ? params.asset_id : null;
+  const findingId = typeof params.finding_id === "string" ? params.finding_id : null;
+  const taskId = typeof params.task_id === "string" ? params.task_id : null;
+  const sessionId = typeof params.session_id === "string" ? params.session_id : null;
+  const cidr = typeof params.cidr === "string" ? params.cidr : null;
+
+  if (findingId && assetId) {
+    return `风险 ${findingId} / 资产 ${assetId}`;
+  }
+  if (findingId) {
+    return `风险 ${findingId}`;
+  }
+  if (assetId) {
+    return `资产 ${assetId}`;
+  }
+  if (taskId) {
+    return `任务 ${taskId}`;
+  }
+  if (sessionId) {
+    return `修复会话 ${sessionId}`;
+  }
+  if (cidr) {
+    return `网段 ${cidr}`;
+  }
+  return null;
+}
+
+function isMockSession(session: AgentSession | null): boolean {
+  return Boolean(session?.messages?.some((item) => Boolean(item.payload_json?.mock_mode)));
+}
+
+function joinSections(parts: Array<string | null | undefined>) {
+  return parts.map((item) => String(item || "").trim()).filter(Boolean).join("\n\n");
+}
+
+function createClientId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `haor-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function messageClientMessageId(message: AgentMessage): string | null {
+  const value = message.payload_json?.client_message_id;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function reconcilePendingUserMessages(pendingMessages: PendingUserMessage[], messages: AgentMessage[]): PendingUserMessage[] {
+  if (!pendingMessages.length || !messages.length) {
+    return pendingMessages;
+  }
+  const persistedIds = new Set(
+    messages
+      .filter((item) => item.role === "user")
+      .map((item) => messageClientMessageId(item))
+      .filter((value): value is string => Boolean(value)),
+  );
+  return pendingMessages.filter((item) => !persistedIds.has(item.clientMessageId));
+}
+
+function markPendingUserMessagesFailed(pendingMessages: PendingUserMessage[]): PendingUserMessage[] {
+  return pendingMessages.map((item) => (item.status === "failed" ? item : { ...item, status: "failed" }));
+}
+
+function upsertSessionMessage(session: AgentSession | null, nextMessage: AgentMessage): AgentSession | null {
+  if (!session) {
+    return null;
+  }
+  const existing = Array.isArray(session.messages) ? session.messages : [];
+  const nextMessages = [...existing];
+  const index = nextMessages.findIndex((item) => item.id === nextMessage.id);
+  if (index >= 0) {
+    nextMessages[index] = nextMessage;
+  } else {
+    nextMessages.push(nextMessage);
+  }
+  nextMessages.sort((left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime());
+  return { ...session, messages: nextMessages, updated_at: nextMessage.created_at || session.updated_at };
+}
+
+function buildPendingPlanDetails(actions: AgentProposedAction[]) {
+  if (!actions.length) {
+    return "";
+  }
+
+  const lines = ["待执行动作："];
+  for (const [index, action] of actions.entries()) {
+    lines.push(`${index + 1}. ${action.title}`);
+    lines.push(`动作类型：${action.action_type}`);
+    const target = planTargetLabel(action);
+    if (target) {
+      lines.push(`目标：${target}`);
+    }
+    if (action.reason) {
+      lines.push(`原因：${action.reason}`);
+    }
+    const paramsText = Object.entries(action.params || {})
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join("，");
+    if (paramsText) {
+      lines.push(`参数：${paramsText}`);
+    }
+    if (index < actions.length - 1) {
+      lines.push("");
+    }
+  }
+  return lines.join("\n");
+}
+
+function buildTaskDigest(task: TaskRunDetail, taskEvents: TaskEvent[]) {
+  const lines = [
+    `${getTaskTypeLabel(task.task_type)} · ${statusLabel(task.status)}`,
+    `进度：${task.progress}%`,
+  ];
+  const taskMessage = localizeTaskMessage(task.message) || "";
+  if (taskMessage) {
+    lines.push(`当前：${taskMessage}`);
+  }
+  const recentEvents = taskEvents.slice(-3);
+  if (recentEvents.length) {
+    lines.push("");
+    lines.push("最近事件：");
+    for (const item of recentEvents) {
+      lines.push(`- ${getTaskEventTypeLabel(item.event_type)}：${localizeTaskMessage(item.message) || item.stage_name || item.stage_code || "-"}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatChatTime(value: string | null | undefined): string {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return formatDateTime(value);
+  }
+  const now = new Date();
+  const sameDay = now.toDateString() === date.toDateString();
+  if (sameDay) {
+    return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  }
+  return date.toLocaleString("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
+  const router = useRouter();
+  const pathname = usePathname() || "/";
+  const searchParams = useSearchParams();
+  const isAdmin = userRole === "admin";
+
+  const feedViewportRef = useRef<HTMLDivElement | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const sessionRef = useRef<AgentSession | null>(null);
+  const taskRef = useRef<TaskRunDetail | null>(null);
+  const activeTurnIdRef = useRef<string | null>(null);
+  const ignoredTurnIdsRef = useRef<Set<string>>(new Set());
+  const ignoredClientMessageIdsRef = useRef<Set<string>>(new Set());
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const pendingUiRequestRef = useRef<{ turnId: string; uiActions: AgentUIAction[]; content?: string | null } | null>(null);
+  const shouldReconnectRef = useRef(false);
+  const turnPhaseRef = useRef<Record<string, "message" | "ui_step" | "approve">>({});
+
+  const [open, setOpen] = useState(false);
+  const [session, setSession] = useState<AgentSession | null>(null);
+  const [task, setTask] = useState<TaskRunDetail | null>(null);
+  const [taskEvents, setTaskEvents] = useState<TaskEvent[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [stepping, setStepping] = useState(false);
+  const [approving, setApproving] = useState(false);
+  const [interrupting, setInterrupting] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [inputValue, setInputValue] = useState("");
+  const [errorText, setErrorText] = useState<string | null>(null);
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const [connectionState, setConnectionState] = useState<"disconnected" | "connecting" | "connected">("disconnected");
+  const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const [draftAssistantMessage, setDraftAssistantMessage] = useState<DraftAssistantMessage | null>(null);
+  const [assistantPlaceholder, setAssistantPlaceholder] = useState<AssistantPlaceholder | null>(null);
+  const [pendingUserMessages, setPendingUserMessages] = useState<PendingUserMessage[]>([]);
+  const [streamFeed, setStreamFeed] = useState<StreamFeedItem[]>([]);
+  const [pendingUiRequest, setPendingUiRequest] = useState<{ turnId: string; uiActions: AgentUIAction[]; content?: string | null } | null>(null);
+
+  const pageContext = useMemo(() => buildPageContext(pathname, searchParams), [pathname, searchParams]);
+  const browserRuntime = useMemo(() => toBrowserRuntime(session), [session]);
+  const proposedActions = useMemo(() => toProposedActions(session), [session]);
+  const visiblePendingUserMessages = useMemo(
+    () => reconcilePendingUserMessages(pendingUserMessages, session?.messages || []),
+    [pendingUserMessages, session?.messages],
+  );
+  const pendingUiActions = useMemo(
+    () => (pendingUiRequest?.uiActions?.length ? pendingUiRequest.uiActions : toPendingUiActions(session)),
+    [pendingUiRequest, session],
+  );
+  const pendingUiKey = pendingUiActions.map((item) => item.action_id).join("|");
+  const runtimeError = typeof browserRuntime.last_error === "string" ? browserRuntime.last_error : "";
+  const mockMode = isMockSession(session);
+  const isRunningSession = normalizeStatus(session?.status) === "running";
+  const rawRunningSession = isRunningSession && Boolean(session?.last_task_id);
+  const linkedTaskLoaded = Boolean(task && session?.last_task_id && task.id === session.last_task_id);
+  const confirmedRunningTask = rawRunningSession && linkedTaskLoaded && isActiveTaskStatus(task?.status);
+  const runningStateResolving = rawRunningSession && !confirmedRunningTask;
+  const showInterrupt = rawRunningSession;
+  const hasAttention =
+    normalizeStatus(session?.status) === "waiting_approval" ||
+    rawRunningSession ||
+    pendingUiActions.length > 0;
+  const composerLocked = sending || stepping || approving || interrupting || resetting;
+  const sendDisabled = composerLocked || confirmedRunningTask;
+  const resetDisabled = resetting || interrupting;
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  useEffect(() => {
+    taskRef.current = task;
+  }, [task]);
+
+  useEffect(() => {
+    activeTurnIdRef.current = activeTurnId;
+  }, [activeTurnId]);
+
+  useEffect(() => {
+    pendingUiRequestRef.current = pendingUiRequest;
+  }, [pendingUiRequest]);
+
+  useEffect(() => {
+    if (!session?.messages?.length) {
+      return;
+    }
+    setPendingUserMessages((current) => reconcilePendingUserMessages(current, session.messages));
+  }, [session?.messages]);
+
+  const pendingPlanMessageId = useMemo(() => {
+    if (!proposedActions.length || !session?.messages?.length) {
+      return null;
+    }
+    for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+      if (session.messages[index]?.message_type === "plan") {
+        return session.messages[index]?.id || null;
+      }
+    }
+    return null;
+  }, [proposedActions.length, session?.messages]);
+
+  const pendingPlanDetails = useMemo(() => buildPendingPlanDetails(proposedActions), [proposedActions]);
+  const liveTaskDigest = useMemo(() => (task ? buildTaskDigest(task, taskEvents) : ""), [task, taskEvents]);
+
+  const headerStatus = useMemo(() => {
+    const waitingApproval = normalizeStatus(session?.status) === "waiting_approval";
+    if (errorText || runtimeError || streamError) {
+      return {
+        text: errorText || runtimeError || streamError,
+        tone: "error" as const,
+      };
+    }
+    if (connectionState === "connecting") {
+      return {
+        text: "haor 正在连接流式会话通道，恢复后会继续接收动作和回复。",
+        tone: "muted" as const,
+      };
+    }
+    if (stepping || pendingUiActions.length > 0) {
+      return {
+        text: "haor 正在执行当前页面动作，并会继续把结果沉淀到聊天记录里。",
+        tone: "muted" as const,
+      };
+    }
+    if (confirmedRunningTask) {
+      return {
+        text: "当前正在执行已批准的编排任务，如需继续输入请先中断。",
+        tone: "warning" as const,
+      };
+    }
+    if (runningStateResolving) {
+      return {
+        text: "正在校验最近任务状态。你可以稍候等待同步，或直接中断当前任务。",
+        tone: "warning" as const,
+      };
+    }
+    if (waitingApproval) {
+      return {
+        text: isAdmin ? "已生成待确认计划，确认后才会执行。" : "已生成待确认计划，当前账号无法确认执行。",
+        tone: "warning" as const,
+      };
+    }
+    if (mockMode) {
+      return {
+        text: "当前处于模拟模式，聊天反馈仅用于演示和联调。",
+        tone: "muted" as const,
+      };
+    }
+    return {
+      text: "全站聊天助手，可直接提问、追问或下达站内操作意图。",
+      tone: "muted" as const,
+    };
+  }, [
+    errorText,
+    runtimeError,
+    streamError,
+    connectionState,
+    stepping,
+    pendingUiActions.length,
+    confirmedRunningTask,
+    runningStateResolving,
+    session?.status,
+    isAdmin,
+    mockMode,
+  ]);
+
+  const composerHint = confirmedRunningTask
+    ? "当前任务执行中，输入已锁定"
+    : sending
+      ? "haor 正在生成回复…"
+      : stepping
+        ? "haor 正在继续处理当前请求…"
+        : runningStateResolving
+          ? "正在校验最近任务状态；可继续输入，或先中断当前任务"
+          : "Shift+Enter 换行，Enter 发送";
+
+  const syncBrowserContext = (context: AgentPageContext = pageContext) => {
+    if (typeof window === "undefined") {
+      return { pathname: context.pathname, query: context.query } as AgentBrowserContext;
+    }
+    try {
+      return collectBrowserContext(context);
+    } catch {
+      return {
+        pathname: context.pathname,
+        origin: window.location.origin,
+        title: document.title,
+        query: context.query,
+        asset_id: context.asset_id || null,
+        finding_id: context.finding_id || null,
+        task_id: context.task_id || null,
+      };
+    }
+  };
+
+  const appendStreamFeed = (
+    item: Omit<StreamFeedItem, "time" | "sender" | "role"> & { time?: string; sender?: string; role?: "assistant" },
+  ) => {
+    const nextItem: StreamFeedItem = {
+      sender: item.sender || "haor",
+      role: "assistant",
+      time: item.time || new Date().toISOString(),
+      ...item,
+    };
+    setStreamFeed((current) => [...current.filter((entry) => entry.id !== nextItem.id), nextItem]);
+  };
+
+  const sendStreamFrame = (frame: Record<string, unknown>) => {
+    const socket = wsRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    socket.send(JSON.stringify(frame));
+    return true;
+  };
+
+  const handleStreamTurnStarted = (event: AgentTurnStartedEvent) => {
+    if (
+      ignoredTurnIdsRef.current.has(event.turn_id) ||
+      (event.client_message_id && ignoredClientMessageIdsRef.current.has(event.client_message_id))
+    ) {
+      ignoredTurnIdsRef.current.add(event.turn_id);
+      return;
+    }
+    turnPhaseRef.current[event.turn_id] = event.phase;
+    setActiveTurnId(event.turn_id);
+    if (event.phase === "message") {
+      setSending(true);
+      setDraftAssistantMessage(null);
+      setAssistantPlaceholder({
+        key: event.client_message_id || event.turn_id,
+        badge: "生成中",
+        content: "正在生成…",
+      });
+    }
+    if (event.phase === "ui_step") {
+      setStepping(true);
+      setAssistantPlaceholder({
+        key: event.turn_id,
+        badge: "处理中",
+        content: "正在继续处理当前请求…",
+        tone: "action",
+      });
+    }
+    if (event.phase === "approve") {
+      setApproving(true);
+      setAssistantPlaceholder({
+        key: event.turn_id,
+        badge: "处理中",
+        content: "正在提交计划并启动任务…",
+        tone: "action",
+      });
+    }
+  };
+
+  const handleStreamTurnDone = (event: AgentTurnDoneEvent) => {
+    if (ignoredTurnIdsRef.current.has(event.turn_id)) {
+      ignoredTurnIdsRef.current.delete(event.turn_id);
+      return;
+    }
+    const phase = turnPhaseRef.current[event.turn_id];
+    delete turnPhaseRef.current[event.turn_id];
+    if (phase === "message") {
+      setSending(false);
+    }
+    if (phase === "ui_step") {
+      setStepping(false);
+    }
+    if (phase === "approve") {
+      setApproving(false);
+    }
+    if (activeTurnIdRef.current === event.turn_id) {
+      setActiveTurnId(null);
+    }
+    if (event.status !== "ok") {
+      setDraftAssistantMessage((current) => (current?.turnId === event.turn_id ? null : current));
+    }
+    if (!(phase === "message" && pendingUiRequestRef.current)) {
+      setAssistantPlaceholder(null);
+    }
+  };
+
+  const handleTaskUpdateEvent = (event: AgentTaskUpdateEvent) => {
+    if (!event.task_id) {
+      return;
+    }
+    const sessionTaskId = sessionRef.current?.last_task_id || null;
+    if (sessionTaskId && sessionTaskId !== event.task_id) {
+      return;
+    }
+    if (!sessionTaskId && normalizeStatus(sessionRef.current?.status) !== "running") {
+      return;
+    }
+    const currentTask = taskRef.current;
+    setTask((current) => {
+      if (!current || current.id !== event.task_id) {
+        void loadTask(event.task_id, true);
+        return current;
+      }
+      return {
+        ...current,
+        status: String(event.status || current.status) as TaskRunDetail["status"],
+        progress: typeof event.progress === "number" ? event.progress : current.progress,
+        message: typeof event.message === "string" ? event.message : current.message,
+        updated_at: new Date().toISOString(),
+      };
+    });
+    if (!currentTask || currentTask.id !== event.task_id) {
+      void loadTask(event.task_id, true);
+    }
+  };
+
+  const handleStreamEvent = (event: AgentStreamServerEnvelope) => {
+    switch (event.type) {
+      case "session_snapshot": {
+        if (sessionRef.current && sessionRef.current.session_id !== event.session.session_id) {
+          return;
+        }
+        if (!activeTurnIdRef.current) {
+          setDraftAssistantMessage(null);
+          setAssistantPlaceholder(null);
+          setStreamFeed([]);
+        }
+        setSession(event.session);
+        setLoading(false);
+        setErrorText(null);
+        setStreamError(null);
+        if (event.session.last_task_id) {
+          void loadTask(event.session.last_task_id, true);
+        } else {
+          setTask(null);
+          setTaskEvents([]);
+        }
+        if (!toPendingUiActions(event.session).length) {
+          pendingUiRequestRef.current = null;
+          setPendingUiRequest(null);
+        }
+        return;
+      }
+      case "turn_started":
+        handleStreamTurnStarted(event);
+        return;
+      case "assistant_message_start":
+        if (ignoredTurnIdsRef.current.has(event.turn_id)) {
+          return;
+        }
+        setDraftAssistantMessage({ turnId: event.turn_id, content: "", messageType: event.message_type });
+        return;
+      case "assistant_message_delta":
+        if (ignoredTurnIdsRef.current.has(event.turn_id)) {
+          return;
+        }
+        setDraftAssistantMessage((current) => {
+          if (!current || current.turnId !== event.turn_id) {
+            return { turnId: event.turn_id, content: event.delta, messageType: "text" };
+          }
+          return { ...current, content: `${current.content}${event.delta}` };
+        });
+        return;
+      case "assistant_message_done":
+        if (ignoredTurnIdsRef.current.has(event.turn_id)) {
+          ignoredTurnIdsRef.current.delete(event.turn_id);
+          return;
+        }
+        setAssistantPlaceholder(null);
+        setDraftAssistantMessage((current) => (current?.turnId === event.turn_id ? null : current));
+        setSession((current) => upsertSessionMessage(current, event.message));
+        return;
+      case "action_update":
+        if (ignoredTurnIdsRef.current.has(event.turn_id)) {
+          return;
+        }
+        if (event.message) {
+          setSession((current) => upsertSessionMessage(current, event.message as AgentMessage));
+        } else {
+          appendStreamFeed({
+            id: `action-${event.turn_id}-${Date.now()}`,
+            badge: "动作",
+            content: event.content,
+            tone: "action",
+          });
+        }
+        return;
+      case "ui_actions_requested":
+        if (ignoredTurnIdsRef.current.has(event.turn_id)) {
+          return;
+        }
+        pendingUiRequestRef.current = { turnId: event.turn_id, uiActions: event.ui_actions, content: event.content || null };
+        setPendingUiRequest({ turnId: event.turn_id, uiActions: event.ui_actions, content: event.content || null });
+        setAssistantPlaceholder({
+          key: event.turn_id,
+          badge: "处理中",
+          content: "正在继续处理当前请求…",
+          tone: "action",
+        });
+        return;
+      case "plan_pending":
+        if (ignoredTurnIdsRef.current.has(event.turn_id)) {
+          return;
+        }
+        setAssistantPlaceholder(null);
+        setSession((current) => {
+          if (!current) {
+            return current;
+          }
+          const nextSession = upsertSessionMessage(current, event.message) || current;
+          return {
+            ...nextSession,
+            status: "waiting_approval",
+            pending_plan_json: event.pending_plan_json,
+          };
+        });
+        return;
+      case "task_update":
+        setAssistantPlaceholder(null);
+        handleTaskUpdateEvent(event);
+        return;
+      case "error":
+        if (event.turn_id && ignoredTurnIdsRef.current.has(event.turn_id)) {
+          ignoredTurnIdsRef.current.delete(event.turn_id);
+          return;
+        }
+        setAssistantPlaceholder(null);
+        if (event.message) {
+          setSession((current) => upsertSessionMessage(current, event.message as AgentMessage));
+        } else {
+          appendStreamFeed({
+            id: `error-${event.turn_id || "global"}-${Date.now()}`,
+            badge: "错误",
+            content: event.detail,
+            tone: "error",
+          });
+        }
+        setPendingUserMessages((current) => markPendingUserMessagesFailed(current));
+        setErrorText(event.detail);
+        return;
+      case "turn_done":
+        handleStreamTurnDone(event);
+        return;
+      default:
+        return;
+    }
+  };
+
+  const loadTask = async (taskId: string, silent = false) => {
+    try {
+      const [taskResult, eventResult] = await Promise.all([
+        getTask(taskId),
+        getTaskEvents(taskId, { pageSize: 6 }),
+      ]);
+      setTask(taskResult);
+      setTaskEvents(eventResult.items);
+      if (!silent) {
+        setErrorText(null);
+      }
+    } catch (error) {
+      if (!silent) {
+        setErrorText(error instanceof Error ? error.message : "无法读取最近任务");
+      }
+    }
+  };
+
+  const loadSession = async (silent = false) => {
+    try {
+      if (!silent) {
+        setLoading(true);
+      }
+      const result = await getHaorSession();
+      setSession(result);
+      if (result.last_task_id) {
+        void loadTask(result.last_task_id, true);
+      } else {
+        setTask(null);
+        setTaskEvents([]);
+      }
+      if (!silent) {
+        setErrorText(null);
+      }
+    } catch (error) {
+      if (!silent) {
+        setErrorText(error instanceof Error ? error.message : "无法恢复 haor 会话");
+      }
+    } finally {
+      if (!silent) {
+        setLoading(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    void loadSession();
+  }, []);
+
+  useEffect(() => {
+    if (!open) {
+      shouldReconnectRef.current = false;
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      setConnectionState("disconnected");
+      setAssistantPlaceholder(null);
+      setPendingUserMessages([]);
+      ignoredTurnIdsRef.current.clear();
+      ignoredClientMessageIdsRef.current.clear();
+      return undefined;
+    }
+
+    const token = getStoredToken();
+    if (!token) {
+      setStreamError("登录状态已失效，请重新登录");
+      setConnectionState("disconnected");
+      return undefined;
+    }
+
+    shouldReconnectRef.current = true;
+    let disposed = false;
+
+    const connect = () => {
+      if (disposed || !shouldReconnectRef.current) {
+        return;
+      }
+      setConnectionState("connecting");
+      const socket = new WebSocket(buildHaorSessionStreamUrl(token));
+      wsRef.current = socket;
+      socket.onopen = () => {
+        if (disposed) {
+          socket.close();
+          return;
+        }
+        reconnectAttemptsRef.current = 0;
+        setConnectionState("connected");
+        setStreamError(null);
+      };
+      socket.onmessage = (rawEvent) => {
+        try {
+          const payload = JSON.parse(rawEvent.data) as AgentStreamServerEnvelope;
+          handleStreamEvent(payload);
+        } catch {
+          setStreamError("haor 流式数据解析失败");
+        }
+      };
+      socket.onerror = () => {
+        setStreamError("haor 流式连接异常，正在尝试恢复");
+      };
+      socket.onclose = () => {
+        if (wsRef.current === socket) {
+          wsRef.current = null;
+        }
+        setLoading(false);
+        setSending(false);
+        setStepping(false);
+        setApproving(false);
+        setActiveTurnId(null);
+        setAssistantPlaceholder(null);
+        setDraftAssistantMessage(null);
+        pendingUiRequestRef.current = null;
+        setPendingUiRequest(null);
+        setPendingUserMessages((current) => markPendingUserMessagesFailed(current));
+        setStreamFeed([]);
+        if (disposed || !shouldReconnectRef.current) {
+          setConnectionState("disconnected");
+          return;
+        }
+        setStreamError("haor 流式连接已断开，正在尝试恢复");
+        setConnectionState("connecting");
+        const nextAttempt = reconnectAttemptsRef.current + 1;
+        reconnectAttemptsRef.current = nextAttempt;
+        const delay = Math.min(1000 * nextAttempt, 4000);
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          connect();
+        }, delay);
+      };
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+      shouldReconnectRef.current = false;
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      setConnectionState("disconnected");
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || connectionState !== "connected") {
+      return;
+    }
+    sendStreamFrame({
+      type: "hello",
+      page_context: pageContext,
+      browser_context: syncBrowserContext(pageContext),
+    });
+  }, [open, connectionState, pageContext]);
+
+  useEffect(() => {
+    if (connectionState === "connected") {
+      return undefined;
+    }
+    if (!session?.last_task_id) {
+      return undefined;
+    }
+    if (!open && normalizeStatus(session.status) !== "running") {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void loadTask(session.last_task_id as string, true);
+      if (normalizeStatus(session.status) === "running") {
+        void loadSession(true);
+      }
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [open, session?.last_task_id, session?.status, connectionState]);
+
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const timer = window.setTimeout(() => {
+      syncBrowserContext(pageContext);
+    }, 120);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.clearTimeout(timer);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open, pageContext]);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const viewport = feedViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    viewport.scrollTo({
+      top: viewport.scrollHeight,
+      behavior: "smooth",
+    });
+  }, [
+    open,
+    session?.messages?.length,
+    visiblePendingUserMessages.length,
+    streamFeed.length,
+    assistantPlaceholder?.content,
+    draftAssistantMessage?.content,
+    proposedActions.length,
+    pendingUiKey,
+    task?.id,
+    task?.status,
+    taskEvents.length,
+    errorText,
+  ]);
+
+  useEffect(() => {
+    if (!open || !pendingUiActions.length || stepping || sending || approving || interrupting || resetting) {
+      return;
+    }
+
+    let canceled = false;
+    let usedStream = false;
+
+    const runPendingUiActions = async () => {
+      try {
+        setStepping(true);
+        const results = await executeUIActions(pendingUiActions, {
+          navigate: (href) => router.push(href),
+        });
+        if (canceled) {
+          return;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 320));
+        const refreshedPageContext = buildPageContextFromLocation();
+        const refreshedBrowserContext = syncBrowserContext(refreshedPageContext);
+        usedStream = sendStreamFrame({
+          type: "ui_step",
+          browser_context: refreshedBrowserContext,
+          ui_action_results: results,
+        });
+        if (!usedStream) {
+          const result = await postHaorStep({
+            browser_context: refreshedBrowserContext,
+            ui_action_results: results,
+          });
+          if (canceled) {
+            return;
+          }
+          setSession(result);
+          setAssistantPlaceholder(
+            toPendingUiActions(result).length
+              ? {
+                  key: result.session_id,
+                  badge: "处理中",
+                  content: "正在继续处理当前请求…",
+                  tone: "action",
+                }
+              : null,
+          );
+          if (result.last_task_id) {
+            void loadTask(result.last_task_id, true);
+          }
+        }
+        pendingUiRequestRef.current = null;
+        setPendingUiRequest(null);
+        setErrorText(null);
+      } catch (error) {
+        if (!canceled) {
+          const text = error instanceof Error ? error.message : "站内动作执行失败";
+          setAssistantPlaceholder(null);
+          setErrorText(text);
+          message.error(text);
+        }
+      } finally {
+        if (!canceled && !usedStream) {
+          setStepping(false);
+        }
+      }
+    };
+
+    void runPendingUiActions();
+
+    return () => {
+      canceled = true;
+    };
+  }, [open, pendingUiKey, stepping, sending, approving, interrupting, resetting, router]);
+
+  const handleSend = async (content: string) => {
+    const normalized = content.trim();
+    if (!normalized) {
+      return;
+    }
+    const clientMessageId = createClientId();
+    const createdAt = new Date().toISOString();
+    let usedStream = false;
+    try {
+      setSending(true);
+      const context = syncBrowserContext(pageContext);
+      setPendingUserMessages((current) => [
+        ...current.filter((item) => item.clientMessageId !== clientMessageId),
+        {
+          clientMessageId,
+          content: normalized,
+          createdAt,
+          status: "sending",
+        },
+      ]);
+      setAssistantPlaceholder({
+        key: clientMessageId,
+        badge: "生成中",
+        content: "正在生成…",
+      });
+      setInputValue("");
+      setOpen(true);
+      setErrorText(null);
+      setStreamError(null);
+      usedStream = sendStreamFrame({
+        type: "message",
+        client_message_id: clientMessageId,
+        content: normalized,
+        page_context: pageContext,
+        browser_context: context,
+      });
+      if (usedStream) {
+        return;
+      }
+      const result = await postHaorMessage({
+        client_message_id: clientMessageId,
+        content: normalized,
+        page_context: pageContext,
+        browser_context: context,
+      });
+      setSession(result);
+      setAssistantPlaceholder(
+        toPendingUiActions(result).length
+          ? {
+              key: clientMessageId,
+              badge: "处理中",
+              content: "正在继续处理当前请求…",
+              tone: "action",
+            }
+          : null,
+      );
+      if (result.last_task_id) {
+        void loadTask(result.last_task_id, true);
+      }
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "haor 消息发送失败";
+      setPendingUserMessages((current) =>
+        current.map((item) => (item.clientMessageId === clientMessageId ? { ...item, status: "failed" } : item)),
+      );
+      setAssistantPlaceholder(null);
+      setErrorText(text);
+      message.error(text);
+    } finally {
+      if (!usedStream) {
+        setSending(false);
+      }
+    }
+  };
+
+  const handleApprove = async () => {
+    let usedStream = false;
+    try {
+      setApproving(true);
+      usedStream = sendStreamFrame({ type: "approve_plan" });
+      if (!usedStream) {
+        const result = await approveHaorSession({});
+        message.success(`haor 编排任务已提交：${result.task_id}`);
+        await loadSession(true);
+        await loadTask(result.task_id, true);
+      }
+      setOpen(true);
+      setErrorText(null);
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "haor 计划提交失败";
+      setErrorText(text);
+      message.error(text);
+    } finally {
+      if (!usedStream) {
+        setApproving(false);
+      }
+    }
+  };
+
+  const handleInterrupt = async () => {
+    try {
+      setInterrupting(true);
+      const result = await interruptHaorSession();
+      setSession(result);
+      if (result.last_task_id) {
+        await loadTask(result.last_task_id, true);
+      } else {
+        setTask(null);
+        setTaskEvents([]);
+      }
+      setErrorText(null);
+      message.success("任务已中断");
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "haor 编排中断失败";
+      setErrorText(text);
+      message.error(text);
+    } finally {
+      setInterrupting(false);
+    }
+  };
+
+  const handleReset = async () => {
+    try {
+      setResetting(true);
+      const result = await resetHaorSession();
+      if (activeTurnIdRef.current) {
+        ignoredTurnIdsRef.current.add(activeTurnIdRef.current);
+      }
+      for (const item of pendingUserMessages) {
+        ignoredClientMessageIdsRef.current.add(item.clientMessageId);
+      }
+      setSession(result);
+      setTask(null);
+      setTaskEvents([]);
+      setInputValue("");
+      setErrorText(null);
+      setStreamError(null);
+      setAssistantPlaceholder(null);
+      setDraftAssistantMessage(null);
+      setPendingUserMessages([]);
+      setStreamFeed([]);
+      pendingUiRequestRef.current = null;
+      setPendingUiRequest(null);
+      setActiveTurnId(null);
+      setSending(false);
+      setStepping(false);
+      setApproving(false);
+      syncBrowserContext(pageContext);
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "无法创建新会话";
+      setErrorText(text);
+      message.error(text);
+    } finally {
+      setResetting(false);
+    }
+  };
+
+  return (
+    <>
+      <div className={`haor-fab-shell ${open ? "haor-fab-shell-open" : ""} ${hasAttention ? "haor-fab-shell-attention" : ""}`}>
+        <Badge dot={hasAttention} color="#dc2626" offset={[-8, 8]}>
+          <button type="button" className="haor-fab-button" onClick={() => setOpen(true)} aria-label="打开 haor 智能体">
+            <span className="haor-fab-ball">
+              <span className="haor-fab-core" />
+            </span>
+            <span className="haor-fab-label">haor</span>
+          </button>
+        </Badge>
+      </div>
+
+      {open ? (
+        <div className="haor-chat-shell" role="dialog" aria-modal="true" aria-label="haor 聊天助手">
+          <button type="button" className="haor-chat-backdrop" onClick={() => setOpen(false)} aria-label="关闭 haor 聊天窗口" />
+
+          <section className="haor-chat-window" data-haor-agent-root="true">
+            <header className="haor-chat-header">
+              <div className="haor-chat-header-copy">
+                <span className="haor-chat-kicker">Chat Assistant</span>
+                <div className="haor-chat-title-row">
+                  <h2 className="haor-chat-title">haor</h2>
+                  <span className={`haor-chat-status haor-chat-status-${normalizeStatus(session?.status) || "active"}`}>
+                    {statusLabel(session?.status)}
+                  </span>
+                </div>
+                <p className={`haor-chat-subtitle haor-chat-subtitle-${headerStatus.tone}`}>{headerStatus.text}</p>
+              </div>
+
+              <div className="haor-chat-header-actions">
+                {showInterrupt ? (
+                  <Button
+                    danger
+                    size="small"
+                    className="haor-chat-header-button haor-chat-header-button-danger"
+                    onClick={() => void handleInterrupt()}
+                    loading={interrupting}
+                  >
+                    中断任务
+                  </Button>
+                ) : null}
+                <Button
+                  size="small"
+                  className="haor-chat-header-button haor-chat-header-button-primary"
+                  onClick={() => void handleReset()}
+                  loading={resetting}
+                  disabled={resetDisabled}
+                >
+                  新会话
+                </Button>
+                <Button size="small" className="haor-chat-header-button" onClick={() => setOpen(false)}>
+                  关闭
+                </Button>
+              </div>
+            </header>
+
+            <div className="haor-chat-body">
+              <div ref={feedViewportRef} className="haor-chat-feed">
+                {loading && !session?.messages?.length ? (
+                  <div className="haor-chat-empty">
+                    <strong>正在恢复会话</strong>
+                    <span>haor 正在同步最近的聊天记录和任务状态。</span>
+                  </div>
+                ) : null}
+
+                {!loading && !session?.messages?.length && !proposedActions.length && !task ? (
+                  <div className="haor-chat-empty">
+                    <strong>开始聊天</strong>
+                    <span>直接像聊天一样提问，或告诉 haor 你想在站内执行什么操作。</span>
+                  </div>
+                ) : null}
+
+                {session?.messages?.map((item) => {
+                  const isPendingPlanMessage = Boolean(proposedActions.length && item.id === pendingPlanMessageId);
+                  const content = isPendingPlanMessage
+                    ? joinSections([item.content, pendingPlanDetails])
+                    : item.content;
+                  const actions = isPendingPlanMessage ? (
+                    isAdmin ? (
+                      <Button type="primary" size="small" onClick={() => void handleApprove()} loading={approving}>
+                        确认执行
+                      </Button>
+                    ) : (
+                      <span className="haor-chat-inline-note">当前账号不是管理员，不能确认执行。</span>
+                    )
+                  ) : undefined;
+
+                  return (
+                    <ChatBubble
+                      key={item.id}
+                      actions={actions}
+                      badge={messageBadgeText(item)}
+                      content={content}
+                      role={item.role === "user" ? "user" : "assistant"}
+                      sender={item.role === "user" ? "你" : "haor"}
+                      time={formatChatTime(item.created_at)}
+                      tone={messageTone(item)}
+                    />
+                  );
+                })}
+
+                {visiblePendingUserMessages.map((item) => (
+                  <ChatBubble
+                    key={`pending-${item.clientMessageId}`}
+                    content={item.content}
+                    metaNote={item.status === "failed" ? "发送失败" : "发送中"}
+                    role="user"
+                    sender="你"
+                    stateTone={item.status === "failed" ? "failed" : "pending"}
+                    time={formatChatTime(item.createdAt)}
+                  />
+                ))}
+
+                {streamFeed.map((item) => (
+                  <ChatBubble
+                    key={item.id}
+                    badge={item.badge}
+                    content={item.content}
+                    role="assistant"
+                    sender={item.sender}
+                    time={formatChatTime(item.time)}
+                    tone={item.tone}
+                  />
+                ))}
+
+                {!draftAssistantMessage?.content && assistantPlaceholder ? (
+                  <ChatBubble
+                    badge={assistantPlaceholder.badge}
+                    content={assistantPlaceholder.content}
+                    role="assistant"
+                    sender="haor"
+                    time={formatChatTime(new Date().toISOString())}
+                    tone={assistantPlaceholder.tone}
+                  />
+                ) : null}
+
+                {draftAssistantMessage?.content ? (
+                  <ChatBubble
+                    badge={draftAssistantMessage.messageType === "clarifying" ? "追问" : null}
+                    content={draftAssistantMessage.content}
+                    role="assistant"
+                    sender="haor"
+                    time={formatChatTime(new Date().toISOString())}
+                    tone={draftAssistantMessage.messageType === "clarifying" ? undefined : undefined}
+                  />
+                ) : null}
+
+                {proposedActions.length && !pendingPlanMessageId ? (
+                  <ChatBubble
+                    actions={
+                      isAdmin ? (
+                        <Button type="primary" size="small" onClick={() => void handleApprove()} loading={approving}>
+                          确认执行
+                        </Button>
+                      ) : (
+                        <span className="haor-chat-inline-note">当前账号不是管理员，不能确认执行。</span>
+                      )
+                    }
+                    badge="计划"
+                    content={joinSections([
+                      typeof session?.pending_plan_json?.reply_markdown === "string"
+                        ? String(session.pending_plan_json.reply_markdown)
+                        : "",
+                      pendingPlanDetails,
+                    ])}
+                    role="assistant"
+                    sender="haor"
+                    time={formatChatTime(session?.updated_at)}
+                    tone="plan"
+                  />
+                ) : null}
+
+                {task && !isTerminalTaskStatus(task.status) ? (
+                  <ChatBubble
+                    actions={
+                      <>
+                        {showInterrupt && task.id === session?.last_task_id ? (
+                          <Button danger size="small" onClick={() => void handleInterrupt()} loading={interrupting}>
+                            中断任务
+                          </Button>
+                        ) : null}
+                        <Button size="small" onClick={() => router.push(`/tasks/${task.id}`)}>
+                          打开任务页
+                        </Button>
+                      </>
+                    }
+                    badge="任务"
+                    content={liveTaskDigest}
+                    role="assistant"
+                    sender="haor"
+                    time={formatChatTime(task.updated_at)}
+                    tone="task"
+                  />
+                ) : null}
+              </div>
+            </div>
+
+            <footer className="haor-chat-composer">
+              <div className="haor-chat-composer-box">
+                <Input.TextArea
+                  autoSize={{ minRows: 2, maxRows: 6 }}
+                  className="haor-chat-composer-input"
+                  value={inputValue}
+                  placeholder="发送消息给 haor，像聊天一样提问、追问或描述你想执行的操作。"
+                  onChange={(event) => setInputValue(event.target.value)}
+                  onPressEnter={(event) => {
+                    if (event.shiftKey) {
+                      return;
+                    }
+                    event.preventDefault();
+                    void handleSend(inputValue);
+                  }}
+                  disabled={sendDisabled}
+                />
+                <div className="haor-chat-composer-footer">
+                  <span className="haor-chat-composer-hint">{composerHint}</span>
+                  <Button
+                    type="primary"
+                    className="haor-chat-send-button"
+                    onClick={() => void handleSend(inputValue)}
+                    loading={sending}
+                    disabled={sendDisabled || !inputValue.trim()}
+                  >
+                    发送
+                  </Button>
+                </div>
+              </div>
+            </footer>
+          </section>
+        </div>
+      ) : null}
+    </>
+  );
+}
