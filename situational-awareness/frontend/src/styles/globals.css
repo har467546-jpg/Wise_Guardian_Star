@@ -2957,8 +2957,17 @@ pre {
 }
 
 .haor-chat-composer-input,
-.haor-chat-composer-input.ant-input {
-  padding: 0;
+.haor-chat-composer-input.ant-input-textarea {
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.haor-chat-composer-textarea,
+.haor-chat-composer-input textarea.ant-input {
+  display: block;
+  min-height: 52px !important;
+  padding: 0 !important;
   border: 0 !important;
   background: transparent !important;
   color: #263022 !important;
@@ -2968,12 +2977,15 @@ pre {
   resize: none;
 }
 
-.haor-chat-composer-input.ant-input:focus,
-.haor-chat-composer-input.ant-input:focus-within {
+.haor-chat-composer-textarea:focus,
+.haor-chat-composer-textarea:focus-within,
+.haor-chat-composer-input textarea.ant-input:focus,
+.haor-chat-composer-input textarea.ant-input:focus-within {
   box-shadow: none !important;
 }
 
-.haor-chat-composer-input::placeholder {
+.haor-chat-composer-textarea::placeholder,
+.haor-chat-composer-input textarea.ant-input::placeholder {
   color: #6f7b69;
 }
 
@@ -4734,13 +4746,19 @@ a {
 }
 
 .haor-chat-composer-input,
-.haor-chat-composer-input.ant-input {
-  border-color: rgba(173, 199, 227, 0.22) !important;
-  background: rgba(248, 251, 255, 0.96) !important;
+.haor-chat-composer-input.ant-input-textarea {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.haor-chat-composer-textarea,
+.haor-chat-composer-input textarea.ant-input {
+  background: transparent !important;
   color: var(--text-primary) !important;
 }
 
-.haor-chat-composer-input::placeholder {
+.haor-chat-composer-textarea::placeholder,
+.haor-chat-composer-input textarea.ant-input::placeholder {
   color: rgba(127, 145, 166, 0.72) !important;
 }
 

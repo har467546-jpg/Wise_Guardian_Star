@@ -1887,7 +1887,8 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
               <div className="haor-chat-composer-box">
                 <Input.TextArea
                   autoSize={{ minRows: 2, maxRows: 6 }}
-                  className="haor-chat-composer-input"
+                  rootClassName="haor-chat-composer-input"
+                  classNames={{ textarea: "haor-chat-composer-textarea" }}
                   value={inputValue}
                   placeholder="发送消息给 haor，像聊天一样提问、追问或描述你想执行的操作。"
                   onChange={(event) => setInputValue(event.target.value)}
