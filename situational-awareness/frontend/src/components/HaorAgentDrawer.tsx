@@ -72,6 +72,16 @@ type AssistantPlaceholder = {
   tone?: "action" | "error" | "plan" | "task";
 };
 
+type PendingMessageTurnState = {
+  clientMessageId: string;
+  content: string;
+  pageContext: AgentPageContext;
+  browserContext: AgentBrowserContext;
+  fallbackUsed: boolean;
+  acked: boolean;
+  timerId: number | null;
+};
+
 type PendingUiStepState = {
   stepRequestId: string;
   browserContext: AgentBrowserContext;
@@ -81,6 +91,7 @@ type PendingUiStepState = {
   timerId: number | null;
 };
 
+const MESSAGE_TURN_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_FAIL_OPEN_TEXT = "上次页面动作未收到继续结果，已结束等待。你可以继续提问、重试，或新开会话。";
 
@@ -447,6 +458,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   const ignoredClientMessageIdsRef = useRef<Set<string>>(new Set());
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptsRef = useRef(0);
+  const pendingMessageTurnRef = useRef<PendingMessageTurnState | null>(null);
   const pendingUiRequestRef = useRef<{ turnId: string; uiActions: AgentUIAction[]; content?: string | null } | null>(null);
   const pendingUiStepRef = useRef<PendingUiStepState | null>(null);
   const shouldReconnectRef = useRef(false);
@@ -610,6 +622,84 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         : runningStateResolving
           ? "正在校验最近任务状态；可继续输入，或先中断当前任务"
           : "Shift+Enter 换行，Enter 发送";
+
+  const clearPendingMessageTurnTimer = () => {
+    const current = pendingMessageTurnRef.current;
+    if (!current?.timerId) {
+      return;
+    }
+    window.clearTimeout(current.timerId);
+    current.timerId = null;
+  };
+
+  const markPendingMessageTurnAcked = (clientMessageId?: string | null) => {
+    const current = pendingMessageTurnRef.current;
+    if (!current) {
+      return false;
+    }
+    if (clientMessageId && current.clientMessageId !== clientMessageId) {
+      return false;
+    }
+    current.acked = true;
+    clearPendingMessageTurnTimer();
+    return true;
+  };
+
+  const resetPendingMessageTurnState = () => {
+    clearPendingMessageTurnTimer();
+    pendingMessageTurnRef.current = null;
+  };
+
+  const settlePendingMessageTurn = (clientMessageId?: string | null) => {
+    const current = pendingMessageTurnRef.current;
+    if (!current) {
+      return false;
+    }
+    if (clientMessageId && current.clientMessageId !== clientMessageId) {
+      return false;
+    }
+    markPendingMessageTurnAcked(clientMessageId);
+    resetPendingMessageTurnState();
+    setSending(false);
+    setAssistantPlaceholder((currentPlaceholder) =>
+      currentPlaceholder?.content === "正在生成…" ? null : currentPlaceholder,
+    );
+    return true;
+  };
+
+  const syncPendingMessageTurnFromSession = (nextSession: AgentSession | null) => {
+    const current = pendingMessageTurnRef.current;
+    if (!current || !nextSession) {
+      return;
+    }
+    const nextRuntime = toBrowserRuntime(nextSession);
+    const nextPhase = typeof nextRuntime.phase === "string" ? nextRuntime.phase.trim() : "";
+    const nextCurrentMessageRequestId =
+      typeof nextRuntime.current_message_request_id === "string" ? nextRuntime.current_message_request_id.trim() : "";
+    const nextLastMessageRequestId =
+      typeof nextRuntime.last_message_request_id === "string" ? nextRuntime.last_message_request_id.trim() : "";
+    if (nextCurrentMessageRequestId && nextCurrentMessageRequestId === current.clientMessageId) {
+      markPendingMessageTurnAcked(current.clientMessageId);
+      setSending(true);
+      setAssistantPlaceholder((currentPlaceholder) =>
+        currentPlaceholder?.content === "正在继续处理当前请求…"
+          ? currentPlaceholder
+          : {
+              key: current.clientMessageId,
+              badge: "生成中",
+              content: "正在生成…",
+            },
+      );
+      return;
+    }
+    if (nextLastMessageRequestId && nextLastMessageRequestId === current.clientMessageId && nextPhase !== "awaiting_agent_reply") {
+      settlePendingMessageTurn(current.clientMessageId);
+      return;
+    }
+    if (current.acked && !nextCurrentMessageRequestId) {
+      settlePendingMessageTurn(current.clientMessageId);
+    }
+  };
 
   const clearPendingUiStepTimer = () => {
     const current = pendingUiStepRef.current;

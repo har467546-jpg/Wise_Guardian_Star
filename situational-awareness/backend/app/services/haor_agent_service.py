@@ -133,6 +133,7 @@ SUPPORTED_UI_ACTIONS = {
 }
 MAX_AGENT_LOOP_STEPS = 10
 MAX_UI_ACTION_BATCH = 6
+MESSAGE_TURN_STALE_SECONDS = 120
 UI_FEEDBACK_STALE_SECONDS = 300
 
 logger = logging.getLogger(__name__)
@@ -716,6 +717,10 @@ def _normalize_browser_runtime(browser_runtime: dict[str, Any] | None) -> dict[s
         "retry_state": sanitize_json_value(payload.get("retry_state") if isinstance(payload.get("retry_state"), dict) else {}),
         "last_user_intent": sanitize_text(str(payload.get("last_user_intent") or ""), max_length=240) or None,
         "last_error": sanitize_text(str(payload.get("last_error") or ""), max_length=240) or None,
+        "current_message_request_id": _sanitize_line(str(payload.get("current_message_request_id") or ""), max_length=128) or None,
+        "message_pending_since": _to_runtime_timestamp(_parse_runtime_timestamp(payload.get("message_pending_since"))),
+        "last_message_request_id": _sanitize_line(str(payload.get("last_message_request_id") or ""), max_length=128) or None,
+        "last_message_ack_at": _to_runtime_timestamp(_parse_runtime_timestamp(payload.get("last_message_ack_at"))),
         "ui_pending_since": _to_runtime_timestamp(_parse_runtime_timestamp(payload.get("ui_pending_since"))),
         "last_step_request_id": _sanitize_line(str(payload.get("last_step_request_id") or ""), max_length=128) or None,
         "last_step_ack_at": _to_runtime_timestamp(_parse_runtime_timestamp(payload.get("last_step_ack_at"))),
@@ -1725,8 +1730,29 @@ def _has_stale_ui_feedback_message(session: AgentSession) -> bool:
     return False
 
 
+def _has_stale_message_turn_message(session: AgentSession) -> bool:
+    for item in reversed(list(session.messages or [])[-12:]):
+        payload = item.payload_json if isinstance(item.payload_json, dict) else {}
+        if payload.get("stale_message_turn"):
+            return True
+    return False
+
+
+def _normalize_client_message_id(value: str | None) -> str | None:
+    return _sanitize_line(str(value or ""), max_length=128) or None
+
+
 def _normalize_step_request_id(value: str | None) -> str | None:
     return _sanitize_line(str(value or ""), max_length=128) or None
+
+
+def _is_duplicate_message_request(browser_runtime: dict[str, Any], *, client_message_id: str | None) -> bool:
+    if not client_message_id:
+        return False
+    return client_message_id in {
+        _normalize_client_message_id(browser_runtime.get("current_message_request_id")),
+        _normalize_client_message_id(browser_runtime.get("last_message_request_id")),
+    }
 
 
 def _is_duplicate_step_request(browser_runtime: dict[str, Any], *, step_request_id: str | None) -> bool:
@@ -1800,6 +1826,72 @@ def _reconcile_running_session_state(
     return False
 
 
+def _reconcile_stale_message_turn_state(
+    db: Session,
+    *,
+    session: AgentSession,
+    source: str = "message_turn_reconcile",
+) -> bool:
+    browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    if str(browser_runtime.get("phase") or "") != "awaiting_agent_reply":
+        return False
+    client_message_id = _normalize_client_message_id(browser_runtime.get("current_message_request_id"))
+    if not client_message_id:
+        return False
+    pending_since = _parse_runtime_timestamp(browser_runtime.get("message_pending_since")) or (
+        session.updated_at.astimezone(timezone.utc) if isinstance(session.updated_at, datetime) else None
+    )
+    if pending_since is None:
+        return False
+    if (_now() - pending_since).total_seconds() < MESSAGE_TURN_STALE_SECONDS:
+        return False
+
+    browser_context = _normalize_browser_context(
+        browser_runtime.get("last_browser_context") if isinstance(browser_runtime.get("last_browser_context"), dict) else {}
+    )
+    _clear_browser_runtime(
+        session,
+        browser_context=browser_context,
+        last_user_intent=str(browser_runtime.get("last_user_intent") or "") or None,
+        current_objective=str(browser_runtime.get("current_objective") or "") or None,
+        objective_kind=str(browser_runtime.get("objective_kind") or "") or None,
+        auto_executed_actions=browser_runtime.get("auto_executed_actions")
+        if isinstance(browser_runtime.get("auto_executed_actions"), list)
+        else [],
+        last_message_request_id=client_message_id,
+        last_message_ack_at=_now(),
+    )
+    session.status = "active"
+    db.add(session)
+    if not _has_stale_message_turn_message(session):
+        _append_message(
+            db,
+            session=session,
+            role="assistant",
+            message_type="text",
+            content="检测到上一轮消息处理已超时，已为你结束等待状态；如需继续，请重新发送或改写问题。",
+            payload_json={
+                "stale_message_turn": True,
+                "client_message_id": client_message_id,
+                "source": source,
+                "expired_after_seconds": MESSAGE_TURN_STALE_SECONDS,
+            },
+        )
+    logger.info(
+        "haor stale message turn reconciled",
+        extra={
+            "agent_session_id": session.id,
+            "agent_client_message_id": client_message_id,
+            "agent_phase": "awaiting_agent_reply",
+            "agent_result": "stale",
+            "agent_source": source,
+        },
+    )
+    return True
+
+
 def _reconcile_stale_ui_feedback_state(
     db: Session,
     *,
@@ -1867,14 +1959,68 @@ def _reconcile_session_runtime_state(
     *,
     session: AgentSession,
     interrupted_source: str = "session_reconcile",
+    message_stale_source: str = "message_turn_reconcile",
     stale_source: str = "ui_feedback_reconcile",
 ) -> bool:
     changed = False
     if _reconcile_running_session_state(db, session=session, interrupted_source=interrupted_source):
         changed = True
+    if _reconcile_stale_message_turn_state(db, session=session, source=message_stale_source):
+        changed = True
     if _reconcile_stale_ui_feedback_state(db, session=session, source=stale_source):
         changed = True
     return changed
+
+
+def _refresh_message_turn_if_active(
+    db: Session,
+    *,
+    session: AgentSession,
+    client_message_id: str | None,
+    turn_id: str | None,
+    phase: str,
+) -> bool:
+    normalized_client_message_id = _normalize_client_message_id(client_message_id)
+    if not normalized_client_message_id:
+        return True
+    db.refresh(session)
+    browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    current_message_request_id = _normalize_client_message_id(browser_runtime.get("current_message_request_id"))
+    if str(browser_runtime.get("phase") or "") == "awaiting_agent_reply" and current_message_request_id == normalized_client_message_id:
+        return True
+    logger.info(
+        "haor message turn abandoned",
+        extra={
+            "agent_session_id": session.id,
+            "agent_turn_id": turn_id,
+            "agent_client_message_id": normalized_client_message_id,
+            "agent_phase": phase,
+            "agent_result": "abandoned",
+        },
+    )
+    return False
+
+
+def _log_message_turn_event(
+    *,
+    session_id: str,
+    turn_id: str | None,
+    client_message_id: str | None,
+    phase: str,
+    result: str,
+) -> None:
+    logger.info(
+        "haor message turn event",
+        extra={
+            "agent_session_id": session_id,
+            "agent_turn_id": turn_id,
+            "agent_client_message_id": client_message_id,
+            "agent_phase": phase,
+            "agent_result": result,
+        },
+    )
 
 
 def _raise_if_session_running(session: AgentSession | None, *, stage: str) -> None:
@@ -3803,6 +3949,11 @@ def _set_browser_runtime(
     step_count: int | None = None,
     retry_state: dict[str, Any] | None = None,
     last_error: str | None = None,
+    clear_message_pending: bool = False,
+    current_message_request_id: str | None = None,
+    message_pending_since: datetime | None = None,
+    last_message_request_id: str | None = None,
+    last_message_ack_at: datetime | None = None,
     ui_pending_since: datetime | None = None,
     last_step_request_id: str | None = None,
     last_step_ack_at: datetime | None = None,
@@ -3825,6 +3976,26 @@ def _set_browser_runtime(
             "retry_state": retry_state if retry_state is not None else current.get("retry_state"),
             "last_user_intent": last_user_intent if last_user_intent is not None else current.get("last_user_intent"),
             "last_error": last_error,
+            "current_message_request_id": None
+            if clear_message_pending
+            else (
+                current_message_request_id
+                if current_message_request_id is not None
+                else current.get("current_message_request_id")
+            ),
+            "message_pending_since": None
+            if clear_message_pending
+            else (
+                _to_runtime_timestamp(message_pending_since)
+                if message_pending_since is not None
+                else current.get("message_pending_since")
+            ),
+            "last_message_request_id": last_message_request_id
+            if last_message_request_id is not None
+            else current.get("last_message_request_id"),
+            "last_message_ack_at": _to_runtime_timestamp(last_message_ack_at)
+            if last_message_ack_at is not None
+            else current.get("last_message_ack_at"),
             "ui_pending_since": _to_runtime_timestamp(ui_pending_since) if ui_pending_since is not None else current.get("ui_pending_since"),
             "last_step_request_id": last_step_request_id if last_step_request_id is not None else current.get("last_step_request_id"),
             "last_step_ack_at": _to_runtime_timestamp(last_step_ack_at) if last_step_ack_at is not None else current.get("last_step_ack_at"),
@@ -3841,6 +4012,8 @@ def _clear_browser_runtime(
     objective_kind: str | None = None,
     auto_executed_actions: list[dict[str, Any]] | None = None,
     last_error: str | None = None,
+    last_message_request_id: str | None = None,
+    last_message_ack_at: datetime | None = None,
     last_step_request_id: str | None = None,
     last_step_ack_at: datetime | None = None,
 ) -> None:
@@ -3862,6 +4035,14 @@ def _clear_browser_runtime(
             "retry_state": {},
             "last_user_intent": last_user_intent,
             "last_error": last_error,
+            "current_message_request_id": None,
+            "message_pending_since": None,
+            "last_message_request_id": last_message_request_id
+            if last_message_request_id is not None
+            else current.get("last_message_request_id"),
+            "last_message_ack_at": _to_runtime_timestamp(last_message_ack_at)
+            if last_message_ack_at is not None
+            else current.get("last_message_ack_at"),
             "ui_pending_since": None,
             "last_step_request_id": last_step_request_id if last_step_request_id is not None else current.get("last_step_request_id"),
             "last_step_ack_at": _to_runtime_timestamp(last_step_ack_at) if last_step_ack_at is not None else current.get("last_step_ack_at"),
@@ -4014,6 +4195,8 @@ def _apply_agent_decision(
     existing_pending_plan: dict[str, Any],
     has_pending_plan: bool,
     platform_url: str,
+    message_request_id: str | None = None,
+    message_request_ack_at: datetime | None = None,
     stream_emitter: _AgentStreamEmitter | None = None,
     turn_id: str | None = None,
 ) -> None:
@@ -4115,6 +4298,8 @@ def _apply_agent_decision(
             current_objective=decision.objective or current_objective.get("summary"),
             objective_kind=str(current_objective.get("objective_kind") or ""),
             auto_executed_actions=auto_execute_results,
+            last_message_request_id=message_request_id,
+            last_message_ack_at=message_request_ack_at,
         )
         message = _append_or_stream_assistant_message(
             db,
@@ -4148,6 +4333,8 @@ def _apply_agent_decision(
                 last_user_intent=user_content,
                 auto_executed_actions=auto_execute_results,
                 last_error="已达到站内代理动作上限，请重新描述更具体的目标。",
+                last_message_request_id=message_request_id,
+                last_message_ack_at=message_request_ack_at,
             )
             message = _append_message(
                 db,
@@ -4187,6 +4374,9 @@ def _apply_agent_decision(
             last_ui_results=[],
             auto_executed_actions=auto_execute_results,
             step_count=next_step_count,
+            clear_message_pending=message_request_id is not None,
+            last_message_request_id=message_request_id,
+            last_message_ack_at=message_request_ack_at,
             ui_pending_since=_now(),
         )
         content = decision.reply_markdown.strip() or (
@@ -4220,6 +4410,8 @@ def _apply_agent_decision(
         current_objective=decision.objective or current_objective.get("summary"),
         objective_kind=str(current_objective.get("objective_kind") or ""),
         auto_executed_actions=auto_execute_results,
+        last_message_request_id=message_request_id,
+        last_message_ack_at=message_request_ack_at,
     )
 
     if needs_confirmation:
@@ -4297,6 +4489,32 @@ def post_agent_message(
         session = _create_session(db, user=user)
         db.flush()
     _raise_if_session_running(session, stage="message")
+    client_message_id = _normalize_client_message_id(payload.client_message_id) or f"haor-msg-{uuid4().hex[:12]}"
+
+    current_browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    current_phase = str(current_browser_runtime.get("phase") or "")
+    current_message_request_id = _normalize_client_message_id(current_browser_runtime.get("current_message_request_id"))
+    if _is_duplicate_message_request(current_browser_runtime, client_message_id=client_message_id):
+        _log_message_turn_event(
+            session_id=session.id,
+            turn_id=turn_id,
+            client_message_id=client_message_id,
+            phase=current_phase or "idle",
+            result="duplicate",
+        )
+        _emit_session_snapshot(stream_emitter, session)
+        return serialize_agent_session(session)
+    if current_phase == "awaiting_agent_reply" and current_message_request_id and current_message_request_id != client_message_id:
+        _log_message_turn_event(
+            session_id=session.id,
+            turn_id=turn_id,
+            client_message_id=client_message_id,
+            phase=current_phase,
+            result="conflict",
+        )
+        raise AgentConflictError("当前 haor 正在处理上一轮消息，请稍候或重试", session_id=session.id, stage="message")
 
     page_context = _normalize_page_context(payload.page_context.model_dump(mode="json"))
     browser_context = _normalize_browser_context(payload.browser_context.model_dump(mode="json"))
@@ -4309,9 +4527,6 @@ def post_agent_message(
     session.updated_at = _now()
     if session.status in {"completed", "failed"}:
         session.status = "active"
-    current_browser_runtime = _normalize_browser_runtime(
-        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
-    )
     current_browser_runtime["last_browser_context"] = browser_context
     current_browser_runtime["last_user_intent"] = payload.content
     current_browser_runtime["semantic_page_context"] = _browser_semantic_page_context(browser_context)
@@ -4353,7 +4568,7 @@ def post_agent_message(
         message_type="text",
         content=payload.content,
         payload_json={
-            **({"client_message_id": payload.client_message_id} if payload.client_message_id else {}),
+            "client_message_id": client_message_id,
             "page_context": page_context,
             "browser_context": browser_context,
             "working_context": working_context,
@@ -4361,9 +4576,64 @@ def post_agent_message(
             "followup_hint": followup_hint,
         },
     )
+    accepted_at = _now()
+    _set_browser_runtime(
+        session,
+        phase="awaiting_agent_reply",
+        browser_context=browser_context,
+        last_user_intent=payload.content,
+        current_objective=current_objective.get("summary"),
+        objective_kind=str(current_objective.get("objective_kind") or ""),
+        planned_steps=current_browser_runtime.get("planned_steps")
+        if isinstance(current_browser_runtime.get("planned_steps"), list)
+        else [],
+        step_cursor=int(current_browser_runtime.get("step_cursor") or 0),
+        pending_ui_actions=current_browser_runtime.get("pending_ui_actions")
+        if isinstance(current_browser_runtime.get("pending_ui_actions"), list)
+        else [],
+        completed_ui_actions=current_browser_runtime.get("completed_ui_actions")
+        if isinstance(current_browser_runtime.get("completed_ui_actions"), list)
+        else [],
+        last_ui_results=current_browser_runtime.get("last_ui_results")
+        if isinstance(current_browser_runtime.get("last_ui_results"), list)
+        else [],
+        auto_executed_actions=current_browser_runtime.get("auto_executed_actions")
+        if isinstance(current_browser_runtime.get("auto_executed_actions"), list)
+        else [],
+        step_count=int(current_browser_runtime.get("step_count") or 0),
+        retry_state=current_browser_runtime.get("retry_state")
+        if isinstance(current_browser_runtime.get("retry_state"), dict)
+        else {},
+        last_error=None,
+        current_message_request_id=client_message_id,
+        message_pending_since=accepted_at,
+        last_message_request_id=client_message_id,
+        last_message_ack_at=accepted_at,
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    current_browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    _log_message_turn_event(
+        session_id=session.id,
+        turn_id=turn_id,
+        client_message_id=client_message_id,
+        phase="awaiting_agent_reply",
+        result="accepted",
+    )
     _emit_session_snapshot(stream_emitter, session)
 
     if has_pending_plan and _should_cancel_pending_plan(payload.content):
+        if not _refresh_message_turn_if_active(
+            db,
+            session=session,
+            client_message_id=client_message_id,
+            turn_id=turn_id,
+            phase="cancel_pending_plan",
+        ):
+            return serialize_agent_session(session)
         _preserve_or_reset_pending_plan(session, existing_pending_plan=existing_pending_plan, preserve_existing=False)
         _clear_dialog_state(session)
         _append_message(
@@ -4379,14 +4649,40 @@ def post_agent_message(
                 "pending_plan_cleared": True,
             },
         )
-        _clear_browser_runtime(session, browser_context=browser_context, last_user_intent=payload.content)
+        _clear_browser_runtime(
+            session,
+            browser_context=browser_context,
+            last_user_intent=payload.content,
+            last_message_request_id=client_message_id,
+            last_message_ack_at=accepted_at,
+        )
         db.commit()
         db.refresh(session)
+        _log_message_turn_event(
+            session_id=session.id,
+            turn_id=turn_id,
+            client_message_id=client_message_id,
+            phase=str(
+                _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}).get(
+                    "phase"
+                )
+                or "idle"
+            ),
+            result="completed",
+        )
         _emit_streamed_assistant_message(stream_emitter, turn_id=turn_id or str(uuid4()), message=session.messages[-1])
         _emit_session_snapshot(stream_emitter, session)
         return serialize_agent_session(session)
 
     if current_dialog_state and followup_hint.get("reply_kind") == "deny":
+        if not _refresh_message_turn_if_active(
+            db,
+            session=session,
+            client_message_id=client_message_id,
+            turn_id=turn_id,
+            phase="followup_deny",
+        ):
+            return serialize_agent_session(session)
         _preserve_or_reset_pending_plan(
             session,
             existing_pending_plan=existing_pending_plan,
@@ -4406,9 +4702,27 @@ def post_agent_message(
                 "followup_resolution": {"status": "canceled"},
             },
         )
-        _clear_browser_runtime(session, browser_context=browser_context, last_user_intent=payload.content)
+        _clear_browser_runtime(
+            session,
+            browser_context=browser_context,
+            last_user_intent=payload.content,
+            last_message_request_id=client_message_id,
+            last_message_ack_at=accepted_at,
+        )
         db.commit()
         db.refresh(session)
+        _log_message_turn_event(
+            session_id=session.id,
+            turn_id=turn_id,
+            client_message_id=client_message_id,
+            phase=str(
+                _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}).get(
+                    "phase"
+                )
+                or "idle"
+            ),
+            result="completed",
+        )
         _emit_streamed_assistant_message(stream_emitter, turn_id=turn_id or str(uuid4()), message=session.messages[-1])
         _emit_session_snapshot(stream_emitter, session)
         return serialize_agent_session(session)
@@ -4420,6 +4734,14 @@ def post_agent_message(
         followup_hint=followup_hint,
     )
     if internal_followup_decision is not None:
+        if not _refresh_message_turn_if_active(
+            db,
+            session=session,
+            client_message_id=client_message_id,
+            turn_id=turn_id,
+            phase="internal_followup",
+        ):
+            return serialize_agent_session(session)
         _apply_agent_decision(
             db,
             session=session,
@@ -4436,11 +4758,25 @@ def post_agent_message(
             existing_pending_plan=existing_pending_plan,
             has_pending_plan=has_pending_plan,
             platform_url=platform_url,
+            message_request_id=client_message_id,
+            message_request_ack_at=accepted_at,
             stream_emitter=stream_emitter,
             turn_id=turn_id,
         )
         db.commit()
         db.refresh(session)
+        _log_message_turn_event(
+            session_id=session.id,
+            turn_id=turn_id,
+            client_message_id=client_message_id,
+            phase=str(
+                _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}).get(
+                    "phase"
+                )
+                or "idle"
+            ),
+            result="completed",
+        )
         _emit_session_snapshot(stream_emitter, session)
         return serialize_agent_session(session)
 
@@ -4451,6 +4787,14 @@ def post_agent_message(
             page_context=page_context,
         )
         if preflight_clarification:
+            if not _refresh_message_turn_if_active(
+                db,
+                session=session,
+                client_message_id=client_message_id,
+                turn_id=turn_id,
+                phase="preflight_clarifying",
+            ):
+                return serialize_agent_session(session)
             _preserve_or_reset_pending_plan(
                 session,
                 existing_pending_plan=existing_pending_plan,
@@ -4475,9 +4819,27 @@ def post_agent_message(
                     "dialog_state": sanitize_json_value(session.dialog_state_json),
                 },
             )
-            _clear_browser_runtime(session, browser_context=browser_context, last_user_intent=payload.content)
+            _clear_browser_runtime(
+                session,
+                browser_context=browser_context,
+                last_user_intent=payload.content,
+                last_message_request_id=client_message_id,
+                last_message_ack_at=accepted_at,
+            )
             db.commit()
             db.refresh(session)
+            _log_message_turn_event(
+                session_id=session.id,
+                turn_id=turn_id,
+                client_message_id=client_message_id,
+                phase=str(
+                    _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}).get(
+                        "phase"
+                    )
+                    or "idle"
+                ),
+                result="completed",
+            )
             _emit_streamed_assistant_message(stream_emitter, turn_id=turn_id or str(uuid4()), message=session.messages[-1])
             _emit_session_snapshot(stream_emitter, session)
             return serialize_agent_session(session)
@@ -4501,6 +4863,14 @@ def post_agent_message(
             turn_id=turn_id,
         )
     except Exception as exc:
+        if not _refresh_message_turn_if_active(
+            db,
+            session=session,
+            client_message_id=client_message_id,
+            turn_id=turn_id,
+            phase="run_loop_error",
+        ):
+            return serialize_agent_session(session)
         _preserve_or_reset_pending_plan(
             session,
             existing_pending_plan=existing_pending_plan,
@@ -4512,6 +4882,8 @@ def post_agent_message(
             browser_context=browser_context,
             last_user_intent=payload.content,
             last_error=_humanize_ai_error(exc),
+            last_message_request_id=client_message_id,
+            last_message_ack_at=accepted_at,
         )
         message = _append_message(
             db,
@@ -4529,6 +4901,18 @@ def post_agent_message(
         )
         db.commit()
         db.refresh(session)
+        _log_message_turn_event(
+            session_id=session.id,
+            turn_id=turn_id,
+            client_message_id=client_message_id,
+            phase=str(
+                _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}).get(
+                    "phase"
+                )
+                or "idle"
+            ),
+            result="error",
+        )
         _emit_error_event(
             stream_emitter,
             detail=message.content,
@@ -4548,6 +4932,14 @@ def post_agent_message(
     if internal_scan_decision is not None:
         decision = internal_scan_decision
 
+    if not _refresh_message_turn_if_active(
+        db,
+        session=session,
+        client_message_id=client_message_id,
+        turn_id=turn_id,
+        phase="apply_decision",
+    ):
+        return serialize_agent_session(session)
     _apply_agent_decision(
         db,
         session=session,
@@ -4564,11 +4956,25 @@ def post_agent_message(
         existing_pending_plan=existing_pending_plan,
         has_pending_plan=has_pending_plan,
         platform_url=platform_url,
+        message_request_id=client_message_id,
+        message_request_ack_at=accepted_at,
         stream_emitter=stream_emitter,
         turn_id=turn_id,
     )
     db.commit()
     db.refresh(session)
+    _log_message_turn_event(
+        session_id=session.id,
+        turn_id=turn_id,
+        client_message_id=client_message_id,
+        phase=str(
+            _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}).get(
+                "phase"
+            )
+            or "idle"
+        ),
+        result="completed",
+    )
     _emit_session_snapshot(stream_emitter, session)
     return serialize_agent_session(session)
 
