@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -172,6 +173,60 @@ def test_get_haor_session_creates_and_recovers_latest_session(monkeypatch) -> No
     assert second.status_code == 200
     assert first.json()["session_id"] == second.json()["session_id"]
     assert first.json()["messages"] == []
+
+
+def test_get_haor_session_reconciles_stale_pending_ui_feedback_once(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    stale_at = datetime.now(timezone.utc) - timedelta(minutes=6)
+
+    with SessionLocal() as db:
+        db.add(
+            AgentSession(
+                id=str(uuid4()),
+                agent_id="haor",
+                user_id=user_id,
+                status="active",
+                route_context_json=_page_context(pathname="/"),
+                working_context_json={},
+                dialog_state_json={},
+                pending_plan_json={},
+                browser_runtime_json={
+                    "phase": "awaiting_ui_feedback",
+                    "pending_ui_actions": [
+                        {
+                            "action_id": "ui-stale-1",
+                            "action_type": "navigate",
+                            "target_node_id": "haor-node-2",
+                            "retryable": False,
+                        }
+                    ],
+                    "completed_ui_actions": [],
+                    "last_ui_results": [],
+                    "last_browser_context": _browser_context(pathname="/"),
+                    "last_user_intent": "帮我扫描 192.168.130.0/24",
+                },
+                updated_at=stale_at,
+                created_at=stale_at,
+            )
+        )
+        db.commit()
+
+    first = client.get("/api/v1/agent/haor/session")
+    second = client.get("/api/v1/agent/haor/session")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["status"] == "active"
+    assert first_body["browser_runtime_json"]["phase"] == "idle"
+    assert first_body["browser_runtime_json"]["pending_ui_actions"] == []
+    stale_messages = [item for item in first_body["messages"] if item["payload_json"].get("stale_ui_feedback")]
+    assert len(stale_messages) == 1
+    assert "已为你解除等待状态" in stale_messages[0]["content"]
+    second_stale_messages = [item for item in second_body["messages"] if item["payload_json"].get("stale_ui_feedback")]
+    assert len(second_stale_messages) == 1
 
 
 def test_post_haor_message_returns_clarifying_message_when_context_missing(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -732,6 +787,7 @@ def test_post_haor_message_can_drive_ui_step_roundtrip(monkeypatch) -> None:  # 
     second = client.post(
         "/api/v1/agent/haor/session/steps",
         json={
+            "step_request_id": "step-http-1",
             "browser_context": _browser_context(pathname="/tasks/task-1", task_id="task-1"),
             "ui_action_results": [
                 {
@@ -753,6 +809,7 @@ def test_post_haor_message_can_drive_ui_step_roundtrip(monkeypatch) -> None:  # 
     assert second_body["messages"][-1]["message_type"] == "text"
     assert "已打开当前任务详情并完成分析" in second_body["messages"][-1]["content"]
     assert second_body["browser_runtime_json"]["pending_ui_actions"] == []
+    assert second_body["browser_runtime_json"]["last_step_request_id"] == "step-http-1"
 
 
 def test_admin_message_can_auto_execute_safe_action(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1397,6 +1454,7 @@ def test_haor_websocket_ui_step_continues_turn_flow(monkeypatch) -> None:  # typ
     client, user_id = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
     call_count = {"value": 0}
+    step_request_id = "step-ws-1"
 
     class _FakeProvider:
         def stream_generate(self, request):  # type: ignore[no-untyped-def]
@@ -1459,6 +1517,7 @@ def test_haor_websocket_ui_step_continues_turn_flow(monkeypatch) -> None:  # typ
         websocket.send_json(
             {
                 "type": "ui_step",
+                "step_request_id": step_request_id,
                 "browser_context": _browser_context(pathname="/tasks/task-1", task_id="task-1"),
                 "ui_action_results": [
                     {
@@ -1475,6 +1534,25 @@ def test_haor_websocket_ui_step_continues_turn_flow(monkeypatch) -> None:  # typ
         )
         second_events = _receive_ws_events_until(websocket, stop_type="turn_done")
 
+    duplicate = client.post(
+        "/api/v1/agent/haor/session/steps",
+        json={
+            "step_request_id": step_request_id,
+            "browser_context": _browser_context(pathname="/tasks/task-1", task_id="task-1"),
+            "ui_action_results": [
+                {
+                    "action_id": action_id,
+                    "action_type": "click",
+                    "ok": True,
+                    "target_node_id": "haor-node-task-1",
+                    "resolved_node_id": "haor-node-task-1",
+                    "message": "已打开任务详情",
+                    "detail_json": {},
+                }
+            ],
+        },
+    )
+
     first_event_types = [item["type"] for item in first_events]
     second_event_types = [item["type"] for item in second_events]
     assert "action_update" in first_event_types
@@ -1486,6 +1564,8 @@ def test_haor_websocket_ui_step_continues_turn_flow(monkeypatch) -> None:  # typ
     assert second_event_types.count("turn_done") == 1
     done_event = next(item for item in second_events if item["type"] == "assistant_message_done")
     assert done_event["message"]["content"] == "已在站内完成详情打开，并继续给出分析结果。"
+    assert duplicate.status_code == 200
+    assert duplicate.json()["browser_runtime_json"]["last_step_request_id"] == step_request_id
     assert call_count["value"] == 2
 
 

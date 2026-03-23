@@ -201,6 +201,7 @@ export type AgentMessageCreateRequest = {
 };
 
 export type AgentUIStepRequest = {
+  step_request_id?: string | null;
   browser_context: AgentBrowserContext;
   ui_action_results: AgentUIActionResult[];
 };
@@ -233,6 +234,7 @@ export type AgentStreamServerType =
 export type AgentStreamClientEnvelope = {
   type: AgentStreamClientType;
   client_message_id?: string | null;
+  step_request_id?: string | null;
   content?: string | null;
   note?: string | null;
   page_context?: AgentPageContext;

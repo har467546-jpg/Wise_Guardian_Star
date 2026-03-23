@@ -33,6 +33,7 @@ import type {
   AgentTurnDoneEvent,
   AgentTurnStartedEvent,
   AgentUIAction,
+  AgentUIActionResult,
   AgentUIActionsRequestedEvent,
 } from "@/types/agent";
 import type { TaskEvent, TaskRunDetail } from "@/types/task";
@@ -70,6 +71,18 @@ type AssistantPlaceholder = {
   content: string;
   tone?: "action" | "error" | "plan" | "task";
 };
+
+type PendingUiStepState = {
+  stepRequestId: string;
+  browserContext: AgentBrowserContext;
+  uiActionResults: AgentUIActionResult[];
+  fallbackUsed: boolean;
+  acked: boolean;
+  timerId: number | null;
+};
+
+const UI_STEP_ACK_TIMEOUT_MS = 8_000;
+const UI_STEP_FAIL_OPEN_TEXT = "上次页面动作未收到继续结果，已结束等待。你可以继续提问、重试，或新开会话。";
 
 type ChatBubbleProps = {
   actions?: ReactNode;
@@ -242,6 +255,31 @@ function messageTone(message: AgentMessage): "action" | "error" | "plan" | "task
   }
 }
 
+function actionUpdateTrace(event: AgentActionUpdateEvent): Record<string, unknown> | null {
+  if (!event.trace || typeof event.trace !== "object" || Array.isArray(event.trace)) {
+    return null;
+  }
+  return event.trace;
+}
+
+function isInternalReadToolProgressEvent(event: AgentActionUpdateEvent): boolean {
+  if (event.message) {
+    return false;
+  }
+  const trace = actionUpdateTrace(event);
+  return Boolean(trace && typeof trace.tool_name === "string");
+}
+
+function isSuccessfulInternalReadToolProgressEvent(event: AgentActionUpdateEvent): boolean {
+  const trace = actionUpdateTrace(event);
+  return isInternalReadToolProgressEvent(event) && trace?.ok === true;
+}
+
+function isFailedInternalReadToolProgressEvent(event: AgentActionUpdateEvent): boolean {
+  const trace = actionUpdateTrace(event);
+  return isInternalReadToolProgressEvent(event) && trace?.ok === false;
+}
+
 function planTargetLabel(action: AgentProposedAction): string | null {
   const params = action.params || {};
   const assetId = typeof params.asset_id === "string" ? params.asset_id : null;
@@ -410,6 +448,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const pendingUiRequestRef = useRef<{ turnId: string; uiActions: AgentUIAction[]; content?: string | null } | null>(null);
+  const pendingUiStepRef = useRef<PendingUiStepState | null>(null);
   const shouldReconnectRef = useRef(false);
   const turnPhaseRef = useRef<Record<string, "message" | "ui_step" | "approve">>({});
 
@@ -572,6 +611,75 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
           ? "正在校验最近任务状态；可继续输入，或先中断当前任务"
           : "Shift+Enter 换行，Enter 发送";
 
+  const clearPendingUiStepTimer = () => {
+    const current = pendingUiStepRef.current;
+    if (!current?.timerId) {
+      return;
+    }
+    window.clearTimeout(current.timerId);
+    current.timerId = null;
+  };
+
+  const markPendingUiStepAcked = (stepRequestId?: string | null) => {
+    const current = pendingUiStepRef.current;
+    if (!current) {
+      return false;
+    }
+    if (stepRequestId && current.stepRequestId !== stepRequestId) {
+      return false;
+    }
+    current.acked = true;
+    clearPendingUiStepTimer();
+    return true;
+  };
+
+  const resetPendingUiStepState = () => {
+    clearPendingUiStepTimer();
+    pendingUiStepRef.current = null;
+  };
+
+  const settlePendingUiStep = (stepRequestId?: string | null) => {
+    const current = pendingUiStepRef.current;
+    if (!current) {
+      return false;
+    }
+    if (stepRequestId && current.stepRequestId !== stepRequestId) {
+      return false;
+    }
+    markPendingUiStepAcked(stepRequestId);
+    resetPendingUiStepState();
+    setStepping(false);
+    setAssistantPlaceholder((currentPlaceholder) =>
+      currentPlaceholder?.content === "正在继续处理当前请求…" ? null : currentPlaceholder,
+    );
+    return true;
+  };
+
+  const failOpenPendingUiStep = (text = UI_STEP_FAIL_OPEN_TEXT) => {
+    resetPendingUiStepState();
+    setStepping(false);
+    setAssistantPlaceholder(null);
+    setErrorText(text);
+  };
+
+  const syncPendingUiStepFromSession = (nextSession: AgentSession | null) => {
+    const current = pendingUiStepRef.current;
+    if (!current || !nextSession) {
+      return;
+    }
+    const nextRuntime = toBrowserRuntime(nextSession);
+    const nextLastStepRequestId =
+      typeof nextRuntime.last_step_request_id === "string" ? nextRuntime.last_step_request_id.trim() : "";
+    const nextPendingActions = toPendingUiActions(nextSession);
+    if (nextLastStepRequestId && nextLastStepRequestId === current.stepRequestId) {
+      settlePendingUiStep(current.stepRequestId);
+      return;
+    }
+    if (current.acked && !nextPendingActions.length) {
+      settlePendingUiStep(current.stepRequestId);
+    }
+  };
+
   const syncBrowserContext = (context: AgentPageContext = pageContext) => {
     if (typeof window === "undefined") {
       return { pathname: context.pathname, query: context.query } as AgentBrowserContext;
@@ -632,6 +740,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
       });
     }
     if (event.phase === "ui_step") {
+      markPendingUiStepAcked();
       setStepping(true);
       setAssistantPlaceholder({
         key: event.turn_id,
@@ -662,6 +771,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
       setSending(false);
     }
     if (phase === "ui_step") {
+      settlePendingUiStep();
       setStepping(false);
     }
     if (phase === "approve") {
@@ -714,6 +824,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         if (sessionRef.current && sessionRef.current.session_id !== event.session.session_id) {
           return;
         }
+        syncPendingUiStepFromSession(event.session);
         if (!activeTurnIdRef.current) {
           setDraftAssistantMessage(null);
           setAssistantPlaceholder(null);
@@ -742,12 +853,14 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         if (ignoredTurnIdsRef.current.has(event.turn_id)) {
           return;
         }
+        settlePendingUiStep();
         setDraftAssistantMessage({ turnId: event.turn_id, content: "", messageType: event.message_type });
         return;
       case "assistant_message_delta":
         if (ignoredTurnIdsRef.current.has(event.turn_id)) {
           return;
         }
+        settlePendingUiStep();
         setDraftAssistantMessage((current) => {
           if (!current || current.turnId !== event.turn_id) {
             return { turnId: event.turn_id, content: event.delta, messageType: "text" };
@@ -760,6 +873,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
           ignoredTurnIdsRef.current.delete(event.turn_id);
           return;
         }
+        settlePendingUiStep();
         setAssistantPlaceholder(null);
         setDraftAssistantMessage((current) => (current?.turnId === event.turn_id ? null : current));
         setSession((current) => upsertSessionMessage(current, event.message));
@@ -768,8 +882,18 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         if (ignoredTurnIdsRef.current.has(event.turn_id)) {
           return;
         }
+        settlePendingUiStep();
         if (event.message) {
           setSession((current) => upsertSessionMessage(current, event.message as AgentMessage));
+        } else if (isSuccessfulInternalReadToolProgressEvent(event)) {
+          return;
+        } else if (isFailedInternalReadToolProgressEvent(event)) {
+          appendStreamFeed({
+            id: `action-${event.turn_id}-${Date.now()}`,
+            badge: "错误",
+            content: event.content,
+            tone: "error",
+          });
         } else {
           appendStreamFeed({
             id: `action-${event.turn_id}-${Date.now()}`,
@@ -783,6 +907,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         if (ignoredTurnIdsRef.current.has(event.turn_id)) {
           return;
         }
+        settlePendingUiStep();
         pendingUiRequestRef.current = { turnId: event.turn_id, uiActions: event.ui_actions, content: event.content || null };
         setPendingUiRequest({ turnId: event.turn_id, uiActions: event.ui_actions, content: event.content || null });
         setAssistantPlaceholder({
@@ -796,6 +921,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         if (ignoredTurnIdsRef.current.has(event.turn_id)) {
           return;
         }
+        settlePendingUiStep();
         setAssistantPlaceholder(null);
         setSession((current) => {
           if (!current) {
@@ -810,6 +936,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         });
         return;
       case "task_update":
+        settlePendingUiStep();
         setAssistantPlaceholder(null);
         handleTaskUpdateEvent(event);
         return;
@@ -818,6 +945,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
           ignoredTurnIdsRef.current.delete(event.turn_id);
           return;
         }
+        settlePendingUiStep();
         setAssistantPlaceholder(null);
         if (event.message) {
           setSession((current) => upsertSessionMessage(current, event.message as AgentMessage));
@@ -864,6 +992,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         setLoading(true);
       }
       const result = await getHaorSession();
+      syncPendingUiStepFromSession(result);
       setSession(result);
       if (result.last_task_id) {
         void loadTask(result.last_task_id, true);
@@ -892,6 +1021,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   useEffect(() => {
     if (!open) {
       shouldReconnectRef.current = false;
+      resetPendingUiStepState();
       if (reconnectTimerRef.current) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -946,15 +1076,20 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         setStreamError("haor 流式连接异常，正在尝试恢复");
       };
       socket.onclose = () => {
+        const hasPendingUiStep = Boolean(pendingUiStepRef.current);
         if (wsRef.current === socket) {
           wsRef.current = null;
         }
         setLoading(false);
         setSending(false);
-        setStepping(false);
+        if (!hasPendingUiStep) {
+          setStepping(false);
+        }
         setApproving(false);
         setActiveTurnId(null);
-        setAssistantPlaceholder(null);
+        if (!hasPendingUiStep) {
+          setAssistantPlaceholder(null);
+        }
         setDraftAssistantMessage(null);
         pendingUiRequestRef.current = null;
         setPendingUiRequest(null);
@@ -1080,6 +1215,73 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
     let canceled = false;
     let usedStream = false;
 
+    const applyStepResult = (result: AgentSession) => {
+      syncPendingUiStepFromSession(result);
+      setSession(result);
+      setAssistantPlaceholder(
+        toPendingUiActions(result).length
+          ? {
+              key: result.session_id,
+              badge: "处理中",
+              content: "正在继续处理当前请求…",
+              tone: "action",
+            }
+          : null,
+      );
+      if (result.last_task_id) {
+        void loadTask(result.last_task_id, true);
+      }
+      setErrorText(null);
+      setStreamError(null);
+    };
+
+    const scheduleUiStepFallback = (stepRequestId: string, refreshedBrowserContext: AgentBrowserContext, results: AgentUIActionResult[]) => {
+      const current = pendingUiStepRef.current;
+      if (!current || current.acked || current.fallbackUsed) {
+        return;
+      }
+      clearPendingUiStepTimer();
+      current.timerId = window.setTimeout(async () => {
+        const pendingStep = pendingUiStepRef.current;
+        if (
+          canceled ||
+          !pendingStep ||
+          pendingStep.stepRequestId !== stepRequestId ||
+          pendingStep.acked ||
+          pendingStep.fallbackUsed
+        ) {
+          return;
+        }
+        pendingStep.fallbackUsed = true;
+        try {
+          const result = await postHaorStep({
+            step_request_id: stepRequestId,
+            browser_context: refreshedBrowserContext,
+            ui_action_results: results,
+          });
+          if (canceled) {
+            return;
+          }
+          const latestPendingStep = pendingUiStepRef.current;
+          if (!latestPendingStep || latestPendingStep.stepRequestId !== stepRequestId) {
+            return;
+          }
+          markPendingUiStepAcked(stepRequestId);
+          applyStepResult(result);
+        } catch {
+          if (canceled) {
+            return;
+          }
+          const latestPendingStep = pendingUiStepRef.current;
+          if (!latestPendingStep || latestPendingStep.stepRequestId !== stepRequestId) {
+            return;
+          }
+          failOpenPendingUiStep();
+          message.warning(UI_STEP_FAIL_OPEN_TEXT);
+        }
+      }, UI_STEP_ACK_TIMEOUT_MS);
+    };
+
     const runPendingUiActions = async () => {
       try {
         setStepping(true);
@@ -1092,40 +1294,43 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         await new Promise((resolve) => window.setTimeout(resolve, 320));
         const refreshedPageContext = buildPageContextFromLocation();
         const refreshedBrowserContext = syncBrowserContext(refreshedPageContext);
+        const stepRequestId = createClientId();
+        pendingUiStepRef.current = {
+          stepRequestId,
+          browserContext: refreshedBrowserContext,
+          uiActionResults: results,
+          fallbackUsed: false,
+          acked: false,
+          timerId: null,
+        };
         usedStream = sendStreamFrame({
           type: "ui_step",
+          step_request_id: stepRequestId,
           browser_context: refreshedBrowserContext,
           ui_action_results: results,
         });
+        pendingUiRequestRef.current = null;
+        setPendingUiRequest(null);
+        setErrorText(null);
         if (!usedStream) {
           const result = await postHaorStep({
+            step_request_id: stepRequestId,
             browser_context: refreshedBrowserContext,
             ui_action_results: results,
           });
           if (canceled) {
             return;
           }
-          setSession(result);
-          setAssistantPlaceholder(
-            toPendingUiActions(result).length
-              ? {
-                  key: result.session_id,
-                  badge: "处理中",
-                  content: "正在继续处理当前请求…",
-                  tone: "action",
-                }
-              : null,
-          );
-          if (result.last_task_id) {
-            void loadTask(result.last_task_id, true);
-          }
+          markPendingUiStepAcked(stepRequestId);
+          applyStepResult(result);
+          resetPendingUiStepState();
+        } else {
+          scheduleUiStepFallback(stepRequestId, refreshedBrowserContext, results);
         }
-        pendingUiRequestRef.current = null;
-        setPendingUiRequest(null);
-        setErrorText(null);
       } catch (error) {
         if (!canceled) {
           const text = error instanceof Error ? error.message : "站内动作执行失败";
+          resetPendingUiStepState();
           setAssistantPlaceholder(null);
           setErrorText(text);
           message.error(text);
@@ -1245,6 +1450,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   const handleInterrupt = async () => {
     try {
       setInterrupting(true);
+      resetPendingUiStepState();
       const result = await interruptHaorSession();
       setSession(result);
       if (result.last_task_id) {
@@ -1267,6 +1473,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   const handleReset = async () => {
     try {
       setResetting(true);
+      resetPendingUiStepState();
       const result = await resetHaorSession();
       if (activeTurnIdRef.current) {
         ignoredTurnIdsRef.current.add(activeTurnIdRef.current);

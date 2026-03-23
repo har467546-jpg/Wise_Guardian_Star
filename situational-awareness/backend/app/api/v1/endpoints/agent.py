@@ -339,6 +339,7 @@ def _build_ws_turn_handler(
             )
         if frame.type == "ui_step":
             payload = AgentUIStepRequest(
+                step_request_id=frame.step_request_id,
                 browser_context=frame.browser_context,
                 ui_action_results=frame.ui_action_results,
             )

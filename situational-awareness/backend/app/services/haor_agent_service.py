@@ -133,6 +133,7 @@ SUPPORTED_UI_ACTIONS = {
 }
 MAX_AGENT_LOOP_STEPS = 10
 MAX_UI_ACTION_BATCH = 6
+UI_FEEDBACK_STALE_SECONDS = 300
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +270,25 @@ class AgentExecutionResult:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _to_runtime_timestamp(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _parse_runtime_timestamp(value: Any) -> datetime | None:
+    text = _sanitize_line(str(value or ""), max_length=64)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _sanitize_line(value: str | None, *, max_length: int = 140) -> str:
@@ -696,6 +716,9 @@ def _normalize_browser_runtime(browser_runtime: dict[str, Any] | None) -> dict[s
         "retry_state": sanitize_json_value(payload.get("retry_state") if isinstance(payload.get("retry_state"), dict) else {}),
         "last_user_intent": sanitize_text(str(payload.get("last_user_intent") or ""), max_length=240) or None,
         "last_error": sanitize_text(str(payload.get("last_error") or ""), max_length=240) or None,
+        "ui_pending_since": _to_runtime_timestamp(_parse_runtime_timestamp(payload.get("ui_pending_since"))),
+        "last_step_request_id": _sanitize_line(str(payload.get("last_step_request_id") or ""), max_length=128) or None,
+        "last_step_ack_at": _to_runtime_timestamp(_parse_runtime_timestamp(payload.get("last_step_ack_at"))),
     }
 
 def _working_context_summary(context: dict[str, Any]) -> str | None:
@@ -1694,6 +1717,28 @@ def _has_interrupted_task_message(session: AgentSession, *, task_id: str) -> boo
     return False
 
 
+def _has_stale_ui_feedback_message(session: AgentSession) -> bool:
+    for item in reversed(list(session.messages or [])[-12:]):
+        payload = item.payload_json if isinstance(item.payload_json, dict) else {}
+        if payload.get("stale_ui_feedback"):
+            return True
+    return False
+
+
+def _normalize_step_request_id(value: str | None) -> str | None:
+    return _sanitize_line(str(value or ""), max_length=128) or None
+
+
+def _is_duplicate_step_request(browser_runtime: dict[str, Any], *, step_request_id: str | None) -> bool:
+    if not step_request_id:
+        return False
+    return (
+        _normalize_step_request_id(browser_runtime.get("last_step_request_id"))
+        == _normalize_step_request_id(step_request_id)
+        and _parse_runtime_timestamp(browser_runtime.get("last_step_ack_at")) is not None
+    )
+
+
 def _append_interrupted_task_message(
     db: Session,
     *,
@@ -1755,6 +1800,83 @@ def _reconcile_running_session_state(
     return False
 
 
+def _reconcile_stale_ui_feedback_state(
+    db: Session,
+    *,
+    session: AgentSession,
+    source: str = "ui_feedback_reconcile",
+) -> bool:
+    browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    if str(browser_runtime.get("phase") or "") != "awaiting_ui_feedback":
+        return False
+    pending_ui_actions = browser_runtime.get("pending_ui_actions")
+    if not isinstance(pending_ui_actions, list) or not pending_ui_actions:
+        return False
+    pending_since = _parse_runtime_timestamp(browser_runtime.get("ui_pending_since")) or (
+        session.updated_at.astimezone(timezone.utc) if isinstance(session.updated_at, datetime) else None
+    )
+    if pending_since is None:
+        return False
+    if (_now() - pending_since).total_seconds() < UI_FEEDBACK_STALE_SECONDS:
+        return False
+
+    browser_context = _normalize_browser_context(
+        browser_runtime.get("last_browser_context") if isinstance(browser_runtime.get("last_browser_context"), dict) else {}
+    )
+    _clear_browser_runtime(
+        session,
+        browser_context=browser_context,
+        last_user_intent=str(browser_runtime.get("last_user_intent") or "") or None,
+        current_objective=str(browser_runtime.get("current_objective") or "") or None,
+        objective_kind=str(browser_runtime.get("objective_kind") or "") or None,
+        auto_executed_actions=browser_runtime.get("auto_executed_actions")
+        if isinstance(browser_runtime.get("auto_executed_actions"), list)
+        else [],
+    )
+    session.status = "active"
+    db.add(session)
+    if not _has_stale_ui_feedback_message(session):
+        _append_message(
+            db,
+            session=session,
+            role="assistant",
+            message_type="text",
+            content="检测到上一次页面动作已过期，已为你解除等待状态；如需继续，请重新描述目标。",
+            payload_json={
+                "stale_ui_feedback": True,
+                "source": source,
+                "expired_after_seconds": UI_FEEDBACK_STALE_SECONDS,
+            },
+        )
+    logger.info(
+        "haor stale ui feedback reconciled",
+        extra={
+            "agent_session_id": session.id,
+            "agent_phase": "awaiting_ui_feedback",
+            "agent_result": "expired",
+            "agent_source": source,
+        },
+    )
+    return True
+
+
+def _reconcile_session_runtime_state(
+    db: Session,
+    *,
+    session: AgentSession,
+    interrupted_source: str = "session_reconcile",
+    stale_source: str = "ui_feedback_reconcile",
+) -> bool:
+    changed = False
+    if _reconcile_running_session_state(db, session=session, interrupted_source=interrupted_source):
+        changed = True
+    if _reconcile_stale_ui_feedback_state(db, session=session, source=stale_source):
+        changed = True
+    return changed
+
+
 def _raise_if_session_running(session: AgentSession | None, *, stage: str) -> None:
     if session is None or str(session.status or "") != "running":
         return
@@ -1795,7 +1917,7 @@ def _create_session(db: Session, *, user: User) -> AgentSession:
 
 def get_or_create_agent_session(db: Session, *, user: User) -> AgentSessionRead:
     session = _load_recent_session(db, user_id=user.id)
-    if session is not None and _reconcile_running_session_state(db, session=session):
+    if session is not None and _reconcile_session_runtime_state(db, session=session):
         db.commit()
         db.refresh(session)
     if session is None or str(session.status or "") not in ACTIVE_SESSION_STATUSES:
@@ -1807,7 +1929,7 @@ def get_or_create_agent_session(db: Session, *, user: User) -> AgentSessionRead:
 
 def reset_agent_session(db: Session, *, user: User) -> AgentSessionRead:
     current_session = _load_recent_session(db, user_id=user.id)
-    if current_session is not None and _reconcile_running_session_state(db, session=current_session):
+    if current_session is not None and _reconcile_session_runtime_state(db, session=current_session):
         db.flush()
     if current_session is not None and str(current_session.status or "") == "running":
         try:
@@ -3681,6 +3803,9 @@ def _set_browser_runtime(
     step_count: int | None = None,
     retry_state: dict[str, Any] | None = None,
     last_error: str | None = None,
+    ui_pending_since: datetime | None = None,
+    last_step_request_id: str | None = None,
+    last_step_ack_at: datetime | None = None,
 ) -> None:
     current = _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {})
     session.browser_runtime_json = _normalize_browser_runtime(
@@ -3700,6 +3825,9 @@ def _set_browser_runtime(
             "retry_state": retry_state if retry_state is not None else current.get("retry_state"),
             "last_user_intent": last_user_intent if last_user_intent is not None else current.get("last_user_intent"),
             "last_error": last_error,
+            "ui_pending_since": _to_runtime_timestamp(ui_pending_since) if ui_pending_since is not None else current.get("ui_pending_since"),
+            "last_step_request_id": last_step_request_id if last_step_request_id is not None else current.get("last_step_request_id"),
+            "last_step_ack_at": _to_runtime_timestamp(last_step_ack_at) if last_step_ack_at is not None else current.get("last_step_ack_at"),
         }
     )
 
@@ -3713,7 +3841,10 @@ def _clear_browser_runtime(
     objective_kind: str | None = None,
     auto_executed_actions: list[dict[str, Any]] | None = None,
     last_error: str | None = None,
+    last_step_request_id: str | None = None,
+    last_step_ack_at: datetime | None = None,
 ) -> None:
+    current = _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {})
     session.browser_runtime_json = _normalize_browser_runtime(
         {
             "phase": "idle",
@@ -3731,6 +3862,9 @@ def _clear_browser_runtime(
             "retry_state": {},
             "last_user_intent": last_user_intent,
             "last_error": last_error,
+            "ui_pending_since": None,
+            "last_step_request_id": last_step_request_id if last_step_request_id is not None else current.get("last_step_request_id"),
+            "last_step_ack_at": _to_runtime_timestamp(last_step_ack_at) if last_step_ack_at is not None else current.get("last_step_ack_at"),
         }
     )
 
@@ -4053,6 +4187,7 @@ def _apply_agent_decision(
             last_ui_results=[],
             auto_executed_actions=auto_execute_results,
             step_count=next_step_count,
+            ui_pending_since=_now(),
         )
         content = decision.reply_markdown.strip() or (
             f"我将先在当前页面执行 {len(normalized_ui_actions)} 个站内动作：{_summarize_ui_actions(normalized_ui_actions)}。"
@@ -4156,7 +4291,7 @@ def post_agent_message(
     turn_id: str | None = None,
 ) -> AgentSessionRead:
     session = _load_recent_session(db, user_id=user.id)
-    if session is not None and _reconcile_running_session_state(db, session=session):
+    if session is not None and _reconcile_session_runtime_state(db, session=session):
         db.flush()
     if session is None or str(session.status or "") not in ACTIVE_SESSION_STATUSES:
         session = _create_session(db, user=user)
@@ -4448,7 +4583,7 @@ def post_agent_step(
     turn_id: str | None = None,
 ) -> AgentSessionRead:
     session = _load_recent_session(db, user_id=user.id)
-    if session is not None and _reconcile_running_session_state(db, session=session):
+    if session is not None and _reconcile_session_runtime_state(db, session=session):
         db.flush()
     if session is None or str(session.status or "") not in ACTIVE_SESSION_STATUSES:
         raise AgentConflictError("当前没有可继续的 haor 会话", stage="step")
@@ -4456,12 +4591,25 @@ def post_agent_step(
 
     browser_context = _normalize_browser_context(payload.browser_context.model_dump(mode="json"))
     page_context = _page_context_from_browser_context(browser_context)
-    session.route_context_json = page_context
-    session.updated_at = _now()
-
     current_browser_runtime = _normalize_browser_runtime(
         session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
     )
+    step_request_id = _normalize_step_request_id(payload.step_request_id)
+    if _is_duplicate_step_request(current_browser_runtime, step_request_id=step_request_id):
+        logger.info(
+            "haor ui_step duplicate ignored",
+            extra={
+                "agent_session_id": session.id,
+                "agent_turn_id": turn_id,
+                "agent_step_request_id": step_request_id,
+                "agent_phase": str(current_browser_runtime.get("phase") or ""),
+                "agent_result": "duplicate",
+            },
+        )
+        return serialize_agent_session(session)
+
+    session.route_context_json = page_context
+    session.updated_at = _now()
     pending_ui_actions = (
         current_browser_runtime.get("pending_ui_actions")
         if isinstance(current_browser_runtime.get("pending_ui_actions"), list)
@@ -4534,16 +4682,54 @@ def post_agent_step(
         working_context = _merge_soft_focus_context(working_context, browser_target)
         session.working_context_json = working_context
 
-    current_browser_runtime["pending_ui_actions"] = []
-    current_browser_runtime["completed_ui_actions"] = ui_action_results
-    current_browser_runtime["last_ui_results"] = ui_action_results
-    current_browser_runtime["last_browser_context"] = browser_context
-    current_browser_runtime["semantic_page_context"] = _browser_semantic_page_context(browser_context)
-    current_browser_runtime["phase"] = "resolving_ui_feedback"
+    accepted_at = _now()
+    last_user_intent = sanitize_text(str(current_browser_runtime.get("last_user_intent") or ""), max_length=240) or "继续当前站内动作"
+    _set_browser_runtime(
+        session,
+        phase="resolving_ui_feedback",
+        browser_context=browser_context,
+        last_user_intent=last_user_intent,
+        current_objective=sanitize_text(str(current_browser_runtime.get("current_objective") or ""), max_length=240) or None,
+        objective_kind=_sanitize_line(str(current_browser_runtime.get("objective_kind") or ""), max_length=32) or None,
+        planned_steps=current_browser_runtime.get("planned_steps")
+        if isinstance(current_browser_runtime.get("planned_steps"), list)
+        else [],
+        step_cursor=int(current_browser_runtime.get("step_cursor") or 0),
+        pending_ui_actions=[],
+        completed_ui_actions=ui_action_results,
+        last_ui_results=ui_action_results,
+        auto_executed_actions=current_browser_runtime.get("auto_executed_actions")
+        if isinstance(current_browser_runtime.get("auto_executed_actions"), list)
+        else [],
+        step_count=int(current_browser_runtime.get("step_count") or 0),
+        retry_state=current_browser_runtime.get("retry_state")
+        if isinstance(current_browser_runtime.get("retry_state"), dict)
+        else {},
+        last_error=None,
+        ui_pending_since=None,
+        last_step_request_id=step_request_id,
+        last_step_ack_at=accepted_at,
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    current_browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    logger.info(
+        "haor ui_step accepted",
+        extra={
+            "agent_session_id": session.id,
+            "agent_turn_id": turn_id,
+            "agent_step_request_id": step_request_id,
+            "agent_phase": "resolving_ui_feedback",
+            "agent_result": "accepted",
+        },
+    )
+    _emit_session_snapshot(stream_emitter, session)
 
     allow_write_plans = _normalize_role(user.role) == "admin"
     allow_auto_execute_actions = _user_can_auto_execute(user)
-    last_user_intent = sanitize_text(str(current_browser_runtime.get("last_user_intent") or ""), max_length=240) or "继续当前站内动作"
     try:
         decision, tool_traces = _run_agent_loop(
             db,
@@ -4582,6 +4768,16 @@ def post_agent_step(
         )
         db.commit()
         db.refresh(session)
+        logger.info(
+            "haor ui_step failed",
+            extra={
+                "agent_session_id": session.id,
+                "agent_turn_id": turn_id,
+                "agent_step_request_id": step_request_id,
+                "agent_phase": "resolving_ui_feedback",
+                "agent_result": "error",
+            },
+        )
         _emit_error_event(stream_emitter, detail=message.content, turn_id=turn_id, message=message)
         _emit_session_snapshot(stream_emitter, session)
         return serialize_agent_session(session)
@@ -4607,6 +4803,21 @@ def post_agent_step(
     )
     db.commit()
     db.refresh(session)
+    logger.info(
+        "haor ui_step completed",
+        extra={
+            "agent_session_id": session.id,
+            "agent_turn_id": turn_id,
+            "agent_step_request_id": step_request_id,
+            "agent_phase": str(
+                _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}).get(
+                    "phase"
+                )
+                or ""
+            ),
+            "agent_result": "completed",
+        },
+    )
     _emit_session_snapshot(stream_emitter, session)
     return serialize_agent_session(session)
 
@@ -4880,7 +5091,7 @@ def approve_agent_session(
     session = _load_recent_session(db, user_id=user.id)
     if session is None:
         raise AgentNotFoundError("当前没有可批准的 haor 会话", stage="approve")
-    if _reconcile_running_session_state(db, session=session):
+    if _reconcile_session_runtime_state(db, session=session):
         db.flush()
     _raise_if_session_running(session, stage="approve")
     pending_plan = session.pending_plan_json if isinstance(session.pending_plan_json, dict) else {}

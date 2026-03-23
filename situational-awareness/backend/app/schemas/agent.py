@@ -227,6 +227,7 @@ class AgentMessageCreateRequest(BaseModel):
 
 
 class AgentUIStepRequest(BaseModel):
+    step_request_id: str | None = Field(default=None, max_length=128)
     browser_context: AgentBrowserContextRead = Field(default_factory=AgentBrowserContextRead)
     ui_action_results: list[AgentUIActionResultRead] = Field(default_factory=list)
 
@@ -244,6 +245,7 @@ class AgentApprovalResponse(BaseModel):
 class AgentStreamClientEnvelope(BaseModel):
     type: AgentStreamClientType
     client_message_id: str | None = Field(default=None, max_length=128)
+    step_request_id: str | None = Field(default=None, max_length=128)
     content: str | None = Field(default=None, max_length=4000)
     note: str | None = Field(default=None, max_length=500)
     page_context: AgentPageContextRead = Field(default_factory=AgentPageContextRead)

@@ -1,20 +1,36 @@
 # 内网资产态势感知平台 V1
 
-一个面向测试环境的资产发现与风险识别平台，覆盖以下能力：
-- 资产发现：CIDR 探测、主机与端口服务识别
-- 资产管理：台账自动更新与标签管理
-- 信息采集：SSH 基础信息采集
-- 风险识别：规则库版本匹配与分级
-- AI 报告：风险摘要与自动报告
-- 平台监控：CPU、内存、磁盘与网络实时指标
-- 平台日志：后端与 worker 运行日志统一查询
-- 移动总览：发现队列、高危风险与设备异常告警流
+一个面向测试环境的资产态势感知平台，围绕“发现 -> 识别 -> 校验 -> 修复 -> 观测”闭环构建，提供桌面端控制台、后端任务编排与配套规则治理能力。
+
+## 核心能力
+- 资产发现：CIDR 探测、主机存活识别、端口与服务指纹采集
+- 资产管理：资产台账自动更新、标签管理、详情页纵深分析
+- 信息采集：SSH 授权验证、主机级信息采集与最近采集结果回看
+- 风险识别：规则库匹配、风险分级、热点资产与趋势聚合
+- 漏洞修复：Runner 安装、修复会话编排、任务输出追踪
+- 智能体协同：站内自治助手 Haor，支持页面理解、UI 代理、后端编排与审批控制
+- 平台观测：CPU、内存、磁盘、网络实时指标与统一日志中心
+- 移动配套：发现队列、高危风险与设备异常告警流的移动端总览能力
 
 ## 目录
-- `backend/` FastAPI + SQLAlchemy + Celery
-- `frontend/` Next.js + Ant Design
-- `infra/` Docker Compose
-- `docs/` 架构、API、运行说明
+- `backend/` FastAPI + SQLAlchemy + Celery，负责 API、任务编排、规则执行与智能体服务
+- `frontend/` Next.js + Ant Design，提供桌面端控制台与 Haor 前端运行时
+- `infra/` Docker Compose、本地 PostgreSQL 初始化与 settings helper
+- `docs/` 架构、API、数据库与运行说明
+
+## 技术栈
+- 前端：Next.js 15、React 19、TypeScript、Ant Design 5
+- 后端：FastAPI、SQLAlchemy 2、Celery、Redis、PostgreSQL、Alembic
+- 安全与智能：SSH 凭据加密、规则库、可切换 LLM provider、Haor 站内自治助手
+
+## 当前模块
+- 总览页：平台实时监控、发现队列、风险热点资产、风险态势波形
+- 扫描发起台：提交 CIDR 任务，自动进入主机发现、端口与风险校验流水线
+- 资产列表/详情：查看资产、端口、SSH 授权、信息采集和风险发现
+- 修复工作台：资产级修复入口、Runner 安装与修复会话管理
+- 漏洞库：YAML 真源规则检索、导入导出、启停与索引治理
+- 任务中心/日志：任务详情、事件日志、平台运行日志统一查看
+- Haor：全站可调起的站内自治助手，会话、审批、任务状态与流式反馈全链路联动
 
 ## 快速开始
 1. 按需修改环境变量文件
@@ -24,18 +40,47 @@ vi frontend/.env.example
 ```
 > 当前 `docker compose` 默认直接读取 `backend/.env.example` 和 `frontend/.env.example`。
 
-2. 默认启动开发环境
+2. 启动开发环境
 ```bash
 cd infra
 docker compose up -d --build
 ```
+
 3. 首次访问初始化管理员
 - 打开前端登录页后，若系统尚未初始化，会自动切换到“初始化管理员”表单
 - 初始化成功后会自动登录进入总览页
-4. 打开
+
+4. 访问入口
 - 前端：http://localhost:3000
 - 后端：http://localhost:8000/docs
+- PostgreSQL：`localhost:5432`
+- Redis：`localhost:6379`
 - 前端默认通过 Next.js 代理把 `/api/v1/*` 转发到后端容器，无需手工填写 `NEXT_PUBLIC_API_BASE`
+
+## 常用开发命令
+- 启动全部服务：
+```bash
+cd infra
+docker compose up -d --build
+```
+- 查看容器状态：
+```bash
+cd infra
+docker compose ps
+```
+- 查看后端日志：
+```bash
+docker logs -f sa-backend
+```
+- 查看 worker 日志：
+```bash
+docker logs -f sa-worker
+```
+- 停止并移除容器：
+```bash
+cd infra
+docker compose down
+```
 
 ## Docker 开发模式
 - Docker Compose 默认以开发模式启动：
@@ -57,6 +102,13 @@ cd infra
 docker compose --profile prod up -d --build frontend-prod
 ```
 - 生产式前端预览地址为 `http://localhost:3001`。
+
+## Haor 说明
+- Haor 不是普通聊天机器人，而是站内自治助手
+- 前端会为其提供当前页面路由、业务语义、可见动作、表单与 DOM 上下文
+- Haor 可在白名单范围内执行站内 UI 动作，并把结果回传后端继续决策
+- 复杂写操作进入后端编排链，低风险动作可自动推进，高风险动作进入审批
+- `mock` 模式下会保留完整链路，但不会真正执行高风险写动作
 
 ## 说明
 - 前端用户可见文案默认使用中文；仅保留 `IP / CIDR / CVE / CWE / YAML / JSON / SSH / nmap` 等必要技术缩写。
@@ -106,6 +158,12 @@ docker compose --profile prod up -d --build frontend-prod
   - 浏览器请求同源 `/api/v1/*`
   - Next.js 再转发到 `BACKEND_INTERNAL_URL=http://backend:8000`
 - 只有前端独立部署到 Docker 外时，才需要显式设置 `NEXT_PUBLIC_API_BASE` 指向外部后端地址。
+
+## 相关文档
+- 架构说明：[docs/architecture.md](docs/architecture.md)
+- API 契约：[docs/api-contract.md](docs/api-contract.md)
+- 数据库结构：[docs/database-schema.md](docs/database-schema.md)
+- 运行手册：[docs/runbook.md](docs/runbook.md)
 
 ## 数据库迁移
 - 后端目录已提供 `backend/alembic.ini`，可直接执行 Alembic：
