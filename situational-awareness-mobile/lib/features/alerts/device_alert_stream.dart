@@ -142,17 +142,27 @@ class DeviceAlertStreamController {
       return;
     }
 
-    await markDeviceAbnormalRiskSeen(
-      riskId: alert.findingId,
-      highRiskFindings: alert.highRiskFindings,
-    );
-    await showDeviceAbnormalSystemNotification(
-      title: alert.title,
-      message: alert.message,
-      route: alert.route,
-      navigateWithGo: alert.navigateWithGo,
-    );
+    try {
+      await markDeviceAbnormalRiskSeen(
+        riskId: alert.findingId,
+        highRiskFindings: alert.highRiskFindings,
+      );
+    } catch (_) {
+      // Keep the realtime prompt path alive even if local snapshot persistence fails.
+    }
+
     await onAlert(alert);
+
+    try {
+      await showDeviceAbnormalSystemNotification(
+        title: alert.title,
+        message: alert.message,
+        route: alert.route,
+        navigateWithGo: alert.navigateWithGo,
+      );
+    } catch (_) {
+      // Foreground overlay is more important than system notification delivery.
+    }
   }
 
   Future<void> _handleSocketClosed() async {

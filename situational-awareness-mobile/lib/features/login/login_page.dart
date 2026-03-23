@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -10,7 +12,25 @@ import '../../shared/widgets/adaptive_layout.dart';
 import '../../shared/widgets/app_widgets.dart';
 
 final bootstrapStatusProvider = FutureProvider<BootstrapStatus>((ref) async {
-  return ref.watch(apiClientProvider).fetchBootstrapStatus();
+  Future<BootstrapStatus> loadStatus() {
+    return ref.read(apiClientProvider).fetchBootstrapStatus();
+  }
+
+  try {
+    return await loadStatus();
+  } catch (error) {
+    if (!shouldAttemptApiBaseUrlSync(error)) {
+      rethrow;
+    }
+    final resolved = await synchronizeApiBaseUrlForRef(
+      ref,
+      forceRescan: true,
+    );
+    if (resolved == null) {
+      rethrow;
+    }
+    return loadStatus();
+  }
 });
 
 class LoginPage extends ConsumerStatefulWidget {
@@ -69,6 +89,25 @@ class _LoginPageState extends ConsumerState<LoginPage> {
     }
   }
 
+  Future<void> _syncApiBaseUrl() async {
+    final resolved = await synchronizeConfiguredApiBaseUrl(forceRescan: true);
+    if (!mounted) {
+      return;
+    }
+    ref.invalidate(dioProvider);
+    ref.invalidate(apiClientProvider);
+    ref.invalidate(bootstrapStatusProvider);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          resolved == null
+              ? '未发现可用后端地址，请确认手机和 Kali 在同一局域网。'
+              : '已同步服务地址：$resolved',
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final bootstrap = ref.watch(bootstrapStatusProvider);
@@ -117,6 +156,7 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                       },
                       onRetryBootstrap: () =>
                           ref.invalidate(bootstrapStatusProvider),
+                      onSyncApiBaseUrl: _syncApiBaseUrl,
                       onSubmit: _submit,
                     )
                   : Row(
@@ -151,6 +191,7 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                                 },
                                 onRetryBootstrap: () =>
                                     ref.invalidate(bootstrapStatusProvider),
+                                onSyncApiBaseUrl: _syncApiBaseUrl,
                                 onSubmit: _submit,
                               ),
                             ],
@@ -201,6 +242,7 @@ class _CompactLoginLayout extends StatelessWidget {
     required this.onModeChanged,
     required this.onPasswordVisibilityChanged,
     required this.onRetryBootstrap,
+    required this.onSyncApiBaseUrl,
     required this.onSubmit,
   });
 
@@ -214,6 +256,7 @@ class _CompactLoginLayout extends StatelessWidget {
   final ValueChanged<bool> onModeChanged;
   final VoidCallback onPasswordVisibilityChanged;
   final VoidCallback onRetryBootstrap;
+  final Future<void> Function() onSyncApiBaseUrl;
   final Future<void> Function() onSubmit;
 
   @override
@@ -268,6 +311,7 @@ class _CompactLoginLayout extends StatelessWidget {
           onModeChanged: onModeChanged,
           onPasswordVisibilityChanged: onPasswordVisibilityChanged,
           onRetryBootstrap: onRetryBootstrap,
+          onSyncApiBaseUrl: onSyncApiBaseUrl,
           onSubmit: onSubmit,
         ),
       ],
@@ -602,6 +646,7 @@ class _LoginFormCard extends StatelessWidget {
     required this.onModeChanged,
     required this.onPasswordVisibilityChanged,
     required this.onRetryBootstrap,
+    required this.onSyncApiBaseUrl,
     required this.onSubmit,
   });
 
@@ -616,6 +661,7 @@ class _LoginFormCard extends StatelessWidget {
   final ValueChanged<bool> onModeChanged;
   final VoidCallback onPasswordVisibilityChanged;
   final VoidCallback onRetryBootstrap;
+  final Future<void> Function() onSyncApiBaseUrl;
   final Future<void> Function() onSubmit;
 
   @override
@@ -687,6 +733,7 @@ class _LoginFormCard extends StatelessWidget {
           error: (error, _) => _BootstrapConnectionError(
             message: describeApiError(error),
             onRetry: onRetryBootstrap,
+            onSyncApiBaseUrl: onSyncApiBaseUrl,
           ),
         ),
         SizedBox(height: compact ? 14 : 22),
@@ -1019,10 +1066,12 @@ class _BootstrapConnectionError extends StatelessWidget {
   const _BootstrapConnectionError({
     required this.message,
     required this.onRetry,
+    required this.onSyncApiBaseUrl,
   });
 
   final String message;
   final VoidCallback onRetry;
+  final Future<void> Function() onSyncApiBaseUrl;
 
   @override
   Widget build(BuildContext context) {
@@ -1077,21 +1126,42 @@ class _BootstrapConnectionError extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton.icon(
-              style: OutlinedButton.styleFrom(
-                foregroundColor: theme.colorScheme.error,
-                side: BorderSide(
-                    color: theme.colorScheme.error.withValues(alpha: 0.28)),
-                minimumSize: const Size.fromHeight(46),
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16)),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: theme.colorScheme.error,
+                    side: BorderSide(
+                        color: theme.colorScheme.error.withValues(alpha: 0.28)),
+                    minimumSize: const Size.fromHeight(46),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16)),
+                  ),
+                  onPressed: onRetry,
+                  icon: const Icon(Icons.refresh_rounded),
+                  label: const Text('重试连接'),
+                ),
               ),
-              onPressed: onRetry,
-              icon: const Icon(Icons.refresh_rounded),
-              label: const Text('重试连接'),
-            ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: theme.colorScheme.primary,
+                    side: BorderSide(
+                      color: theme.colorScheme.primary.withValues(alpha: 0.28),
+                    ),
+                    minimumSize: const Size.fromHeight(46),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                  onPressed: () => unawaited(onSyncApiBaseUrl()),
+                  icon: const Icon(Icons.wifi_tethering_rounded),
+                  label: const Text('同步地址'),
+                ),
+              ),
+            ],
           ),
         ],
       ),

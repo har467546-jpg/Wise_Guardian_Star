@@ -364,6 +364,8 @@ void deviceAbnormalAlertWorkmanagerDispatcher() {
     }
 
     try {
+      await initializeConfiguredApiBaseUrl();
+      await synchronizeConfiguredApiBaseUrl(forceRescan: false);
       await initializeDeviceAbnormalNotifications();
       final token = await const FlutterSecureStorage().read(
         key: AppStorage.tokenStorageKey,

@@ -1,4 +1,5 @@
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -21,6 +22,18 @@ from app.utils.local_asset import remember_local_asset_hint
 
 _LOCAL_ASSET_PURGE_COMPLETED = False
 _REMOVED_VULN_LIBRARY_TASKS_PURGED = False
+
+
+def _build_cors_allowlist(raw_origins: str) -> tuple[list[str], str | None]:
+    exact_origins: list[str] = []
+    wildcard_patterns: list[str] = []
+    for origin in (item.strip() for item in raw_origins.split(",") if item.strip()):
+        if "*" in origin:
+            wildcard_patterns.append(re.escape(origin).replace(r"\*", r"[^/]+"))
+        else:
+            exact_origins.append(origin)
+    allow_origin_regex = f"^(?:{'|'.join(wildcard_patterns)})$" if wildcard_patterns else None
+    return exact_origins, allow_origin_regex
 
 
 def _purge_removed_vuln_library_tasks(logger: logging.Logger) -> None:
@@ -92,16 +105,22 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
     if settings.CORS_ALLOW_ALL:
         cors_allow_origins = ["*"]
+        cors_allow_origin_regex = None
         cors_allow_credentials = False
         logger.info("CORS running in development allow-all mode")
     else:
-        cors_allow_origins = [origin.strip() for origin in settings.CORS_ALLOW_ORIGINS.split(",") if origin.strip()]
+        cors_allow_origins, cors_allow_origin_regex = _build_cors_allowlist(settings.CORS_ALLOW_ORIGINS)
         cors_allow_credentials = True
-        logger.info("CORS allowlist mode enabled for origins: %s", cors_allow_origins)
+        logger.info(
+            "CORS allowlist mode enabled for origins=%s regex=%s",
+            cors_allow_origins,
+            cors_allow_origin_regex,
+        )
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_allow_origins,
+        allow_origin_regex=cors_allow_origin_regex,
         allow_credentials=cors_allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],

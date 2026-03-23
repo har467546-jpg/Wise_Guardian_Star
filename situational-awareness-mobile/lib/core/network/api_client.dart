@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../shared/models/agent_models.dart';
 import '../../shared/models/app_models.dart';
@@ -12,50 +14,268 @@ const _configuredApiBaseUrlFromEnv = String.fromEnvironment(
   'API_BASE_URL',
   defaultValue: '',
 );
+const _apiBaseUrlStorageKey = 'sa.api_base_url';
+const _androidEmulatorApiBaseUrl = 'http://10.0.2.2:8000/api/v1';
+const _loopbackApiBaseUrl = 'http://127.0.0.1:8000/api/v1';
+String _runtimeApiBaseUrl = '';
+
+String _defaultApiBaseUrl() {
+  if (Platform.isAndroid) {
+    return _androidEmulatorApiBaseUrl;
+  }
+  return _loopbackApiBaseUrl;
+}
+
+String _normalizeApiBaseUrl(String value) {
+  final normalized = value.trim().replaceFirst(RegExp(r'/$'), '');
+  if (normalized.isEmpty) {
+    return _defaultApiBaseUrl();
+  }
+  final parsed = Uri.tryParse(normalized);
+  if (parsed == null || parsed.host.isEmpty || !parsed.hasScheme) {
+    return _defaultApiBaseUrl();
+  }
+  if (parsed.scheme != 'http' && parsed.scheme != 'https') {
+    return _defaultApiBaseUrl();
+  }
+  return parsed.toString();
+}
 
 String get configuredApiBaseUrl {
+  final runtime = _runtimeApiBaseUrl.trim();
+  if (runtime.isNotEmpty) {
+    return runtime;
+  }
   final configured = _configuredApiBaseUrlFromEnv.trim();
   if (configured.isNotEmpty) {
-    return configured;
+    return _normalizeApiBaseUrl(configured);
   }
-  if (Platform.isAndroid) {
-    return 'http://10.0.2.2:8000/api/v1';
+  return _defaultApiBaseUrl();
+}
+
+Uri _buildApiUri(
+  String baseUrl,
+  List<String> trailingSegments, {
+  Map<String, String>? queryParameters,
+}) {
+  final parsed = Uri.parse(_normalizeApiBaseUrl(baseUrl));
+  final pathSegments = [
+    ...parsed.pathSegments.where((item) => item.isNotEmpty),
+    ...trailingSegments,
+  ];
+  return parsed.replace(
+    pathSegments: pathSegments,
+    queryParameters: queryParameters,
+  );
+}
+
+bool _isPrivateIpv4Host(String host) {
+  final address = InternetAddress.tryParse(host);
+  if (address == null || address.type != InternetAddressType.IPv4) {
+    return false;
   }
-  return 'http://127.0.0.1:8000/api/v1';
+  final octets = host.split('.');
+  if (octets.length != 4) {
+    return false;
+  }
+  final first = int.tryParse(octets[0]) ?? -1;
+  final second = int.tryParse(octets[1]) ?? -1;
+  if (first == 10) {
+    return true;
+  }
+  if (first == 172 && second >= 16 && second <= 31) {
+    return true;
+  }
+  return first == 192 && second == 168;
+}
+
+Future<void> initializeConfiguredApiBaseUrl() async {
+  final prefs = await SharedPreferences.getInstance();
+  final persisted = prefs.getString(_apiBaseUrlStorageKey) ?? '';
+  final nextValue = persisted.trim().isNotEmpty
+      ? persisted
+      : (_configuredApiBaseUrlFromEnv.trim().isNotEmpty
+            ? _configuredApiBaseUrlFromEnv
+            : _defaultApiBaseUrl());
+  _runtimeApiBaseUrl = _normalizeApiBaseUrl(nextValue);
+}
+
+Future<void> persistConfiguredApiBaseUrl(String baseUrl) async {
+  final normalized = _normalizeApiBaseUrl(baseUrl);
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(_apiBaseUrlStorageKey, normalized);
+  _runtimeApiBaseUrl = normalized;
+}
+
+Future<bool> _isPlatformApiBaseUrlHealthy(String baseUrl) async {
+  final client = HttpClient()..connectionTimeout = const Duration(milliseconds: 600);
+  try {
+    final request = await client
+        .getUrl(_buildApiUri(baseUrl, const ['auth', 'bootstrap-status']))
+        .timeout(const Duration(milliseconds: 800));
+    final response = await request.close().timeout(const Duration(milliseconds: 900));
+    if (response.statusCode != 200) {
+      return false;
+    }
+    final body = await response.transform(utf8.decoder).join().timeout(const Duration(milliseconds: 900));
+    final decoded = jsonDecode(body);
+    return decoded is Map && decoded.containsKey('can_bootstrap_admin');
+  } catch (_) {
+    return false;
+  } finally {
+    client.close(force: true);
+  }
+}
+
+Future<List<String>> _buildDiscoveryCandidates(String seedBaseUrl) async {
+  final candidates = <String>[];
+  final seenCandidates = <String>{};
+  final seed = Uri.parse(_normalizeApiBaseUrl(seedBaseUrl));
+
+  void addCandidate(String host) {
+    final value = seed
+        .replace(
+          host: host,
+          pathSegments: seed.pathSegments.where((item) => item.isNotEmpty),
+        )
+        .toString();
+    if (seenCandidates.add(value)) {
+      candidates.add(value);
+    }
+  }
+
+  if (_isPrivateIpv4Host(seed.host)) {
+    addCandidate(seed.host);
+  }
+
+  final interfaces = await NetworkInterface.list(
+    type: InternetAddressType.IPv4,
+    includeLoopback: false,
+    includeLinkLocal: false,
+  );
+  for (final interface in interfaces) {
+    for (final address in interface.addresses) {
+      final host = address.address;
+      if (!_isPrivateIpv4Host(host)) {
+        continue;
+      }
+      final octets = host.split('.');
+      if (octets.length != 4) {
+        continue;
+      }
+      final self = int.tryParse(octets[3]) ?? -1;
+      final prefix = '${octets[0]}.${octets[1]}.${octets[2]}.';
+      if (_isPrivateIpv4Host(seed.host) &&
+          seed.host.startsWith(prefix) &&
+          seed.host != host) {
+        addCandidate(seed.host);
+      }
+      for (var index = 1; index < 255; index += 1) {
+        if (index == self) {
+          continue;
+        }
+        addCandidate('$prefix$index');
+      }
+    }
+  }
+
+  return candidates;
+}
+
+Future<String?> _discoverApiBaseUrl(String seedBaseUrl) async {
+  final candidates = await _buildDiscoveryCandidates(seedBaseUrl);
+  if (candidates.isEmpty) {
+    return null;
+  }
+
+  const concurrency = 48;
+  var nextIndex = 0;
+  String? found;
+
+  Future<void> worker() async {
+    while (found == null) {
+      final currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= candidates.length) {
+        return;
+      }
+      final candidate = candidates[currentIndex];
+      if (await _isPlatformApiBaseUrlHealthy(candidate)) {
+        found = candidate;
+        return;
+      }
+    }
+  }
+
+  final workers = List.generate(
+    candidates.length < concurrency ? candidates.length : concurrency,
+    (_) => worker(),
+  );
+  await Future.wait(workers);
+  return found;
+}
+
+bool shouldAttemptApiBaseUrlSync(Object error) {
+  if (error is DioException) {
+    return error.type == DioExceptionType.connectionTimeout ||
+        error.type == DioExceptionType.connectionError ||
+        error.type == DioExceptionType.sendTimeout ||
+        error.type == DioExceptionType.receiveTimeout ||
+        error.type == DioExceptionType.unknown;
+  }
+  final message = describeApiError(error);
+  return message.contains('无法连接到后端服务') ||
+      message.contains('连接服务器超时') ||
+      message.contains('请求发送超时') ||
+      message.contains('服务器响应超时') ||
+      message.contains('当前地址：');
+}
+
+Future<String?> synchronizeConfiguredApiBaseUrl({bool forceRescan = false}) async {
+  await initializeConfiguredApiBaseUrl();
+  final current = configuredApiBaseUrl;
+  if (!forceRescan && await _isPlatformApiBaseUrlHealthy(current)) {
+    return current;
+  }
+  final discovered = await _discoverApiBaseUrl(current);
+  if (discovered == null) {
+    return null;
+  }
+  await persistConfiguredApiBaseUrl(discovered);
+  return discovered;
+}
+
+Future<String?> synchronizeApiBaseUrlForRef(
+  Ref ref, {
+  bool forceRescan = false,
+}) async {
+  final resolved = await synchronizeConfiguredApiBaseUrl(forceRescan: forceRescan);
+  ref.invalidate(dioProvider);
+  ref.invalidate(apiClientProvider);
+  return resolved;
 }
 
 String buildHaorSessionStreamUrl(String token) {
-  final baseUrl = configuredApiBaseUrl.replaceFirst(RegExp(r'/$'), '');
-  final parsed = Uri.parse(baseUrl);
+  final parsed = Uri.parse(configuredApiBaseUrl);
   final scheme = parsed.scheme == 'https' ? 'wss' : 'ws';
-  final pathSegments = [
-    ...parsed.pathSegments.where((item) => item.isNotEmpty),
-    'agent',
-    'haor',
-    'session',
-    'stream',
-  ];
-  return parsed.replace(
-    scheme: scheme,
-    pathSegments: pathSegments,
+  return _buildApiUri(
+    configuredApiBaseUrl,
+    const ['agent', 'haor', 'session', 'stream'],
     queryParameters: {'token': token},
+  ).replace(
+    scheme: scheme,
   ).toString();
 }
 
 String buildDeviceAlertStreamUrl(String token) {
-  final baseUrl = configuredApiBaseUrl.replaceFirst(RegExp(r'/$'), '');
-  final parsed = Uri.parse(baseUrl);
+  final parsed = Uri.parse(configuredApiBaseUrl);
   final scheme = parsed.scheme == 'https' ? 'wss' : 'ws';
-  final pathSegments = [
-    ...parsed.pathSegments.where((item) => item.isNotEmpty),
-    'mobile',
-    'alerts',
-    'stream',
-  ];
-  return parsed.replace(
-    scheme: scheme,
-    pathSegments: pathSegments,
+  return _buildApiUri(
+    configuredApiBaseUrl,
+    const ['mobile', 'alerts', 'stream'],
     queryParameters: {'token': token},
+  ).replace(
+    scheme: scheme,
   ).toString();
 }
 

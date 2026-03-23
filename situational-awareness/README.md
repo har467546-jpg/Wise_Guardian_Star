@@ -92,9 +92,9 @@ docker compose down
   - 前端开发入口：`http://localhost:3000`
   - 后端文档：`http://localhost:8000/docs`
 - 前端开发模式会把 `node_modules` 与 `.next` 缓存留在容器卷内，不污染项目目录。
-- 若需要从局域网访问前端开发入口，请在前端环境变量中设置 `NEXT_ALLOWED_DEV_ORIGINS`，填入完整来源列表，例如：
+- 若需要从局域网访问前端开发入口，请在前端环境变量中设置 `NEXT_ALLOWED_DEV_ORIGINS`，可直接使用私网通配规则，例如：
 ```bash
-NEXT_ALLOWED_DEV_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://192.168.10.131:3000
+NEXT_ALLOWED_DEV_ORIGINS=localhost,127.0.0.1,192.168.*.*,10.*.*.*,172.*.*.*
 ```
 - 如需临时验证生产式前端构建，可额外启动预览入口：
 ```bash
@@ -178,4 +178,8 @@ docker exec sa-backend sh -lc 'cd /app && alembic upgrade head'
 - 若前端出现 `NetworkError when attempting to fetch resource` 且后端有 `OPTIONS ... 400`，优先检查后端容器读取的环境变量：
   - `CORS_ALLOW_ALL=true`，或
   - `CORS_ALLOW_ALL=false` 且 `CORS_ALLOW_ORIGINS` 包含当前前端实际来源（完整协议+主机+端口）。
+- `CORS_ALLOW_ORIGINS` 支持 `*` 通配符，可一次覆盖常见局域网地址，例如：
+```bash
+CORS_ALLOW_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://192.168.*.*:3000,http://10.*.*.*:3000,http://172.16.*.*:3000,http://172.17.*.*:3000,http://172.18.*.*:3000,http://172.19.*.*:3000,http://172.20.*.*:3000,http://172.21.*.*:3000,http://172.22.*.*:3000,http://172.23.*.*:3000,http://172.24.*.*:3000,http://172.25.*.*:3000,http://172.26.*.*:3000,http://172.27.*.*:3000,http://172.28.*.*:3000,http://172.29.*.*:3000,http://172.30.*.*:3000,http://172.31.*.*:3000
+```
 - 生产环境建议关闭全放开模式：`CORS_ALLOW_ALL=false`，并显式设置 `CORS_ALLOW_ORIGINS` 白名单。

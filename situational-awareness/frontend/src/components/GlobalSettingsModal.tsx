@@ -838,7 +838,13 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
                   <div className="global-settings-form-grid">
                     <SectionCard title="跨域与本机识别">
                       <SwitchField name="cors_allow_all" label="允许全部跨域来源" disabled={disabled} />
-                      <TextField name="cors_allow_origins" label="允许的跨域来源" disabled={disabled} textarea extra="使用逗号分隔 Origin" />
+                      <TextField
+                        name="cors_allow_origins"
+                        label="允许的跨域来源"
+                        disabled={disabled}
+                        textarea
+                        extra="使用逗号分隔 Origin，支持通配符，例如 http://192.168.*.*:3000"
+                      />
                       <TextField name="local_asset_ips" label="本机 IP / 网段" disabled={disabled} textarea extra="使用逗号分隔 IP 或网段" />
                     </SectionCard>
                     <SectionCard title="认证时效">

@@ -22,6 +22,20 @@ RUNTIME_ENV_LOCK_PATH = BACKEND_ROOT / ".env.runtime.lock"
 RUNTIME_ENV_BOOTSTRAP_MARKER_PATH = BACKEND_ROOT / ".env.runtime.bootstrap"
 
 
+def _default_private_network_cors_origins() -> str:
+    origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://192.168.*.*:3000",
+        "http://10.*.*.*:3000",
+    ]
+    origins.extend(f"http://172.{second_octet}.*.*:3000" for second_octet in range(16, 32))
+    return ",".join(origins)
+
+
+DEFAULT_PRIVATE_NETWORK_CORS_ORIGINS = _default_private_network_cors_origins()
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeEnvBootstrapState:
     runtime_env_path: Path
@@ -178,9 +192,7 @@ class Settings(BaseSettings):
     DEVICE_ALERTS_REDIS_CHANNEL: str = "sa:device_abnormal_alerts"
 
     CORS_ALLOW_ALL: bool = False
-    CORS_ALLOW_ORIGINS: str = (
-        "http://localhost:3000,http://127.0.0.1:3000,http://192.168.10.131:3000"
-    )
+    CORS_ALLOW_ORIGINS: str = DEFAULT_PRIVATE_NETWORK_CORS_ORIGINS
     LOCAL_ASSET_IPS: str = "127.0.0.1,::1"
 
     ENCRYPTION_KEY: str = ""
