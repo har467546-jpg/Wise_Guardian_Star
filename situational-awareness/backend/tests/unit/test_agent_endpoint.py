@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import threading
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -229,6 +230,51 @@ def test_get_haor_session_reconciles_stale_pending_ui_feedback_once(monkeypatch)
     assert len(second_stale_messages) == 1
 
 
+def test_get_haor_session_reconciles_stale_pending_message_turn_once(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    stale_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+
+    with SessionLocal() as db:
+        db.add(
+            AgentSession(
+                id=str(uuid4()),
+                agent_id="haor",
+                user_id=user_id,
+                status="active",
+                route_context_json=_page_context(pathname="/"),
+                working_context_json={},
+                dialog_state_json={},
+                pending_plan_json={},
+                browser_runtime_json={
+                    "phase": "awaiting_agent_reply",
+                    "current_message_request_id": "client-msg-stale-1",
+                    "message_pending_since": stale_at.isoformat(),
+                    "last_message_request_id": "client-msg-stale-1",
+                    "last_message_ack_at": stale_at.isoformat(),
+                    "last_browser_context": _browser_context(pathname="/"),
+                    "last_user_intent": "帮我分析资产",
+                },
+                updated_at=stale_at,
+                created_at=stale_at,
+            )
+        )
+        db.commit()
+
+    first = client.get("/api/v1/agent/haor/session")
+    second = client.get("/api/v1/agent/haor/session")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["browser_runtime_json"]["phase"] == "idle"
+    stale_messages = [item for item in first_body["messages"] if item["payload_json"].get("stale_message_turn")]
+    assert len(stale_messages) == 1
+    second_stale_messages = [item for item in second_body["messages"] if item["payload_json"].get("stale_message_turn")]
+    assert len(second_stale_messages) == 1
+
+
 def test_post_haor_message_returns_clarifying_message_when_context_missing(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
@@ -291,6 +337,139 @@ def test_post_haor_message_persists_client_message_id(monkeypatch) -> None:  # t
     body = response.json()
     user_message = next(item for item in body["messages"] if item["role"] == "user")
     assert user_message["payload_json"]["client_message_id"] == "client-msg-rest-1"
+
+
+def test_post_haor_message_duplicate_client_message_id_only_runs_once_while_pending(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    started = threading.Event()
+    release = threading.Event()
+    call_count = {"value": 0}
+    holder: dict[str, object] = {}
+
+    def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
+        call_count["value"] += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return (
+            haor_agent_service._AgentModelDecision(
+                reply_markdown="已完成当前资产分析。",
+                conversation_state="answer",
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(haor_agent_service, "_run_agent_loop", _fake_run_loop)
+
+    def _send_first() -> None:
+        holder["response"] = client.post(
+            "/api/v1/agent/haor/session/messages",
+            json={
+                "client_message_id": "client-msg-dup-1",
+                "content": "分析我当前页面上的对象",
+                "page_context": _page_context(pathname="/assets/asset-1", asset_id="asset-1"),
+                "browser_context": _browser_context(pathname="/assets/asset-1", asset_id="asset-1"),
+            },
+        )
+
+    thread = threading.Thread(target=_send_first)
+    thread.start()
+    assert started.wait(timeout=5)
+
+    duplicate = client.post(
+        "/api/v1/agent/haor/session/messages",
+        json={
+            "client_message_id": "client-msg-dup-1",
+            "content": "分析我当前页面上的对象",
+            "page_context": _page_context(pathname="/assets/asset-1", asset_id="asset-1"),
+            "browser_context": _browser_context(pathname="/assets/asset-1", asset_id="asset-1"),
+        },
+    )
+
+    release.set()
+    thread.join(timeout=5)
+
+    assert duplicate.status_code == 200
+    duplicate_body = duplicate.json()
+    assert duplicate_body["browser_runtime_json"]["current_message_request_id"] == "client-msg-dup-1"
+    assert len([item for item in duplicate_body["messages"] if item["role"] == "user"]) == 1
+    assert call_count["value"] == 1
+
+    first = holder["response"]
+    assert isinstance(first, httpx.Response)
+    assert first.status_code == 200
+
+    with SessionLocal() as db:
+        session = db.query(AgentSession).filter(AgentSession.user_id == user_id).order_by(AgentSession.created_at.desc()).first()
+        assert session is not None
+        user_messages = [item for item in session.messages if item.role == "user"]
+        assert len(user_messages) == 1
+
+
+def test_post_haor_message_returns_409_when_another_message_turn_is_pending(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    started = threading.Event()
+    release = threading.Event()
+    call_count = {"value": 0}
+    holder: dict[str, object] = {}
+
+    def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
+        call_count["value"] += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return (
+            haor_agent_service._AgentModelDecision(
+                reply_markdown="已完成当前资产分析。",
+                conversation_state="answer",
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(haor_agent_service, "_run_agent_loop", _fake_run_loop)
+
+    def _send_first() -> None:
+        holder["response"] = client.post(
+            "/api/v1/agent/haor/session/messages",
+            json={
+                "client_message_id": "client-msg-pending-1",
+                "content": "分析我当前页面上的对象",
+                "page_context": _page_context(pathname="/assets/asset-1", asset_id="asset-1"),
+                "browser_context": _browser_context(pathname="/assets/asset-1", asset_id="asset-1"),
+            },
+        )
+
+    thread = threading.Thread(target=_send_first)
+    thread.start()
+    assert started.wait(timeout=5)
+
+    conflict = client.post(
+        "/api/v1/agent/haor/session/messages",
+        json={
+            "client_message_id": "client-msg-pending-2",
+            "content": "分析另外一个资产",
+            "page_context": _page_context(pathname="/assets/asset-2", asset_id="asset-2"),
+            "browser_context": _browser_context(pathname="/assets/asset-2", asset_id="asset-2"),
+        },
+    )
+
+    release.set()
+    thread.join(timeout=5)
+
+    assert conflict.status_code == 409
+    assert "上一轮消息" in conflict.json()["detail"]
+    assert call_count["value"] == 1
+
+    first = holder["response"]
+    assert isinstance(first, httpx.Response)
+    assert first.status_code == 200
+
+    with SessionLocal() as db:
+        session = db.query(AgentSession).filter(AgentSession.user_id == user_id).order_by(AgentSession.created_at.desc()).first()
+        assert session is not None
+        user_messages = [item for item in session.messages if item.role == "user"]
+        assert len(user_messages) == 1
+        assert user_messages[0].payload_json["client_message_id"] == "client-msg-pending-1"
 
 
 def test_model_clarifying_message_keeps_session_active(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1212,6 +1391,68 @@ def test_reset_haor_session_interrupts_running_task_and_creates_new_session(monk
         assert previous_task is not None
         assert previous_session.status == "completed"
         assert previous_task.status == TaskExecutionStatus.CANCELED
+
+
+def test_reset_haor_session_prevents_late_message_reply_from_old_turn(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    started = threading.Event()
+    release = threading.Event()
+    holder: dict[str, object] = {}
+
+    def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
+        started.set()
+        assert release.wait(timeout=5)
+        return (
+            haor_agent_service._AgentModelDecision(
+                reply_markdown="这条旧回复不应该再落回原会话。",
+                conversation_state="answer",
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(haor_agent_service, "_run_agent_loop", _fake_run_loop)
+
+    def _send_first() -> None:
+        holder["response"] = client.post(
+            "/api/v1/agent/haor/session/messages",
+            json={
+                "client_message_id": "client-msg-reset-1",
+                "content": "分析我当前页面上的对象",
+                "page_context": _page_context(pathname="/assets/asset-1", asset_id="asset-1"),
+                "browser_context": _browser_context(pathname="/assets/asset-1", asset_id="asset-1"),
+            },
+        )
+
+    thread = threading.Thread(target=_send_first)
+    thread.start()
+    assert started.wait(timeout=5)
+
+    with SessionLocal() as db:
+        old_session = db.query(AgentSession).filter(AgentSession.user_id == user_id).order_by(AgentSession.created_at.desc()).first()
+        assert old_session is not None
+        old_session_id = old_session.id
+
+    reset = client.post("/api/v1/agent/haor/session/reset", json={})
+    release.set()
+    thread.join(timeout=5)
+
+    assert reset.status_code == 200
+    first = holder["response"]
+    assert isinstance(first, httpx.Response)
+    assert first.status_code == 200
+
+    with SessionLocal() as db:
+        previous_session = db.get(AgentSession, old_session_id)
+        latest_session = db.query(AgentSession).filter(AgentSession.user_id == user_id).order_by(AgentSession.created_at.desc()).first()
+        assert previous_session is not None
+        assert latest_session is not None
+        assert previous_session.status == "completed"
+        assert latest_session.id != old_session_id
+        assistant_messages = [item for item in previous_session.messages if item.role == "assistant"]
+        assert assistant_messages == []
+        user_messages = [item for item in previous_session.messages if item.role == "user"]
+        assert len(user_messages) == 1
 
 
 def test_interrupt_haor_session_cancels_task_and_restores_input_state(monkeypatch) -> None:  # type: ignore[no-untyped-def]

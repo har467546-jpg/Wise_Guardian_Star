@@ -821,6 +821,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
     turnPhaseRef.current[event.turn_id] = event.phase;
     setActiveTurnId(event.turn_id);
     if (event.phase === "message") {
+      markPendingMessageTurnAcked(event.client_message_id);
       setSending(true);
       setDraftAssistantMessage(null);
       setAssistantPlaceholder({
@@ -858,6 +859,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
     const phase = turnPhaseRef.current[event.turn_id];
     delete turnPhaseRef.current[event.turn_id];
     if (phase === "message") {
+      settlePendingMessageTurn();
       setSending(false);
     }
     if (phase === "ui_step") {
@@ -914,8 +916,9 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         if (sessionRef.current && sessionRef.current.session_id !== event.session.session_id) {
           return;
         }
+        syncPendingMessageTurnFromSession(event.session);
         syncPendingUiStepFromSession(event.session);
-        if (!activeTurnIdRef.current) {
+        if (!activeTurnIdRef.current && !pendingMessageTurnRef.current && !pendingUiStepRef.current) {
           setDraftAssistantMessage(null);
           setAssistantPlaceholder(null);
           setStreamFeed([]);
@@ -963,6 +966,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
           ignoredTurnIdsRef.current.delete(event.turn_id);
           return;
         }
+        settlePendingMessageTurn();
         settlePendingUiStep();
         setAssistantPlaceholder(null);
         setDraftAssistantMessage((current) => (current?.turnId === event.turn_id ? null : current));
@@ -997,6 +1001,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         if (ignoredTurnIdsRef.current.has(event.turn_id)) {
           return;
         }
+        settlePendingMessageTurn();
         settlePendingUiStep();
         pendingUiRequestRef.current = { turnId: event.turn_id, uiActions: event.ui_actions, content: event.content || null };
         setPendingUiRequest({ turnId: event.turn_id, uiActions: event.ui_actions, content: event.content || null });
@@ -1011,6 +1016,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         if (ignoredTurnIdsRef.current.has(event.turn_id)) {
           return;
         }
+        settlePendingMessageTurn();
         settlePendingUiStep();
         setAssistantPlaceholder(null);
         setSession((current) => {
@@ -1035,6 +1041,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
           ignoredTurnIdsRef.current.delete(event.turn_id);
           return;
         }
+        settlePendingMessageTurn();
         settlePendingUiStep();
         setAssistantPlaceholder(null);
         if (event.message) {
@@ -1056,6 +1063,38 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
       default:
         return;
     }
+  };
+
+  const applyMessageTurnResult = (result: AgentSession, clientMessageId: string) => {
+    syncPendingMessageTurnFromSession(result);
+    syncPendingUiStepFromSession(result);
+    setSession(result);
+    if (toPendingUiActions(result).length) {
+      setAssistantPlaceholder({
+        key: clientMessageId,
+        badge: "处理中",
+        content: "正在继续处理当前请求…",
+        tone: "action",
+      });
+    } else {
+      const runtime = toBrowserRuntime(result);
+      const currentMessageRequestId =
+        typeof runtime.current_message_request_id === "string" ? runtime.current_message_request_id.trim() : "";
+      setAssistantPlaceholder(
+        currentMessageRequestId === clientMessageId
+          ? {
+              key: clientMessageId,
+              badge: "生成中",
+              content: "正在生成…",
+            }
+          : null,
+      );
+    }
+    if (result.last_task_id) {
+      void loadTask(result.last_task_id, true);
+    }
+    setErrorText(null);
+    setStreamError(null);
   };
 
   const loadTask = async (taskId: string, silent = false) => {
@@ -1082,6 +1121,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         setLoading(true);
       }
       const result = await getHaorSession();
+      syncPendingMessageTurnFromSession(result);
       syncPendingUiStepFromSession(result);
       setSession(result);
       if (result.last_task_id) {
@@ -1166,25 +1206,32 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         setStreamError("haor 流式连接异常，正在尝试恢复");
       };
       socket.onclose = () => {
+        const hasPendingMessageTurn = Boolean(pendingMessageTurnRef.current);
         const hasPendingUiStep = Boolean(pendingUiStepRef.current);
         if (wsRef.current === socket) {
           wsRef.current = null;
         }
         setLoading(false);
-        setSending(false);
+        if (!hasPendingMessageTurn) {
+          setSending(false);
+        }
         if (!hasPendingUiStep) {
           setStepping(false);
         }
         setApproving(false);
         setActiveTurnId(null);
-        if (!hasPendingUiStep) {
+        if (!hasPendingUiStep && !hasPendingMessageTurn) {
           setAssistantPlaceholder(null);
         }
-        setDraftAssistantMessage(null);
+        if (!hasPendingMessageTurn) {
+          setDraftAssistantMessage(null);
+        }
         pendingUiRequestRef.current = null;
         setPendingUiRequest(null);
-        setPendingUserMessages((current) => markPendingUserMessagesFailed(current));
-        setStreamFeed([]);
+        if (!hasPendingMessageTurn) {
+          setPendingUserMessages((current) => markPendingUserMessagesFailed(current));
+          setStreamFeed([]);
+        }
         if (disposed || !shouldReconnectRef.current) {
           setConnectionState("disconnected");
           return;
@@ -1446,10 +1493,59 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
     }
     const clientMessageId = createClientId();
     const createdAt = new Date().toISOString();
+    const currentPageContext = { ...pageContext };
+    const context = syncBrowserContext(currentPageContext);
     let usedStream = false;
+
+    const scheduleMessageTurnFallback = () => {
+      const current = pendingMessageTurnRef.current;
+      if (!current || current.acked || current.fallbackUsed) {
+        return;
+      }
+      clearPendingMessageTurnTimer();
+      current.timerId = window.setTimeout(async () => {
+        const pendingTurn = pendingMessageTurnRef.current;
+        if (
+          !pendingTurn ||
+          pendingTurn.clientMessageId !== clientMessageId ||
+          pendingTurn.acked ||
+          pendingTurn.fallbackUsed
+        ) {
+          return;
+        }
+        pendingTurn.fallbackUsed = true;
+        try {
+          const result = await postHaorMessage({
+            client_message_id: pendingTurn.clientMessageId,
+            content: pendingTurn.content,
+            page_context: pendingTurn.pageContext,
+            browser_context: pendingTurn.browserContext,
+          });
+          const latestPendingTurn = pendingMessageTurnRef.current;
+          if (!latestPendingTurn || latestPendingTurn.clientMessageId !== clientMessageId) {
+            return;
+          }
+          applyMessageTurnResult(result, clientMessageId);
+        } catch {
+          const latestPendingTurn = pendingMessageTurnRef.current;
+          if (!latestPendingTurn || latestPendingTurn.clientMessageId !== clientMessageId) {
+            return;
+          }
+        }
+      }, MESSAGE_TURN_ACK_TIMEOUT_MS);
+    };
+
     try {
       setSending(true);
-      const context = syncBrowserContext(pageContext);
+      pendingMessageTurnRef.current = {
+        clientMessageId,
+        content: normalized,
+        pageContext: currentPageContext,
+        browserContext: context,
+        fallbackUsed: false,
+        acked: false,
+        timerId: null,
+      };
       setPendingUserMessages((current) => [
         ...current.filter((item) => item.clientMessageId !== clientMessageId),
         {
@@ -1472,34 +1568,24 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         type: "message",
         client_message_id: clientMessageId,
         content: normalized,
-        page_context: pageContext,
+        page_context: currentPageContext,
         browser_context: context,
       });
       if (usedStream) {
+        scheduleMessageTurnFallback();
         return;
       }
       const result = await postHaorMessage({
         client_message_id: clientMessageId,
         content: normalized,
-        page_context: pageContext,
+        page_context: currentPageContext,
         browser_context: context,
       });
-      setSession(result);
-      setAssistantPlaceholder(
-        toPendingUiActions(result).length
-          ? {
-              key: clientMessageId,
-              badge: "处理中",
-              content: "正在继续处理当前请求…",
-              tone: "action",
-            }
-          : null,
-      );
-      if (result.last_task_id) {
-        void loadTask(result.last_task_id, true);
-      }
+      applyMessageTurnResult(result, clientMessageId);
+      resetPendingMessageTurnState();
     } catch (error) {
       const text = error instanceof Error ? error.message : "haor 消息发送失败";
+      resetPendingMessageTurnState();
       setPendingUserMessages((current) =>
         current.map((item) => (item.clientMessageId === clientMessageId ? { ...item, status: "failed" } : item)),
       );
@@ -1540,6 +1626,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   const handleInterrupt = async () => {
     try {
       setInterrupting(true);
+      resetPendingMessageTurnState();
       resetPendingUiStepState();
       const result = await interruptHaorSession();
       setSession(result);
@@ -1563,6 +1650,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   const handleReset = async () => {
     try {
       setResetting(true);
+      resetPendingMessageTurnState();
       resetPendingUiStepState();
       const result = await resetHaorSession();
       if (activeTurnIdRef.current) {
