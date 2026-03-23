@@ -10,6 +10,7 @@ from app.repositories.task_repo import create_task_run, get_latest_task_run_for_
 from app.schemas.common import PageMeta
 from app.schemas.discovery import DiscoveryJobCreate, DiscoveryJobCreateResponse, DiscoveryJobListResponse, DiscoveryJobRead
 from app.tasks.scan_tasks import run_asset_scan_task
+from app.utils.net import normalize_cidr
 
 router = APIRouter()
 
@@ -35,7 +36,7 @@ def create_discovery_job(
         celery_task = run_asset_scan_task.delay(created.id, job_id)
         return update_task_run(db, created, celery_task_id=celery_task.id)
 
-    cidr_text = str(payload.cidr)
+    cidr_text = normalize_cidr(str(payload.cidr))
     active_job = get_active_job_by_cidr(db, cidr_text)
     if active_job:
         existing_task = ensure_scan_task(active_job.id, message="已复用已有扫描任务")

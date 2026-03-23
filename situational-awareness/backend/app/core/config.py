@@ -1,9 +1,13 @@
-import fcntl
 import shutil
 import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+
+try:
+    import fcntl
+except ModuleNotFoundError:
+    fcntl = None
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -108,7 +112,8 @@ def _drop_env_line(lines: list[str], key: str) -> list[str]:
 def ensure_runtime_encryption_key() -> RuntimeEnvBootstrapState:
     RUNTIME_ENV_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with RUNTIME_ENV_LOCK_PATH.open("a+", encoding="utf-8") as lock_handle:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         runtime_env = _ensure_runtime_env_file()
         lines = runtime_env.read_text(encoding="utf-8").splitlines()
         if _extract_env_value(lines, "ENCRYPTION_KEY"):

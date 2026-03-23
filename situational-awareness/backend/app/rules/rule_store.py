@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-import fcntl
+try:
+    import fcntl
+except ModuleNotFoundError:
+    fcntl = None
 import yaml
 
 from app.rules.remediation import resolve_rule_remediation, serialize_remediation
@@ -410,8 +413,10 @@ class RuleStore:
     def _write_lock(self) -> Iterator[None]:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

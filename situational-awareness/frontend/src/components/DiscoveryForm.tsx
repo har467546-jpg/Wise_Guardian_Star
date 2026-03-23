@@ -90,7 +90,7 @@ export default function DiscoveryForm() {
 
       const response = await createDiscoveryJob(payload);
       
-      // --- 核心修复：增加安全性校验 ---
+      // --- 增加安全性校验 ---
       if (!response || !response.task_id) {
         throw new Error("接口未返回有效的任务 ID");
       }

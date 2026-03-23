@@ -32,7 +32,6 @@ from app.db.models.remediation_session import RemediationSession
 from app.db.models.risk_finding import RiskFinding
 from app.db.models.user import User
 from app.repositories.asset_repo import get_asset, list_assets
-from app.repositories.discovery_repo import create_job, get_active_job_by_cidr
 from app.repositories.risk_repo import get_finding, list_findings, list_findings_by_asset
 from app.repositories.task_event_repo import list_task_events_for_task
 from app.repositories.task_repo import (
@@ -64,24 +63,32 @@ from app.schemas.agent import (
     AgentUIStepRequest,
 )
 from app.services.ai.providers import LLMMessage, LLMRequest, build_provider
+from app.services.agent.context_service import sanitize_browser_context_summary
+from app.services.agent.execution_registry import AgentActionExecutorContext, AgentExecutionResult
+from app.services.agent.execution_service import AgentExecutionService
+from app.services.agent.session_service import (
+    append_interrupted_task_message,
+    ensure_active_session,
+    interrupt_agent_session as interrupt_agent_session_via_service,
+    load_recent_session,
+    mark_agent_session_interrupted as mark_agent_session_interrupted_via_service,
+    reconcile_running_session_state,
+    reset_agent_session as reset_agent_session_via_service,
+    restore_session_from_running_state,
+)
+from app.services.agent.state_machine import is_active_public_session_status
 from app.services.remediation_service import build_plan, get_manual_credential, list_remediation_assets
 from app.services.remediation_session_service import (
-    approve_remediation_session,
     build_remediation_asset_detail,
-    create_or_resume_remediation_session,
     get_remediation_session_read,
 )
-from app.services.runner_service import queue_runner_install
 from app.services.task_observability_service import serialize_task_detail, serialize_task_event
-from app.tasks.runner_tasks import run_runner_install_task
-from app.tasks.scan_tasks import run_asset_scan_task
-from app.tasks.verify_tasks import run_risk_verify_task
 from app.utils.local_asset import resolve_local_asset
+from app.utils.net import normalize_cidr
 from app.utils.sanitize import sanitize_json_value, sanitize_text
 
 
 AGENT_ID = "haor"
-ACTIVE_SESSION_STATUSES = {"active", "waiting_approval", "running"}
 ACTIVE_TASK_STATUSES = {
     TaskExecutionStatus.PENDING,
     TaskExecutionStatus.RUNNING,
@@ -115,6 +122,7 @@ SUPPORTED_WRITE_ACTIONS = {
     "create_or_resume_remediation_session",
     "approve_remediation_session",
 }
+AGENT_EXECUTION_SERVICE = AgentExecutionService(supported_action_types=SUPPORTED_WRITE_ACTIONS)
 AUTO_EXECUTE_ACTIONS = {
     "create_discovery_job",
     "verify_asset_risks",
@@ -312,11 +320,7 @@ def _session_query(user_id: str):
 
 
 def _load_recent_session(db: Session, *, user_id: str) -> AgentSession | None:
-    sessions = db.scalars(_session_query(user_id)).unique().all()
-    for session in sessions:
-        if str(session.status or "") in ACTIVE_SESSION_STATUSES:
-            return session
-    return sessions[0] if sessions else None
+    return load_recent_session(query_builder=_session_query, db=db, user_id=user_id)
 
 
 def _normalize_task_status(status: TaskExecutionStatus | str | None) -> str:
@@ -517,6 +521,10 @@ def _normalize_semantic_page_context(page_context: dict[str, Any] | None) -> dic
     return normalized
 
 
+def _normalize_browser_context_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
+    return sanitize_browser_context_summary(summary)
+
+
 def _normalize_browser_context(browser_context: dict[str, Any] | None) -> dict[str, Any]:
     payload = browser_context if isinstance(browser_context, dict) else {}
     query = payload.get("query") if isinstance(payload.get("query"), dict) else {}
@@ -527,6 +535,7 @@ def _normalize_browser_context(browser_context: dict[str, Any] | None) -> dict[s
     semantic_actions = payload.get("semantic_actions") if isinstance(payload.get("semantic_actions"), list) else []
     semantic_forms = payload.get("semantic_forms") if isinstance(payload.get("semantic_forms"), list) else []
     semantic_page_context = payload.get("semantic_page_context") if isinstance(payload.get("semantic_page_context"), dict) else {}
+    summary_json = payload.get("summary_json") if isinstance(payload.get("summary_json"), dict) else {}
     dom_snapshot = payload.get("dom_snapshot") if isinstance(payload.get("dom_snapshot"), list) else []
     normalized = {
         "pathname": sanitize_text(str(payload.get("pathname") or "/"), max_length=255) or "/",
@@ -543,6 +552,7 @@ def _normalize_browser_context(browser_context: dict[str, Any] | None) -> dict[s
         "semantic_page_context": {},
         "semantic_actions": [],
         "semantic_forms": [],
+        "summary_json": {},
         "dom_snapshot": [],
     }
     for item in selected_entities[:8]:
@@ -603,6 +613,7 @@ def _normalize_browser_context(browser_context: dict[str, Any] | None) -> dict[s
             if isinstance(normalized["semantic_page_context"], dict)
             else []
         )
+    normalized["summary_json"] = _normalize_browser_context_summary(summary_json)
     for item in dom_snapshot[:80]:
         normalized_node = _normalize_browser_dom_node(item if isinstance(item, dict) else {})
         if normalized_node:
@@ -1705,11 +1716,7 @@ def _append_or_stream_assistant_message(
 
 
 def _restore_session_from_running_state(session: AgentSession) -> None:
-    session.status = "active"
-    session.pending_plan_json = {}
-    session.dialog_state_json = {}
-    session.browser_runtime_json = {}
-    session.updated_at = _now()
+    restore_session_from_running_state(session, now_fn=_now)
 
 
 def _has_interrupted_task_message(session: AgentSession, *, task_id: str) -> bool:
@@ -1772,19 +1779,12 @@ def _append_interrupted_task_message(
     task_id: str,
     source: str,
 ) -> None:
-    if _has_interrupted_task_message(session, task_id=task_id):
-        return
-    _append_message(
+    append_interrupted_task_message(
         db,
         session=session,
-        role="assistant",
-        message_type="task_update",
-        content="当前编排已中断，可以继续输入新的问题或执行意图。",
-        payload_json={
-            "task_id": task_id,
-            "interrupted": True,
-            "source": source,
-        },
+        task_id=task_id,
+        source=source,
+        append_message_fn=_append_message,
     )
 
 
@@ -1794,36 +1794,19 @@ def _reconcile_running_session_state(
     session: AgentSession,
     interrupted_source: str = "session_reconcile",
 ) -> bool:
-    if str(session.status or "") != "running":
-        return False
-
-    task_id = _sanitize_line(str(session.last_task_id or ""), max_length=64)
-    if not task_id:
-        _restore_session_from_running_state(session)
-        db.add(session)
-        return True
-
-    task = get_task_run(db, task_id)
-    if task is None or not _is_session_orchestrate_task(task, session_id=session.id):
-        _restore_session_from_running_state(session)
-        db.add(session)
-        return True
-
-    task_status = _normalize_task_status(task.status)
-    if task_status == TaskExecutionStatus.CANCELED.value:
-        _restore_session_from_running_state(session)
-        session.last_task_id = task_id
-        db.add(session)
-        _append_interrupted_task_message(db, session=session, task_id=task_id, source=interrupted_source)
-        return True
-
-    if _is_terminal_task_status(task.status):
-        _restore_session_from_running_state(session)
-        session.last_task_id = task_id
-        db.add(session)
-        return True
-
-    return False
+    return reconcile_running_session_state(
+        db,
+        session=session,
+        interrupted_source=interrupted_source,
+        sanitize_line_fn=_sanitize_line,
+        get_task_run_fn=get_task_run,
+        is_session_orchestrate_task_fn=_is_session_orchestrate_task,
+        normalize_task_status_fn=_normalize_task_status,
+        is_terminal_task_status_fn=_is_terminal_task_status,
+        restore_session_from_running_state_fn=_restore_session_from_running_state,
+        append_interrupted_task_message_fn=_append_interrupted_task_message,
+        canceled_task_status=TaskExecutionStatus.CANCELED.value,
+    )
 
 
 def _reconcile_stale_message_turn_state(
@@ -2036,13 +2019,14 @@ def mark_agent_session_interrupted(
     task_id: str,
     source: str,
 ) -> None:
-    session = db.get(AgentSession, session_id)
-    if session is None:
-        return
-    _restore_session_from_running_state(session)
-    session.last_task_id = task_id
-    db.add(session)
-    _append_interrupted_task_message(db, session=session, task_id=task_id, source=source)
+    mark_agent_session_interrupted_via_service(
+        db,
+        session_id=session_id,
+        task_id=task_id,
+        source=source,
+        restore_session_from_running_state_fn=_restore_session_from_running_state,
+        append_interrupted_task_message_fn=_append_interrupted_task_message,
+    )
 
 
 def _create_session(db: Session, *, user: User) -> AgentSession:
@@ -2062,42 +2046,30 @@ def _create_session(db: Session, *, user: User) -> AgentSession:
 
 
 def get_or_create_agent_session(db: Session, *, user: User) -> AgentSessionRead:
-    session = _load_recent_session(db, user_id=user.id)
-    if session is not None and _reconcile_session_runtime_state(db, session=session):
-        db.commit()
-        db.refresh(session)
-    if session is None or str(session.status or "") not in ACTIVE_SESSION_STATUSES:
-        session = _create_session(db, user=user)
-        db.commit()
-        db.refresh(session)
+    session = ensure_active_session(
+        load_recent_session_fn=_load_recent_session,
+        reconcile_session_runtime_state_fn=_reconcile_session_runtime_state,
+        create_session_fn=_create_session,
+        db=db,
+        user=user,
+    )
     return serialize_agent_session(session)
 
 
 def reset_agent_session(db: Session, *, user: User) -> AgentSessionRead:
-    current_session = _load_recent_session(db, user_id=user.id)
-    if current_session is not None and _reconcile_session_runtime_state(db, session=current_session):
-        db.flush()
-    if current_session is not None and str(current_session.status or "") == "running":
-        try:
-            interrupt_agent_session(db, user=user)
-        except AgentConflictError:
-            db.flush()
-
-    sessions = db.scalars(_session_query(user.id)).unique().all()
-    for session in sessions:
-        if str(session.status or "") in ACTIVE_SESSION_STATUSES:
-            session.status = "completed"
-            session.pending_plan_json = {}
-            session.working_context_json = {}
-            session.dialog_state_json = {}
-            session.browser_runtime_json = {}
-            session.route_context_json = _normalize_page_context({})
-            session.updated_at = _now()
-            db.add(session)
-    session = _create_session(db, user=user)
-    db.commit()
-    db.refresh(session)
-    return serialize_agent_session(session)
+    return reset_agent_session_via_service(
+        db,
+        user=user,
+        load_recent_session_fn=_load_recent_session,
+        reconcile_session_runtime_state_fn=_reconcile_session_runtime_state,
+        interrupt_agent_session_fn=interrupt_agent_session,
+        agent_conflict_error_cls=AgentConflictError,
+        query_builder=_session_query,
+        normalize_page_context_fn=_normalize_page_context,
+        now_fn=_now,
+        create_session_fn=_create_session,
+        serialize_agent_session_fn=serialize_agent_session,
+    )
 
 
 def append_agent_task_message(
@@ -2694,7 +2666,10 @@ def _extract_cidr_target(content: str) -> str | None:
     match = re.search(r"((?:\d{1,3}\.){3}\d{1,3}/\d{1,2})", normalized)
     if not match:
         return None
-    return match.group(0)
+    try:
+        return normalize_cidr(match.group(0))
+    except ValueError:
+        return None
 
 
 def _has_pending_plan(payload: dict[str, Any] | None) -> bool:
@@ -4485,7 +4460,7 @@ def post_agent_message(
     session = _load_recent_session(db, user_id=user.id)
     if session is not None and _reconcile_session_runtime_state(db, session=session):
         db.flush()
-    if session is None or str(session.status or "") not in ACTIVE_SESSION_STATUSES:
+    if session is None or not is_active_public_session_status(str(session.status or "")):
         session = _create_session(db, user=user)
         db.flush()
     _raise_if_session_running(session, stage="message")
@@ -4991,7 +4966,7 @@ def post_agent_step(
     session = _load_recent_session(db, user_id=user.id)
     if session is not None and _reconcile_session_runtime_state(db, session=session):
         db.flush()
-    if session is None or str(session.status or "") not in ACTIVE_SESSION_STATUSES:
+    if session is None or not is_active_public_session_status(str(session.status or "")):
         raise AgentConflictError("当前没有可继续的 haor 会话", stage="step")
     _raise_if_session_running(session, stage="step")
 
@@ -5307,134 +5282,6 @@ def stream_agent_approve_turn(
     return response
 
 
-def _queue_discovery_job_from_action(db: Session, *, action: dict[str, Any], user_id: str) -> AgentExecutionResult:
-    params = action.get("params") if isinstance(action.get("params"), dict) else {}
-    cidr = sanitize_text(str(params.get("cidr") or ""), max_length=64, single_line=True) or ""
-    label = sanitize_text(str(params.get("label") or ""), max_length=255)
-    if not cidr:
-        raise RuntimeError("扫描计划缺少 CIDR")
-    active_job = get_active_job_by_cidr(db, cidr)
-    if active_job is None:
-        job = create_job(db=db, cidr=cidr, label=label, created_by=user_id)
-    else:
-        job = active_job
-    existing_task = get_latest_task_run_for_scope(
-        db,
-        scope_type="discovery_job",
-        scope_id=job.id,
-        task_type=TaskType.ASSET_SCAN,
-        statuses=[TaskExecutionStatus.PENDING, TaskExecutionStatus.RUNNING, TaskExecutionStatus.RETRY],
-    )
-    if existing_task is not None:
-        return AgentExecutionResult(
-            status="queued",
-            summary=f"已复用扫描任务 {existing_task.id}",
-            child_task_id=existing_task.id,
-            payload={"job_id": job.id, "task_id": existing_task.id, "reused": True},
-        )
-    task_run = create_task_run(
-        db,
-        task_type=TaskType.ASSET_SCAN,
-        scope_type="discovery_job",
-        scope_id=job.id,
-        message="扫描任务已入队",
-    )
-    celery_task = run_asset_scan_task.delay(task_run.id, job.id)
-    update_task_run(db, task_run, celery_task_id=celery_task.id)
-    return AgentExecutionResult(
-        status="queued",
-        summary=f"已创建扫描任务 {task_run.id}",
-        child_task_id=task_run.id,
-        payload={"job_id": job.id, "task_id": task_run.id, "reused": False},
-    )
-
-
-def _queue_risk_verify_from_action(db: Session, *, action: dict[str, Any]) -> AgentExecutionResult:
-    params = action.get("params") if isinstance(action.get("params"), dict) else {}
-    asset_id = _sanitize_line(str(params.get("asset_id") or ""), max_length=64)
-    if not asset_id:
-        raise RuntimeError("风险验证计划缺少 asset_id")
-    asset = db.get(Asset, asset_id)
-    if asset is None:
-        raise RuntimeError("资产不存在")
-    task_run = create_task_run(
-        db,
-        task_type=TaskType.RISK_VERIFY,
-        scope_type="asset",
-        scope_id=asset_id,
-        message="风险验证任务已入队",
-    )
-    celery_task = run_risk_verify_task.delay(task_run.id, asset_id)
-    update_task_run(db, task_run, celery_task_id=celery_task.id)
-    return AgentExecutionResult(
-        status="queued",
-        summary=f"已触发资产 {asset_id} 的风险验证",
-        child_task_id=task_run.id,
-        payload={"asset_id": asset_id, "task_id": task_run.id},
-    )
-
-
-def _queue_runner_install_from_action(
-    db: Session,
-    *,
-    action: dict[str, Any],
-    platform_url: str,
-) -> AgentExecutionResult:
-    params = action.get("params") if isinstance(action.get("params"), dict) else {}
-    asset_id = _sanitize_line(str(params.get("asset_id") or ""), max_length=64)
-    if not asset_id:
-        raise RuntimeError("Runner 安装计划缺少 asset_id")
-    if not str(platform_url or "").strip():
-        raise RuntimeError("Runner 安装计划缺少平台地址")
-    asset = db.get(Asset, asset_id)
-    if asset is None:
-        raise RuntimeError("资产不存在")
-    credential = get_manual_credential(db, asset_id)
-    host_runner, task_id, registration_token = queue_runner_install(
-        db,
-        asset=asset,
-        credential=credential,
-        platform_url=platform_url,
-    )
-    celery_task = run_runner_install_task.delay(task_id, asset_id, platform_url, registration_token)
-    task_run = get_task_run(db, task_id)
-    if task_run is not None:
-        update_task_run(db, task_run, celery_task_id=celery_task.id)
-    return AgentExecutionResult(
-        status="queued",
-        summary=f"已提交 Host Runner 安装任务 {task_id}",
-        child_task_id=task_id,
-        payload={"asset_id": asset_id, "task_id": task_id, "runner_id": host_runner.id},
-    )
-
-
-def _create_or_resume_remediation_from_action(db: Session, *, action: dict[str, Any]) -> AgentExecutionResult:
-    params = action.get("params") if isinstance(action.get("params"), dict) else {}
-    asset_id = _sanitize_line(str(params.get("asset_id") or ""), max_length=64)
-    if not asset_id:
-        raise RuntimeError("修复会话计划缺少 asset_id")
-    session = create_or_resume_remediation_session(db, asset_id=asset_id)
-    return AgentExecutionResult(
-        status="success",
-        summary=f"已准备主机修复会话 {session.session_id}",
-        payload={"asset_id": asset_id, "session_id": session.session_id},
-    )
-
-
-def _approve_remediation_from_action(db: Session, *, action: dict[str, Any]) -> AgentExecutionResult:
-    params = action.get("params") if isinstance(action.get("params"), dict) else {}
-    session_id = _sanitize_line(str(params.get("session_id") or ""), max_length=64)
-    if not session_id:
-        raise RuntimeError("修复批准计划缺少 session_id")
-    response = approve_remediation_session(db, session_id=session_id, approved_by="haor")
-    return AgentExecutionResult(
-        status="queued",
-        summary=f"已批准修复会话 {session_id}",
-        child_task_id=response.task_id,
-        payload={"session_id": session_id, "task_id": response.task_id},
-    )
-
-
 def execute_approved_action(
     db: Session,
     *,
@@ -5442,20 +5289,15 @@ def execute_approved_action(
     session_user_id: str,
     platform_url: str,
 ) -> AgentExecutionResult:
-    action_type = str(action.get("action_type") or "").strip()
-    if action_type not in SUPPORTED_WRITE_ACTIONS:
-        raise RuntimeError("计划中存在不受支持的动作类型")
-    if action_type == "create_discovery_job":
-        return _queue_discovery_job_from_action(db, action=action, user_id=session_user_id)
-    if action_type == "verify_asset_risks":
-        return _queue_risk_verify_from_action(db, action=action)
-    if action_type == "install_runner":
-        return _queue_runner_install_from_action(db, action=action, platform_url=platform_url)
-    if action_type == "create_or_resume_remediation_session":
-        return _create_or_resume_remediation_from_action(db, action=action)
-    if action_type == "approve_remediation_session":
-        return _approve_remediation_from_action(db, action=action)
-    raise RuntimeError("不支持的动作类型")
+    return AGENT_EXECUTION_SERVICE.execute(
+        AgentActionExecutorContext(
+            db=db,
+            session_user_id=session_user_id,
+            platform_url=platform_url,
+            get_manual_credential=get_manual_credential,
+        ),
+        action=action,
+    )
 
 
 def wait_for_child_task(task_id: str, *, timeout_seconds: int = 7200, interval_seconds: int = 2) -> dict[str, Any]:
@@ -5574,71 +5416,24 @@ def approve_agent_session(
 
 
 def interrupt_agent_session(db: Session, *, user: User) -> AgentSessionRead:
-    session = _load_recent_session(db, user_id=user.id)
-    if session is None:
-        raise AgentNotFoundError("当前 haor 会话不存在", stage="interrupt")
-
-    if _reconcile_running_session_state(db, session=session, interrupted_source="session_interrupt_reconcile"):
-        db.commit()
-        db.refresh(session)
-
-    if str(session.status or "") != "running":
-        raise AgentConflictError("当前没有运行中的 haor 编排任务", session_id=session.id, stage="interrupt")
-
-    task_id = _sanitize_line(str(session.last_task_id or ""), max_length=64)
-    if not task_id:
-        _restore_session_from_running_state(session)
-        db.commit()
-        db.refresh(session)
-        raise AgentConflictError("当前没有运行中的 haor 编排任务", session_id=session.id, stage="interrupt")
-
-    task = get_task_run(db, task_id)
-    if task is None:
-        _restore_session_from_running_state(session)
-        db.commit()
-        db.refresh(session)
-        raise AgentConflictError("当前没有运行中的 haor 编排任务", session_id=session.id, stage="interrupt")
-
-    if not _is_session_orchestrate_task(task, session_id=session.id):
-        _restore_session_from_running_state(session)
-        db.commit()
-        db.refresh(session)
-        raise AgentConflictError("当前没有运行中的 haor 编排任务", session_id=session.id, stage="interrupt")
-
-    if not _is_active_task_status(task.status):
-        _restore_session_from_running_state(session)
-        db.commit()
-        db.refresh(session)
-        raise AgentConflictError("当前任务已结束，无需中断", session_id=session.id, stage="interrupt")
-
-    if task.celery_task_id:
-        try:
-            celery_app.control.revoke(
-                task.celery_task_id,
-                terminate=_normalize_task_status(task.status) in {
-                    TaskExecutionStatus.RUNNING.value,
-                    TaskExecutionStatus.RETRY.value,
-                },
-                signal="SIGTERM",
-            )
-        except Exception as exc:
-            raise AgentUpstreamError(
-                f"haor 编排中断请求下发失败：{exc}",
-                session_id=session.id,
-                stage="interrupt",
-            ) from exc
-
-    cancel_task_run(
+    return interrupt_agent_session_via_service(
         db,
-        task,
-        message="haor 编排任务已中断",
-        payload_json={
-            "source": "agent_session_interrupt",
-            "celery_task_id": task.celery_task_id,
-            "session_id": session.id,
-        },
+        user=user,
+        load_recent_session_fn=_load_recent_session,
+        reconcile_running_session_state_fn=_reconcile_running_session_state,
+        restore_session_from_running_state_fn=_restore_session_from_running_state,
+        sanitize_line_fn=_sanitize_line,
+        get_task_run_fn=get_task_run,
+        is_session_orchestrate_task_fn=_is_session_orchestrate_task,
+        is_active_task_status_fn=_is_active_task_status,
+        normalize_task_status_fn=_normalize_task_status,
+        celery_app=celery_app,
+        running_task_status=TaskExecutionStatus.RUNNING.value,
+        retry_task_status=TaskExecutionStatus.RETRY.value,
+        cancel_task_run_fn=cancel_task_run,
+        mark_agent_session_interrupted_fn=mark_agent_session_interrupted,
+        serialize_agent_session_fn=serialize_agent_session,
+        agent_not_found_error_cls=AgentNotFoundError,
+        agent_conflict_error_cls=AgentConflictError,
+        agent_upstream_error_cls=AgentUpstreamError,
     )
-    mark_agent_session_interrupted(db, session_id=session.id, task_id=task.id, source="interrupt_api")
-    db.commit()
-    db.refresh(session)
-    return serialize_agent_session(session)

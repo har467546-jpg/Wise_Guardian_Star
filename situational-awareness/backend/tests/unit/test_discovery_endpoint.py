@@ -78,3 +78,39 @@ def test_create_discovery_job_creates_new_job(monkeypatch) -> None:
     assert result.status == "pending"
     assert result.task_id == "task-new"
     assert str(result.job.cidr) == "10.10.0.0/24"
+
+
+def test_create_discovery_job_normalizes_host_bits_before_lookup_and_create(monkeypatch) -> None:
+    observed: dict[str, str] = {}
+
+    def _get_active_job_by_cidr(db, cidr):  # type: ignore[no-untyped-def]
+        observed["lookup_cidr"] = cidr
+        return None
+
+    def _create_job(**kwargs):  # type: ignore[no-untyped-def]
+        observed["create_cidr"] = kwargs["cidr"]
+        return _job("job-normalized")
+
+    monkeypatch.setattr(discovery_endpoint, "get_active_job_by_cidr", _get_active_job_by_cidr)
+    monkeypatch.setattr(discovery_endpoint, "create_job", _create_job)
+    monkeypatch.setattr(discovery_endpoint, "get_latest_task_run_for_scope", lambda *args, **kwargs: None)
+    monkeypatch.setattr(discovery_endpoint, "create_task_run", lambda *args, **kwargs: SimpleNamespace(id="task-normalized"))
+    monkeypatch.setattr(
+        discovery_endpoint,
+        "run_asset_scan_task",
+        SimpleNamespace(delay=lambda *args, **kwargs: SimpleNamespace(id="celery-normalized")),
+    )
+    monkeypatch.setattr(discovery_endpoint, "update_task_run", lambda db, task, **kwargs: task)
+
+    response = Response()
+    result = discovery_endpoint.create_discovery_job(
+        payload=SimpleNamespace(cidr="10.10.0.9/24", label="normalize"),
+        response=response,
+        db=DummyDB(),
+        current_user=SimpleNamespace(id="user-1"),
+    )
+
+    assert response.status_code == 201
+    assert observed["lookup_cidr"] == "10.10.0.0/24"
+    assert observed["create_cidr"] == "10.10.0.0/24"
+    assert str(result.job.cidr) == "10.10.0.0/24"

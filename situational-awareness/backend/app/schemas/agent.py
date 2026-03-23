@@ -124,6 +124,18 @@ class AgentSemanticPageContextRead(BaseModel):
     summary: str | None = None
 
 
+class AgentBrowserContextSummaryRead(BaseModel):
+    page_kind: str = "unknown"
+    primary_entity: dict[str, Any] = Field(default_factory=dict)
+    secondary_entities: list[dict[str, Any]] = Field(default_factory=list)
+    visible_sections: list[dict[str, Any]] = Field(default_factory=list)
+    top_semantic_actions: list[dict[str, Any]] = Field(default_factory=list)
+    selected_rows: list[dict[str, Any]] = Field(default_factory=list)
+    active_dialog: dict[str, Any] = Field(default_factory=dict)
+    has_modal_or_drawer: bool = False
+    summary: str | None = None
+
+
 class AgentBrowserContextRead(BaseModel):
     pathname: str = "/"
     origin: str | None = None
@@ -139,6 +151,7 @@ class AgentBrowserContextRead(BaseModel):
     semantic_page_context: AgentSemanticPageContextRead = Field(default_factory=AgentSemanticPageContextRead)
     semantic_actions: list[AgentBrowserSemanticActionRead] = Field(default_factory=list)
     semantic_forms: list[AgentBrowserSemanticFormRead] = Field(default_factory=list)
+    summary_json: AgentBrowserContextSummaryRead = Field(default_factory=AgentBrowserContextSummaryRead)
     dom_snapshot: list[AgentBrowserDOMNodeRead] = Field(default_factory=list)
 
 

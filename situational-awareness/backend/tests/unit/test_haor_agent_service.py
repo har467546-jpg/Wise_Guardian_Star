@@ -473,6 +473,10 @@ def test_build_internal_followup_decision_executes_discovery_scan_on_affirm_with
     assert "label" not in decision.auto_execute_actions[0].params
 
 
+def test_extract_cidr_target_normalizes_host_bits() -> None:
+    assert haor_agent_service._extract_cidr_target("请扫描 192.168.10.1/24") == "192.168.10.0/24"
+
+
 def test_build_internal_followup_decision_uses_explicit_label_override() -> None:
     decision = haor_agent_service._build_internal_followup_decision(
         user=SimpleNamespace(role="admin"),

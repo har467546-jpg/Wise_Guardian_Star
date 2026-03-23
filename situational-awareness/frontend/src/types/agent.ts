@@ -141,6 +141,18 @@ export type AgentSemanticPageContext = {
   summary?: string | null;
 };
 
+export type AgentBrowserContextSummary = {
+  page_kind: string;
+  primary_entity?: Record<string, unknown>;
+  secondary_entities?: Array<Record<string, unknown>>;
+  visible_sections?: Array<Record<string, unknown>>;
+  top_semantic_actions?: Array<Record<string, unknown>>;
+  selected_rows?: Array<Record<string, unknown>>;
+  active_dialog?: Record<string, unknown>;
+  has_modal_or_drawer?: boolean;
+  summary?: string | null;
+};
+
 export type AgentBrowserContext = {
   pathname: string;
   origin?: string | null;
@@ -156,6 +168,7 @@ export type AgentBrowserContext = {
   semantic_page_context?: AgentSemanticPageContext;
   semantic_actions?: AgentBrowserSemanticAction[];
   semantic_forms?: AgentBrowserSemanticForm[];
+  summary_json?: AgentBrowserContextSummary;
   dom_snapshot?: AgentBrowserDOMNode[];
 };
 

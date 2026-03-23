@@ -828,9 +828,47 @@ function collectSemanticPageContext(pageContext: AgentPageContext) {
   }
 }
 
+function buildBrowserContextSummary(
+  pageContext: AgentPageContext,
+  semanticPageContext: AgentSemanticPageContext,
+  openPanels: Array<Record<string, unknown>>,
+) {
+  const pageKind = semanticPageContext.page_kind || inferPageKind(pageContext);
+  const visibleSections = Array.isArray(semanticPageContext.visible_sections) ? semanticPageContext.visible_sections.slice(0, 6) : [];
+  const topSemanticActions = Array.isArray(semanticPageContext.semantic_actions) ? semanticPageContext.semantic_actions.slice(0, 8) : [];
+  const secondaryEntities = Array.isArray(semanticPageContext.secondary_entities) ? semanticPageContext.secondary_entities.slice(0, 6) : [];
+  const selectedRows = Array.isArray(semanticPageContext.selected_rows) ? semanticPageContext.selected_rows.slice(0, 6) : [];
+  const activeDialog = semanticPageContext.active_dialog && typeof semanticPageContext.active_dialog === "object"
+    ? semanticPageContext.active_dialog
+    : {};
+  return {
+    page_kind: pageKind,
+    primary_entity: semanticPageContext.primary_entity || {},
+    secondary_entities: secondaryEntities,
+    visible_sections: visibleSections.map((item) => ({
+      section_id: item.section_id,
+      label: item.label,
+      node_id: item.node_id || null,
+      description: item.description || null,
+    })),
+    top_semantic_actions: topSemanticActions.map((item) => ({
+      semantic_action_id: item.semantic_action_id,
+      label: item.label,
+      action_type: item.action_type,
+      section_id: item.section_id || null,
+      href: item.href || null,
+    })),
+    selected_rows: selectedRows,
+    active_dialog: activeDialog,
+    has_modal_or_drawer: openPanels.length > 0,
+    summary: semanticPageContext.summary || null,
+  };
+}
+
 export function collectBrowserContext(pageContext: AgentPageContext): AgentBrowserContext {
   const domSnapshot = collectDOMSnapshot();
   const semanticPageContext = collectSemanticPageContext(pageContext);
+  const openPanels = collectOpenPanels();
   return {
     pathname: pageContext.pathname,
     origin: window.location.origin,
@@ -840,12 +878,13 @@ export function collectBrowserContext(pageContext: AgentPageContext): AgentBrows
     finding_id: pageContext.finding_id || null,
     task_id: pageContext.task_id || null,
     selected_entities: collectSelectedEntities(pageContext),
-    open_panels: collectOpenPanels(),
+    open_panels: openPanels,
     forms: collectForms(),
     visible_actions: collectVisibleActions(domSnapshot),
     semantic_page_context: semanticPageContext,
     semantic_actions: semanticPageContext.semantic_actions || [],
     semantic_forms: semanticPageContext.semantic_forms || [],
+    summary_json: buildBrowserContextSummary(pageContext, semanticPageContext, openPanels),
     dom_snapshot: domSnapshot,
   };
 }

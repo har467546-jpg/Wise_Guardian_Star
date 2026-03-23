@@ -145,8 +145,12 @@ function LiveTrendCard({ label, color, value, detail, series, scaleLabel, maxVal
         )}
       </div>
       <div className="live-trend-card-footer">
-        <Typography.Text type="secondary">{detail}</Typography.Text>
-        <Typography.Text type="secondary">{scaleLabel}</Typography.Text>
+        <Typography.Text type="secondary" className="live-trend-card-detail" title={detail}>
+          {detail}
+        </Typography.Text>
+        <Typography.Text type="secondary" className="live-trend-card-scale">
+          {scaleLabel}
+        </Typography.Text>
       </div>
     </div>
   );

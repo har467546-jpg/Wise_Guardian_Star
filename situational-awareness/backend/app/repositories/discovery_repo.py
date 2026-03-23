@@ -5,10 +5,12 @@ from sqlalchemy.orm import Session
 
 from app.db.models.discovery_job import DiscoveryJob
 from app.db.models.enums import DiscoveryJobStatus
+from app.utils.net import normalize_cidr
 
 
 def create_job(db: Session, cidr: str, label: str | None, created_by: str | None) -> DiscoveryJob:
-    job = DiscoveryJob(cidr=cidr, label=label, created_by=created_by)
+    normalized_cidr = normalize_cidr(cidr)
+    job = DiscoveryJob(cidr=normalized_cidr, label=label, created_by=created_by)
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -41,10 +43,11 @@ def list_jobs(
 
 
 def get_active_job_by_cidr(db: Session, cidr: str) -> DiscoveryJob | None:
+    normalized_cidr = normalize_cidr(cidr)
     stmt = (
         select(DiscoveryJob)
         .where(
-            DiscoveryJob.cidr == cidr,
+            DiscoveryJob.cidr == normalized_cidr,
             DiscoveryJob.status.in_([DiscoveryJobStatus.PENDING, DiscoveryJobStatus.RUNNING]),
         )
         .order_by(DiscoveryJob.created_at.desc())
