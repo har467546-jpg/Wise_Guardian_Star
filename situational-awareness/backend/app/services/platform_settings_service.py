@@ -28,7 +28,17 @@ from app.schemas.settings import (
     PlatformSettingsSectionRead,
     PlatformSettingsUpdate,
 )
-from app.services.ai.providers import LLMRequest, build_provider, list_remote_models, resolve_provider_base_url
+from app.services.ai.providers import (
+    LLMRequest,
+    PROVIDER_META,
+    build_provider,
+    list_remote_models,
+    normalize_provider_name,
+    provider_requires_base_url,
+    resolve_provider_base_url,
+    resolve_provider_default_wire_api,
+    resolve_provider_saved_base_url,
+)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_ENV_PATH = BACKEND_ROOT / ".env.runtime"
@@ -183,12 +193,27 @@ def _mask_secret(value: str | None) -> str | None:
 
 
 def _current_api_key_state() -> PlatformSecretFieldStateRead:
-    plain = str(settings.LLM_API_KEY or "").strip()
+    plain = _runtime_env_value("LLM_API_KEY", str(settings.LLM_API_KEY or "")).strip()
     return PlatformSecretFieldStateRead(
         configured=bool(plain),
         masked_value=_mask_secret(plain),
         editable=True,
     )
+
+
+def _runtime_env_snapshot() -> dict[str, str]:
+    runtime_path = ensure_runtime_env_file()
+    env_map = _parse_env_file(runtime_path)
+    if env_map:
+        return env_map
+    return _parse_env_file(EXAMPLE_ENV_PATH)
+
+
+def _runtime_env_value(key: str, fallback: str = "") -> str:
+    value = _runtime_env_snapshot().get(key)
+    if value is None:
+        return str(fallback or "")
+    return str(value).strip()
 
 
 def _resolve_ai_validation_api_key(payload: PlatformAIValidateRequest) -> tuple[str, bool]:
@@ -197,7 +222,7 @@ def _resolve_ai_validation_api_key(payload: PlatformAIValidateRequest) -> tuple[
         return incoming_api_key, False
     if payload.clear_llm_api_key:
         return "", False
-    saved_api_key = str(settings.LLM_API_KEY or "").strip()
+    saved_api_key = _runtime_env_value("LLM_API_KEY", str(settings.LLM_API_KEY or ""))
     if saved_api_key:
         return saved_api_key, True
     return "", False
@@ -253,6 +278,17 @@ def _humanize_ai_validation_error(exc: Exception) -> str:
 
 def get_platform_settings_read() -> PlatformSettingsRead:
     ensure_runtime_env_file()
+    runtime_env = _runtime_env_snapshot()
+    runtime_provider = str(runtime_env.get("LLM_PROVIDER") or settings.LLM_PROVIDER or "mock")
+    runtime_model = str(runtime_env.get("LLM_MODEL") or settings.LLM_MODEL or "")
+    runtime_base_url = str(runtime_env.get("LLM_BASE_URL") or settings.LLM_BASE_URL or "")
+    runtime_wire_api = str(runtime_env.get("LLM_WIRE_API") or settings.LLM_WIRE_API or "")
+    runtime_timeout_seconds = str(runtime_env.get("LLM_TIMEOUT_SECONDS") or settings.LLM_TIMEOUT_SECONDS or "")
+    normalized_provider = normalize_provider_name(runtime_provider)
+    if normalized_provider not in PROVIDER_META:
+        raise ValueError("当前模型接入方式不受支持，请迁移到 custom_proxy")
+    normalized_base_url = resolve_provider_saved_base_url(normalized_provider, runtime_base_url)
+    normalized_wire_api = runtime_wire_api.strip().lower() or resolve_provider_default_wire_api(normalized_provider)
     return PlatformSettingsRead(
         sections=SETTINGS_SECTIONS,
         runner_poll_interval_seconds=int(settings.RUNNER_POLL_INTERVAL_SECONDS),
@@ -283,11 +319,11 @@ def get_platform_settings_read() -> PlatformSettingsRead:
         risk_active_verify_connect_timeout_seconds=int(settings.RISK_ACTIVE_VERIFY_CONNECT_TIMEOUT_SECONDS),
         risk_active_verify_read_timeout_seconds=int(settings.RISK_ACTIVE_VERIFY_READ_TIMEOUT_SECONDS),
         risk_active_verify_max_concurrency=int(settings.RISK_ACTIVE_VERIFY_MAX_CONCURRENCY),
-        llm_provider=str(settings.LLM_PROVIDER or "mock").lower(),  # type: ignore[arg-type]
-        llm_model=str(settings.LLM_MODEL or ""),
-        llm_base_url=str(settings.LLM_BASE_URL or ""),
-        llm_wire_api=str(settings.LLM_WIRE_API or "responses"),
-        llm_timeout_seconds=int(settings.LLM_TIMEOUT_SECONDS),
+        llm_provider=normalized_provider,  # type: ignore[arg-type]
+        llm_model=runtime_model,
+        llm_base_url=normalized_base_url,
+        llm_wire_api=normalized_wire_api,
+        llm_timeout_seconds=int(runtime_timeout_seconds or settings.LLM_TIMEOUT_SECONDS),
         llm_api_key=_current_api_key_state(),
         cors_allow_all=bool(settings.CORS_ALLOW_ALL),
         cors_allow_origins=str(settings.CORS_ALLOW_ORIGINS or ""),
@@ -298,12 +334,14 @@ def get_platform_settings_read() -> PlatformSettingsRead:
 
 def validate_platform_ai_settings(payload: PlatformAIValidateRequest) -> PlatformAIValidateResponse:
     started_at = perf_counter()
-    provider_name = str(payload.llm_provider or "mock").strip().lower() or "mock"
+    provider_name = normalize_provider_name(str(payload.llm_provider or "mock"))
     model = str(payload.llm_model or "").strip()
     resolved_api_key, used_saved_api_key = _resolve_ai_validation_api_key(payload)
     resolved_base_url = resolve_provider_base_url(provider_name, payload.llm_base_url)
 
     try:
+        if provider_requires_base_url(provider_name) and not resolved_base_url:
+            raise ValueError("当前模型接入方式必须填写 Base URL")
         provider_result = build_provider(
             provider_name=provider_name,
             model=model,
@@ -331,13 +369,14 @@ def validate_platform_ai_settings(payload: PlatformAIValidateRequest) -> Platfor
                 system_prompt="你是平台的 AI 连通性测试助手。请严格只返回 OK。",
             )
         )
+        actual_base_url = str(getattr(provider_result.provider, "base_url", provider_result.resolved_base_url) or provider_result.resolved_base_url).strip()
         latency_ms = int((perf_counter() - started_at) * 1000)
         return PlatformAIValidateResponse(
             ok=True,
             message="AI 连接验证成功",
             provider=provider_result.provider_name,  # type: ignore[arg-type]
             model=provider_result.model,
-            resolved_base_url=provider_result.resolved_base_url,
+            resolved_base_url=actual_base_url,
             used_saved_api_key=used_saved_api_key,
             latency_ms=latency_ms,
         )
@@ -356,11 +395,13 @@ def validate_platform_ai_settings(payload: PlatformAIValidateRequest) -> Platfor
 
 def list_platform_ai_models(payload: PlatformAIModelsRequest) -> PlatformAIModelsResponse:
     started_at = perf_counter()
-    provider_name = str(payload.llm_provider or "mock").strip().lower() or "mock"
+    provider_name = normalize_provider_name(str(payload.llm_provider or "mock"))
     resolved_api_key, used_saved_api_key = _resolve_ai_validation_api_key(payload)
     resolved_base_url = resolve_provider_base_url(provider_name, payload.llm_base_url)
 
     try:
+        if provider_requires_base_url(provider_name) and not resolved_base_url:
+            raise ValueError("当前模型接入方式必须填写 Base URL")
         actual_base_url, models = list_remote_models(
             provider_name=provider_name,
             base_url=payload.llm_base_url,
@@ -509,6 +550,7 @@ def queue_platform_settings_apply(db: Session, payload: PlatformSettingsUpdate) 
         "restart_targets": RESTART_TARGETS,
         "runtime_env_path": _helper_workspace_path("backend", ".env.runtime"),
         "compose_dir": _helper_workspace_path("infra"),
+        "compose_file": _helper_workspace_path("infra", "docker-compose.yml"),
         "health_url": "http://backend:8000/health",
         "callback_url": f"http://backend:8000{settings.API_V1_PREFIX}/settings/internal/tasks/{task.id}/complete",
     }

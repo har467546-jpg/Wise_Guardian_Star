@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.db.models.enums import TaskExecutionStatus
+from app.services.ai.providers import (
+    normalize_provider_name,
+    provider_requires_base_url,
+    resolve_provider_base_url,
+    resolve_provider_default_wire_api,
+    resolve_provider_saved_base_url,
+)
 
 
 def _normalize_csv_text(value: str | None, *, allow_empty: bool = False) -> str:
@@ -42,18 +48,21 @@ def _normalize_port_csv(value: str | None, *, allow_empty: bool = False) -> str:
     return ",".join(str(port) for port in ports)
 
 
-LLMProvider = Literal["mock", "openai", "openai_compatible", "ollama_remote"]
+LLMProvider = Literal["mock", "openai", "minimax", "custom_proxy", "ollama_remote"]
 LLMWireAPI = Literal["auto", "chat_completions", "responses"]
 
 
 def _normalize_optional_url(value: str | None) -> str:
-    normalized = str(value or "").strip().rstrip("/")
-    if not normalized:
-        return ""
-    parsed = urlparse(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("Base URL 必须是有效的 http:// 或 https:// 地址")
-    return normalized
+    return str(value or "").strip()
+
+
+def _normalize_llm_fields(model: Any) -> Any:
+    model.llm_provider = normalize_provider_name(model.llm_provider)  # type: ignore[assignment]
+    model.llm_base_url = resolve_provider_saved_base_url(model.llm_provider, model.llm_base_url)
+    fields_set = set(getattr(model, "__pydantic_fields_set__", set()) or set())
+    if "llm_wire_api" not in fields_set or not str(model.llm_wire_api or "").strip():
+        model.llm_wire_api = resolve_provider_default_wire_api(model.llm_provider)  # type: ignore[assignment]
+    return model
 
 
 class PlatformSettingsSectionRead(BaseModel):
@@ -181,6 +190,11 @@ class PlatformSettingsUpdate(BaseModel):
             raise ValueError("模型名称不能为空")
         return normalized
 
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _normalize_provider(cls, value: str) -> str:
+        return normalize_provider_name(str(value or "mock"))
+
     @field_validator("llm_base_url")
     @classmethod
     def _normalize_base_url(cls, value: str) -> str:
@@ -200,7 +214,8 @@ class PlatformSettingsUpdate(BaseModel):
             raise ValueError("关闭全量跨域时必须填写允许的来源列表")
         if self.clear_llm_api_key and self.llm_api_key:
             raise ValueError("清空 API Key 时不能同时提交新的 API Key")
-        if self.llm_provider in {"openai_compatible", "ollama_remote"} and not self.llm_base_url:
+        _normalize_llm_fields(self)
+        if provider_requires_base_url(self.llm_provider) and not self.llm_base_url:
             raise ValueError("当前模型接入方式必须填写 Base URL")
         return self
 
@@ -227,6 +242,11 @@ class PlatformAIValidateRequest(BaseModel):
             raise ValueError("模型名称不能为空")
         return normalized
 
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _normalize_validate_provider(cls, value: str) -> str:
+        return normalize_provider_name(str(value or "mock"))
+
     @field_validator("llm_base_url")
     @classmethod
     def _normalize_validate_base_url(cls, value: str) -> str:
@@ -244,7 +264,7 @@ class PlatformAIValidateRequest(BaseModel):
     def _validate_ai_config(self) -> "PlatformAIValidateRequest":
         if self.clear_llm_api_key and self.llm_api_key:
             raise ValueError("清空 API Key 时不能同时提交新的 API Key")
-        return self
+        return _normalize_llm_fields(self)
 
 
 class PlatformAIValidateResponse(BaseModel):
@@ -276,6 +296,11 @@ class PlatformAIModelsRequest(BaseModel):
     def _normalize_models_base_url(cls, value: str) -> str:
         return _normalize_optional_url(value)
 
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _normalize_models_provider(cls, value: str) -> str:
+        return normalize_provider_name(str(value or "mock"))
+
     @field_validator("llm_api_key")
     @classmethod
     def _normalize_models_api_key(cls, value: str | None) -> str | None:
@@ -288,9 +313,7 @@ class PlatformAIModelsRequest(BaseModel):
     def _validate_models_request(self) -> "PlatformAIModelsRequest":
         if self.clear_llm_api_key and self.llm_api_key:
             raise ValueError("清空 API Key 时不能同时提交新的 API Key")
-        if self.llm_provider in {"openai_compatible", "ollama_remote"} and not self.llm_base_url:
-            raise ValueError("当前模型接入方式必须填写 Base URL")
-        return self
+        return _normalize_llm_fields(self)
 
 
 class PlatformAIModelsResponse(BaseModel):

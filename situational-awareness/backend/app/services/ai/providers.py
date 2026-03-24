@@ -4,11 +4,13 @@ import json
 from dataclasses import dataclass, field
 from time import sleep
 from typing import Any, Iterator, Literal
+from urllib.parse import urlparse
 
 import httpx
 
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/v1"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_SYSTEM_PROMPT = "你是资产态势感知平台的安全分析助手，请使用简洁中文输出可执行结论。"
 DEFAULT_OPENAI_COMPAT_USER_AGENT = (
@@ -16,7 +18,43 @@ DEFAULT_OPENAI_COMPAT_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 )
 DEFAULT_OPENAI_COMPAT_ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9,en;q=0.8"
+DEFAULT_MODEL_REQUEST_CLIENT_NAME = "asset-situational-awareness"
 DEFAULT_TRANSIENT_RETRY_ATTEMPTS = 3
+OPENAI_STYLE_ENDPOINT_SUFFIXES = ["/models", "/responses", "/chat/completions"]
+OLLAMA_ENDPOINT_SUFFIXES = ["/api/tags", "/api/generate"]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderMeta:
+    default_base_url: str = ""
+    default_wire_api: str = "responses"
+    requires_base_url: bool = False
+    url_style: Literal["none", "openai_like", "ollama"] = "none"
+
+
+PROVIDER_META = {
+    "mock": ProviderMeta(),
+    "openai": ProviderMeta(
+        default_base_url=DEFAULT_OPENAI_BASE_URL,
+        default_wire_api="responses",
+        url_style="openai_like",
+    ),
+    "minimax": ProviderMeta(
+        default_base_url=DEFAULT_MINIMAX_BASE_URL,
+        default_wire_api="chat_completions",
+        url_style="openai_like",
+    ),
+    "custom_proxy": ProviderMeta(
+        default_wire_api="auto",
+        requires_base_url=True,
+        url_style="openai_like",
+    ),
+    "ollama_remote": ProviderMeta(
+        default_wire_api="responses",
+        requires_base_url=True,
+        url_style="ollama",
+    ),
+}
 
 
 @dataclass(slots=True)
@@ -134,6 +172,165 @@ def _strip_endpoint_suffix(base_url: str, suffixes: list[str]) -> str:
     return normalized
 
 
+def _matches_endpoint_path(raw_value: str, suffixes: list[str]) -> bool:
+    normalized = str(raw_value or "").strip()
+    if not normalized or "://" in normalized:
+        return False
+    normalized_path = f"/{normalized.strip('/')}"
+    return normalized_path in suffixes
+
+
+def _ensure_url_scheme(base_url: str, *, default_scheme: str) -> str:
+    normalized = str(base_url or "").strip()
+    if not normalized:
+        return ""
+    if "://" in normalized:
+        return normalized
+    return f"{default_scheme}://{normalized.lstrip('/')}"
+
+
+def _validate_normalized_url(base_url: str) -> tuple[str, str, str]:
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Base URL 必须是有效的 http:// 或 https:// 地址")
+    return parsed.scheme, parsed.netloc, parsed.path.rstrip("/")
+
+
+def _normalize_openai_like_base_url(base_url: str, *, default_base_url: str = "") -> str:
+    raw_value = str(base_url or "").strip()
+    fallback_value = str(default_base_url or "").strip()
+    if not raw_value:
+        raw_value = fallback_value
+    elif _matches_endpoint_path(raw_value, OPENAI_STYLE_ENDPOINT_SUFFIXES):
+        raw_value = fallback_value
+    if not raw_value:
+        return ""
+    candidate = _ensure_url_scheme(raw_value, default_scheme="https")
+    scheme, netloc, path = _validate_normalized_url(candidate)
+    stripped = _strip_endpoint_suffix(f"{scheme}://{netloc}{path}", OPENAI_STYLE_ENDPOINT_SUFFIXES)
+    stripped_scheme, stripped_netloc, stripped_path = _validate_normalized_url(stripped)
+    if not stripped_path:
+        return f"{stripped_scheme}://{stripped_netloc}/v1"
+    return f"{stripped_scheme}://{stripped_netloc}{stripped_path}"
+
+
+def _normalize_ollama_base_url(base_url: str, *, default_base_url: str = "") -> str:
+    raw_value = str(base_url or "").strip()
+    fallback_value = str(default_base_url or "").strip()
+    if not raw_value:
+        raw_value = fallback_value
+    elif _matches_endpoint_path(raw_value, OLLAMA_ENDPOINT_SUFFIXES):
+        raw_value = fallback_value
+    if not raw_value:
+        return ""
+    candidate = _ensure_url_scheme(raw_value, default_scheme="http")
+    scheme, netloc, path = _validate_normalized_url(candidate)
+    stripped = _strip_endpoint_suffix(f"{scheme}://{netloc}{path}", OLLAMA_ENDPOINT_SUFFIXES)
+    stripped_scheme, stripped_netloc, stripped_path = _validate_normalized_url(stripped)
+    return f"{stripped_scheme}://{stripped_netloc}{stripped_path}"
+
+
+def _append_unique_candidate(candidates: list[str], candidate: str) -> None:
+    normalized = str(candidate or "").strip()
+    if not normalized or normalized in candidates:
+        return
+    candidates.append(normalized)
+
+
+def _resolve_openai_like_base_url_candidates(
+    base_url: str,
+    *,
+    default_base_url: str = "",
+    allow_root_fallback: bool = False,
+    allow_root_fallback_for_v1: bool = False,
+    allow_root_fallback_for_custom_path: bool = False,
+) -> list[str]:
+    raw_value = str(base_url or "").strip()
+    fallback_value = str(default_base_url or "").strip()
+    if not raw_value:
+        raw_value = fallback_value
+    elif _matches_endpoint_path(raw_value, OPENAI_STYLE_ENDPOINT_SUFFIXES):
+        raw_value = fallback_value
+    if not raw_value:
+        return []
+    candidate = _ensure_url_scheme(raw_value, default_scheme="https")
+    scheme, netloc, path = _validate_normalized_url(candidate)
+    stripped = _strip_endpoint_suffix(f"{scheme}://{netloc}{path}", OPENAI_STYLE_ENDPOINT_SUFFIXES)
+    stripped_scheme, stripped_netloc, stripped_path = _validate_normalized_url(stripped)
+    root_base_url = f"{stripped_scheme}://{stripped_netloc}"
+    primary_base_url = f"{root_base_url}{stripped_path}" if stripped_path else f"{root_base_url}/v1"
+    candidates: list[str] = []
+    _append_unique_candidate(candidates, primary_base_url)
+    fallback_candidate = ""
+    if allow_root_fallback and not stripped_path:
+        fallback_candidate = root_base_url
+    elif allow_root_fallback_for_v1 and stripped_path == "/v1":
+        fallback_candidate = root_base_url
+    elif allow_root_fallback_for_custom_path and stripped_path not in {"", "/v1"}:
+        fallback_candidate = f"{root_base_url}/v1"
+    if fallback_candidate:
+        _append_unique_candidate(candidates, fallback_candidate)
+    return candidates
+
+
+def _resolve_ollama_base_url_candidates(base_url: str, *, default_base_url: str = "") -> list[str]:
+    normalized = _normalize_ollama_base_url(base_url, default_base_url=default_base_url)
+    return [normalized] if normalized else []
+
+
+def _resolve_explicit_custom_proxy_root_base_url(base_url: str) -> str:
+    raw_value = str(base_url or "").strip()
+    if not raw_value or "://" not in raw_value:
+        return ""
+    scheme, netloc, path = _validate_normalized_url(raw_value)
+    if path:
+        return ""
+    return f"{scheme}://{netloc}"
+
+
+def normalize_provider_name(provider_name: str) -> str:
+    normalized = str(provider_name or "mock").strip().lower() or "mock"
+    return normalized
+
+
+def get_provider_meta(provider_name: str) -> ProviderMeta:
+    normalized_provider = normalize_provider_name(provider_name)
+    return PROVIDER_META.get(normalized_provider, PROVIDER_META["mock"])
+
+
+def resolve_provider_default_base_url(provider_name: str) -> str:
+    return get_provider_meta(provider_name).default_base_url
+
+
+def resolve_provider_default_wire_api(provider_name: str) -> str:
+    return get_provider_meta(provider_name).default_wire_api
+
+
+def provider_requires_base_url(provider_name: str) -> bool:
+    return get_provider_meta(provider_name).requires_base_url
+
+
+def resolve_provider_base_url_candidates(
+    provider_name: str,
+    base_url: str = "",
+    *,
+    allow_runtime_probe_fallback: bool = False,
+) -> list[str]:
+    normalized_provider = normalize_provider_name(provider_name)
+    meta = get_provider_meta(normalized_provider)
+    if meta.url_style == "openai_like":
+        return _resolve_openai_like_base_url_candidates(
+            base_url,
+            default_base_url=meta.default_base_url,
+            allow_root_fallback=normalized_provider == "custom_proxy",
+            allow_root_fallback_for_v1=allow_runtime_probe_fallback and normalized_provider == "custom_proxy",
+            allow_root_fallback_for_custom_path=allow_runtime_probe_fallback and normalized_provider == "custom_proxy",
+        )
+    if meta.url_style == "ollama":
+        return _resolve_ollama_base_url_candidates(base_url, default_base_url=meta.default_base_url)
+    return []
+
+
 def _parse_json_response(response: httpx.Response) -> dict[str, Any]:
     try:
         payload = response.json()
@@ -145,6 +342,36 @@ def _parse_json_response(response: httpx.Response) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("上游返回格式不符合预期")
     return payload
+
+
+def _build_model_request_headers(
+    *,
+    api_key: str = "",
+    include_accept: bool = True,
+    include_content_type: bool = False,
+) -> dict[str, str]:
+    headers = {
+        "Accept-Language": DEFAULT_OPENAI_COMPAT_ACCEPT_LANGUAGE,
+        "User-Agent": DEFAULT_OPENAI_COMPAT_USER_AGENT,
+        "X-Client-Name": DEFAULT_MODEL_REQUEST_CLIENT_NAME,
+    }
+    if include_accept:
+        headers["Accept"] = "application/json"
+    if include_content_type:
+        headers["Content-Type"] = "application/json"
+    normalized_api_key = str(api_key or "").strip()
+    if normalized_api_key:
+        headers["Authorization"] = f"Bearer {normalized_api_key}"
+    return headers
+
+
+def _should_retry_with_alternate_base_url(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {404, 405, 422}
+    if isinstance(exc, ValueError):
+        message = str(exc)
+        return "页面内容" in message or "非 JSON" in message
+    return False
 
 
 def _normalize_message_role(role: str | None) -> str:
@@ -160,7 +387,10 @@ def _openai_message_text(message: LLMMessage) -> str:
 
 def _build_openai_chat_messages(request: LLMRequest) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
-    for item in request.messages:
+    instructions = request.system_instructions()
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+    for item in request.conversation_messages():
         text = _openai_message_text(item)
         if not text:
             continue
@@ -336,13 +566,21 @@ class OpenAICompatibleProvider(BaseProvider):
         *,
         model: str,
         base_url: str,
+        base_url_candidates: list[str] | None = None,
         timeout_seconds: int,
         api_key: str = "",
         wire_api: str = "responses",
         provider_label: str = "OpenAI 兼容接口",
     ) -> None:
+        normalized_candidates: list[str] = []
+        for item in base_url_candidates or [base_url]:
+            _append_unique_candidate(normalized_candidates, str(item or "").strip().rstrip("/"))
+        if not normalized_candidates:
+            _append_unique_candidate(normalized_candidates, str(base_url or "").strip().rstrip("/"))
         self.model = model
-        self.base_url = base_url
+        self.base_url_candidates = normalized_candidates
+        self._active_base_url_index = 0
+        self.base_url = normalized_candidates[0] if normalized_candidates else str(base_url or "").strip().rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.api_key = api_key
         self.wire_api = str(wire_api or "responses").strip().lower() or "responses"
@@ -350,16 +588,68 @@ class OpenAICompatibleProvider(BaseProvider):
         self.max_attempts = DEFAULT_TRANSIENT_RETRY_ATTEMPTS
 
     def _build_headers(self) -> dict[str, str]:
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Accept-Language": DEFAULT_OPENAI_COMPAT_ACCEPT_LANGUAGE,
-            "User-Agent": DEFAULT_OPENAI_COMPAT_USER_AGENT,
-            "X-Client-Name": "asset-situational-awareness",
-        }
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        return headers
+        return _build_model_request_headers(
+            api_key=self.api_key,
+            include_accept=True,
+            include_content_type=True,
+        )
+
+    def _set_active_base_url_index(self, candidate_index: int) -> None:
+        if not self.base_url_candidates:
+            return
+        self._active_base_url_index = candidate_index
+        self.base_url = self.base_url_candidates[candidate_index]
+
+    def _candidate_attempt_indices(self) -> list[int]:
+        if not self.base_url_candidates:
+            return [0]
+        ordered = [self._active_base_url_index]
+        for index in range(len(self.base_url_candidates)):
+            if index != self._active_base_url_index:
+                ordered.append(index)
+        return ordered
+
+    def _run_with_base_url_fallback(self, operation):  # type: ignore[no-untyped-def]
+        original_index = self._active_base_url_index
+        last_exc: Exception | None = None
+        attempt_indices = self._candidate_attempt_indices()
+        for attempt_position, candidate_index in enumerate(attempt_indices):
+            self._set_active_base_url_index(candidate_index)
+            try:
+                return operation()
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt_position == len(attempt_indices) - 1 or not _should_retry_with_alternate_base_url(exc):
+                    self._set_active_base_url_index(original_index)
+                    raise
+        self._set_active_base_url_index(original_index)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("AI 请求失败")
+
+    def _stream_with_base_url_fallback(self, operation):  # type: ignore[no-untyped-def]
+        original_index = self._active_base_url_index
+        last_exc: Exception | None = None
+        attempt_indices = self._candidate_attempt_indices()
+        for attempt_position, candidate_index in enumerate(attempt_indices):
+            emitted_any = False
+            self._set_active_base_url_index(candidate_index)
+            try:
+                for chunk in operation():
+                    emitted_any = True
+                    yield chunk
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if emitted_any:
+                    raise
+                if attempt_position == len(attempt_indices) - 1 or not _should_retry_with_alternate_base_url(exc):
+                    self._set_active_base_url_index(original_index)
+                    raise
+        self._set_active_base_url_index(original_index)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("AI 请求失败")
 
     def _should_retry_with_chat_completions(self, exc: httpx.HTTPStatusError) -> bool:
         if exc.response.status_code not in {400, 404, 405, 422}:
@@ -443,7 +733,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 "temperature": 0.2,
             },
         )
-        return _extract_openai_content(response.json())
+        return _extract_openai_content(_parse_json_response(response))
 
     def _stream_chat_completions(self, request: LLMRequest) -> Iterator[str]:
         with httpx.stream(
@@ -459,6 +749,10 @@ class OpenAICompatibleProvider(BaseProvider):
             timeout=self.timeout_seconds,
         ) as response:
             response.raise_for_status()
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "text/html" in content_type:
+                raise ValueError("上游返回页面内容，请检查 Base URL 是否指向 API 根地址")
+            emitted_any = False
             for line in response.iter_lines():
                 if not line:
                     continue
@@ -479,6 +773,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     continue
                 content = delta.get("content")
                 if isinstance(content, str) and content:
+                    emitted_any = True
                     yield content
                     continue
                 if isinstance(content, list):
@@ -486,7 +781,10 @@ class OpenAICompatibleProvider(BaseProvider):
                         if isinstance(item, dict):
                             text = item.get("text")
                             if isinstance(text, str) and text:
+                                emitted_any = True
                                 yield text
+            if not emitted_any:
+                raise ValueError("上游返回非 JSON 响应，请检查 Base URL 是否正确")
 
     def _generate_responses(self, request: LLMRequest) -> str:
         response = self._post_with_retry(
@@ -497,7 +795,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 "input": _build_openai_responses_input(request),
             },
         )
-        return _extract_openai_responses_content(response.json())
+        return _extract_openai_responses_content(_parse_json_response(response))
 
     def _stream_responses(self, request: LLMRequest) -> Iterator[str]:
         with httpx.stream(
@@ -513,6 +811,10 @@ class OpenAICompatibleProvider(BaseProvider):
             timeout=self.timeout_seconds,
         ) as response:
             response.raise_for_status()
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "text/html" in content_type:
+                raise ValueError("上游返回页面内容，请检查 Base URL 是否指向 API 根地址")
+            emitted_any = False
             for line in response.iter_lines():
                 if not line:
                     continue
@@ -529,47 +831,56 @@ class OpenAICompatibleProvider(BaseProvider):
                 if event_type in {"response.output_text.delta", "output_text.delta"}:
                     delta = payload.get("delta")
                     if isinstance(delta, str) and delta:
+                        emitted_any = True
                         yield delta
                     continue
                 if event_type in {"response.output_text.done", "output_text.done"}:
                     text = payload.get("text")
                     if isinstance(text, str) and text:
+                        emitted_any = True
                         yield text
+            if not emitted_any:
+                raise ValueError("上游返回非 JSON 响应，请检查 Base URL 是否正确")
 
     def generate(self, request: LLMRequest) -> str:
-        if self.wire_api == "responses":
-            return self._generate_responses(request)
-        if self.wire_api == "chat_completions":
+        def _generate() -> str:
+            if self.wire_api == "responses":
+                return self._generate_responses(request)
+            if self.wire_api == "chat_completions":
+                return self._generate_chat_completions(request)
+            try:
+                return self._generate_responses(request)
+            except httpx.HTTPStatusError as exc:
+                if not self._should_retry_with_chat_completions(exc):
+                    raise
             return self._generate_chat_completions(request)
-        try:
-            return self._generate_responses(request)
-        except httpx.HTTPStatusError as exc:
-            if not self._should_retry_with_chat_completions(exc):
-                raise
-        return self._generate_chat_completions(request)
+
+        return self._run_with_base_url_fallback(_generate)
 
     def stream_generate(self, request: LLMRequest) -> Iterator[str]:
         emitted_any = False
         try:
             if self.wire_api == "responses":
-                for chunk in self._stream_responses(request):
+                for chunk in self._stream_with_base_url_fallback(lambda: self._stream_responses(request)):
                     emitted_any = True
                     yield chunk
                 return
             if self.wire_api == "chat_completions":
-                for chunk in self._stream_chat_completions(request):
+                for chunk in self._stream_with_base_url_fallback(lambda: self._stream_chat_completions(request)):
                     emitted_any = True
                     yield chunk
                 return
-            try:
-                for chunk in self._stream_responses(request):
-                    emitted_any = True
-                    yield chunk
-                return
-            except httpx.HTTPStatusError as exc:
-                if not self._should_retry_with_chat_completions(exc):
-                    raise
-            for chunk in self._stream_chat_completions(request):
+
+            def _stream_auto() -> Iterator[str]:
+                try:
+                    yield from self._stream_responses(request)
+                    return
+                except httpx.HTTPStatusError as exc:
+                    if not self._should_retry_with_chat_completions(exc):
+                        raise
+                yield from self._stream_chat_completions(request)
+
+            for chunk in self._stream_with_base_url_fallback(_stream_auto):
                 emitted_any = True
                 yield chunk
         except Exception:
@@ -598,12 +909,13 @@ class OllamaRemoteProvider(BaseProvider):
         self.api_key = api_key
 
     def generate(self, request: LLMRequest) -> str:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
         response = httpx.post(
             _join_endpoint(self.base_url, "/api/generate"),
-            headers=headers,
+            headers=_build_model_request_headers(
+                api_key=self.api_key,
+                include_accept=True,
+                include_content_type=True,
+            ),
             json={
                 "model": self.model,
                 "prompt": _render_ollama_prompt(request),
@@ -615,15 +927,16 @@ class OllamaRemoteProvider(BaseProvider):
         return _extract_ollama_content(response.json())
 
     def stream_generate(self, request: LLMRequest) -> Iterator[str]:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
         emitted_any = False
         try:
             with httpx.stream(
                 "POST",
                 _join_endpoint(self.base_url, "/api/generate"),
-                headers=headers,
+                headers=_build_model_request_headers(
+                    api_key=self.api_key,
+                    include_accept=True,
+                    include_content_type=True,
+                ),
                 json={
                     "model": self.model,
                     "prompt": _render_ollama_prompt(request),
@@ -660,23 +973,47 @@ class ProviderBuildResult:
 
 
 def resolve_provider_base_url(provider_name: str, base_url: str = "") -> str:
-    normalized_provider = str(provider_name or "mock").strip().lower() or "mock"
-    normalized_base_url = str(base_url or "").strip().rstrip("/")
-    if normalized_provider == "openai":
-        return normalized_base_url or DEFAULT_OPENAI_BASE_URL
-    if normalized_provider in {"openai_compatible", "ollama_remote"}:
-        return normalized_base_url
-    return ""
+    candidates = resolve_provider_base_url_candidates(provider_name, base_url)
+    return candidates[0] if candidates else ""
+
+
+def resolve_provider_saved_base_url(provider_name: str, base_url: str = "") -> str:
+    normalized_provider = normalize_provider_name(provider_name)
+    if normalized_provider == "custom_proxy":
+        explicit_root = _resolve_explicit_custom_proxy_root_base_url(base_url)
+        if explicit_root:
+            return explicit_root
+    return resolve_provider_base_url(normalized_provider, base_url)
 
 
 def resolve_provider_models_base_url(provider_name: str, base_url: str = "") -> str:
-    normalized_provider = str(provider_name or "mock").strip().lower() or "mock"
-    resolved = resolve_provider_base_url(normalized_provider, base_url)
-    if normalized_provider in {"openai", "openai_compatible"}:
-        return _strip_endpoint_suffix(resolved, ["/models", "/responses", "/chat/completions"])
+    candidates = resolve_provider_models_base_url_candidates(provider_name, base_url)
+    return candidates[0] if candidates else ""
+
+
+def resolve_provider_models_base_url_candidates(
+    provider_name: str,
+    base_url: str = "",
+    *,
+    allow_runtime_probe_fallback: bool = False,
+) -> list[str]:
+    normalized_provider = normalize_provider_name(provider_name)
+    resolved_candidates = resolve_provider_base_url_candidates(
+        normalized_provider,
+        base_url,
+        allow_runtime_probe_fallback=allow_runtime_probe_fallback,
+    )
+    if normalized_provider in {"openai", "minimax", "custom_proxy"}:
+        normalized_candidates: list[str] = []
+        for candidate in resolved_candidates:
+            _append_unique_candidate(normalized_candidates, _strip_endpoint_suffix(candidate, OPENAI_STYLE_ENDPOINT_SUFFIXES))
+        return normalized_candidates
     if normalized_provider == "ollama_remote":
-        return _strip_endpoint_suffix(resolved, ["/api/tags", "/api/generate"])
-    return resolved
+        normalized_candidates = []
+        for candidate in resolved_candidates:
+            _append_unique_candidate(normalized_candidates, _strip_endpoint_suffix(candidate, OLLAMA_ENDPOINT_SUFFIXES))
+        return normalized_candidates
+    return resolved_candidates
 
 
 def list_remote_models(
@@ -686,40 +1023,56 @@ def list_remote_models(
     api_key: str = "",
     timeout_seconds: int = 60,
 ) -> tuple[str, list[RemoteModelOption]]:
-    normalized_provider = str(provider_name or "mock").strip().lower() or "mock"
+    normalized_provider = normalize_provider_name(provider_name)
     normalized_api_key = str(api_key or "").strip()
     normalized_timeout = max(int(timeout_seconds or 60), 1)
 
     if normalized_provider == "mock":
         return "", [RemoteModelOption(id="gpt-4o-mini", display_name="Mock 默认模型")]
 
-    if normalized_provider in {"openai", "openai_compatible"}:
-        resolved_base_url = resolve_provider_models_base_url(normalized_provider, base_url)
-        headers = {
-            "Accept": "application/json",
-            "Accept-Language": DEFAULT_OPENAI_COMPAT_ACCEPT_LANGUAGE,
-            "User-Agent": DEFAULT_OPENAI_COMPAT_USER_AGENT,
-            "X-Client-Name": "asset-situational-awareness",
-        }
-        if normalized_api_key:
-            headers["Authorization"] = f"Bearer {normalized_api_key}"
-        response = httpx.get(
-            _join_endpoint(resolved_base_url, "/models"),
-            headers=headers,
-            timeout=normalized_timeout,
+    if normalized_provider in {"openai", "minimax", "custom_proxy"}:
+        resolved_base_urls = resolve_provider_models_base_url_candidates(
+            normalized_provider,
+            base_url,
+            allow_runtime_probe_fallback=True,
         )
-        response.raise_for_status()
-        payload = _parse_json_response(response)
-        return resolved_base_url, _extract_openai_models(payload)
+        if not resolved_base_urls:
+            raise ValueError("当前模型接入方式必须填写 Base URL")
+        last_exc: Exception | None = None
+        for attempt_position, resolved_base_url in enumerate(resolved_base_urls):
+            try:
+                response = httpx.get(
+                    _join_endpoint(resolved_base_url, "/models"),
+                    headers=_build_model_request_headers(
+                        api_key=normalized_api_key,
+                        include_accept=True,
+                        include_content_type=False,
+                    ),
+                    timeout=normalized_timeout,
+                )
+                response.raise_for_status()
+                payload = _parse_json_response(response)
+                return resolved_base_url, _extract_openai_models(payload)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt_position == len(resolved_base_urls) - 1 or not _should_retry_with_alternate_base_url(exc):
+                    raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("获取模型列表失败")
 
     if normalized_provider == "ollama_remote":
-        resolved_base_url = resolve_provider_models_base_url(normalized_provider, base_url)
-        headers = {"Accept": "application/json"}
-        if normalized_api_key:
-            headers["Authorization"] = f"Bearer {normalized_api_key}"
+        resolved_base_urls = resolve_provider_models_base_url_candidates(normalized_provider, base_url)
+        if not resolved_base_urls:
+            raise ValueError("当前模型接入方式必须填写 Base URL")
+        resolved_base_url = resolved_base_urls[0]
         response = httpx.get(
             _join_endpoint(resolved_base_url, "/api/tags"),
-            headers=headers,
+            headers=_build_model_request_headers(
+                api_key=normalized_api_key,
+                include_accept=True,
+                include_content_type=False,
+            ),
             timeout=normalized_timeout,
         )
         response.raise_for_status()
@@ -734,17 +1087,25 @@ def build_provider(
     provider_name: str,
     model: str,
     base_url: str = "",
-    wire_api: str = "responses",
+    wire_api: str = "",
     timeout_seconds: int = 60,
     api_key: str = "",
     fallback_to_mock: bool = False,
 ) -> ProviderBuildResult:
-    normalized_provider = str(provider_name or "mock").strip().lower() or "mock"
+    normalized_provider = normalize_provider_name(provider_name)
     normalized_model = str(model or "").strip() or "gpt-4o-mini"
-    normalized_base_url = str(base_url or "").strip().rstrip("/")
-    normalized_wire_api = str(wire_api or "responses").strip().lower() or "responses"
+    normalized_base_url_candidates = resolve_provider_base_url_candidates(
+        normalized_provider,
+        base_url,
+        allow_runtime_probe_fallback=normalized_provider == "custom_proxy",
+    )
+    normalized_base_url = normalized_base_url_candidates[0] if normalized_base_url_candidates else ""
+    normalized_wire_api = str(wire_api or resolve_provider_default_wire_api(normalized_provider)).strip().lower() or resolve_provider_default_wire_api(normalized_provider)
     normalized_api_key = str(api_key or "").strip()
     normalized_timeout = max(int(timeout_seconds or 60), 1)
+
+    if normalized_provider not in PROVIDER_META:
+        raise ValueError("当前模型接入方式不受支持")
 
     if normalized_provider == "mock":
         return ProviderBuildResult(
@@ -778,26 +1139,45 @@ def build_provider(
             ),
         )
 
-    if normalized_provider == "openai_compatible":
+    if normalized_provider == "minimax":
+        resolved_base_url = normalized_base_url or DEFAULT_MINIMAX_BASE_URL
+        return ProviderBuildResult(
+            provider_name="minimax",
+            model=normalized_model,
+            resolved_base_url=resolved_base_url,
+            provider=OpenAICompatibleProvider(
+                api_key=normalized_api_key,
+                model=normalized_model,
+                base_url=resolved_base_url,
+                base_url_candidates=[resolved_base_url],
+                timeout_seconds=normalized_timeout,
+                wire_api=normalized_wire_api,
+                provider_label="MiniMax",
+            ),
+        )
+
+    if normalized_provider == "custom_proxy":
         if not normalized_base_url:
             if fallback_to_mock:
                 return ProviderBuildResult(
                     provider_name="mock",
                     model=normalized_model,
                     resolved_base_url="",
-                    provider=MockProvider("OpenAI 兼容接口未配置 Base URL，已回退到模板摘要。"),
+                    provider=MockProvider("自定义中转未配置 Base URL，已回退到模板摘要。"),
                 )
             raise ValueError("当前模型接入方式必须填写 Base URL")
         return ProviderBuildResult(
-            provider_name="openai_compatible",
+            provider_name="custom_proxy",
             model=normalized_model,
             resolved_base_url=normalized_base_url,
             provider=OpenAICompatibleProvider(
                 api_key=normalized_api_key,
                 model=normalized_model,
                 base_url=normalized_base_url,
+                base_url_candidates=normalized_base_url_candidates,
                 timeout_seconds=normalized_timeout,
                 wire_api=normalized_wire_api,
+                provider_label="自定义中转",
             ),
         )
 
@@ -823,11 +1203,4 @@ def build_provider(
             ),
         )
 
-    if fallback_to_mock:
-        return ProviderBuildResult(
-            provider_name="mock",
-            model=normalized_model,
-            resolved_base_url="",
-            provider=MockProvider("模型接入方式不受支持，已回退到模板摘要。"),
-        )
     raise ValueError("当前模型接入方式不受支持")

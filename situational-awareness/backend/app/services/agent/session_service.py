@@ -47,6 +47,7 @@ def restore_session_from_running_state(
     session.pending_plan_json = {}
     session.dialog_state_json = {}
     session.browser_runtime_json = {}
+    session.agent_state_json = {}
     session.updated_at = now_fn()
 
 
@@ -268,6 +269,7 @@ def reset_agent_session(
             session.working_context_json = {}
             session.dialog_state_json = {}
             session.browser_runtime_json = {}
+            session.agent_state_json = {}
             session.route_context_json = normalize_page_context_fn({})
             session.updated_at = now_fn()
             db.add(session)

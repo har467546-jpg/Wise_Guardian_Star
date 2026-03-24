@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
 
 import '../../core/network/api_client.dart';
+import '../../core/network/websocket_client.dart';
 import 'device_abnormal_notifications.dart';
 
 class DeviceAbnormalRealtimeAlert {
@@ -43,13 +43,15 @@ class DeviceAlertStreamController {
   DeviceAlertStreamController({
     required this.token,
     required this.onAlert,
+    required this.webSocketClient,
   });
 
   final String token;
   final FutureOr<void> Function(DeviceAbnormalRealtimeAlert alert) onAlert;
+  final WebSocketClient webSocketClient;
 
   StreamSubscription<dynamic>? _socketSubscription;
-  WebSocket? _socket;
+  WebSocketConnection? _socket;
   Timer? _reconnectTimer;
   bool _active = false;
   bool _disposed = false;
@@ -89,13 +91,14 @@ class DeviceAlertStreamController {
       return;
     }
     try {
-      final socket = await WebSocket.connect(
-        buildDeviceAlertStreamUrl(token),
+      final socket = await webSocketClient.connectAuthenticated(
+        uri: buildDeviceAlertStreamUri(),
+        token: token,
       );
       socket.pingInterval = const Duration(seconds: 20);
       _socket = socket;
       _reconnectAttempts = 0;
-      _socketSubscription = socket.listen(
+      _socketSubscription = socket.stream.listen(
         (dynamic raw) => unawaited(_handleRawMessage(raw)),
         onDone: () => unawaited(_handleSocketClosed()),
         onError: (_) => unawaited(_handleSocketClosed()),

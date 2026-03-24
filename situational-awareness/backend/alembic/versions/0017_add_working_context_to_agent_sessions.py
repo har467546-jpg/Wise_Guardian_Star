@@ -19,6 +19,10 @@ depends_on: Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    column_names = {item["name"] for item in inspector.get_columns("agent_sessions")}
+    if "working_context_json" in column_names:
+        return
     op.add_column(
         "agent_sessions",
         sa.Column(
@@ -64,4 +68,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    column_names = {item["name"] for item in inspector.get_columns("agent_sessions")}
+    if "working_context_json" not in column_names:
+        return
     op.drop_column("agent_sessions", "working_context_json")

@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: asset
       POSTGRES_PASSWORD: asset
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -18,7 +18,7 @@ services:
     container_name: sa-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "6380:6379"
 
   backend:
     build:
@@ -34,6 +34,8 @@ services:
         required: false
     environment:
       PYTHONUNBUFFERED: "1"
+      DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       - postgres
       - redis
@@ -56,6 +58,9 @@ services:
     depends_on:
       - postgres
       - redis
+    environment:
+      DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
+      REDIS_URL: redis://redis:6379/0
     command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report", "--loglevel=info"]
     volumes:
       - ../backend:/app
@@ -93,6 +98,7 @@ services:
     env_file:
       - ../frontend/.env.example
     environment:
+      BACKEND_INTERNAL_URL: http://backend:8000
       NEXT_ALLOWED_DEV_ORIGINS: ${NEXT_ALLOWED_DEV_ORIGINS:-localhost,127.0.0.1,192.168.*.*,10.*.*.*,172.*.*.*}
       WATCHPACK_POLLING: ${WATCHPACK_POLLING:-true}
     depends_on:
@@ -115,6 +121,8 @@ services:
     command: ["npm", "run", "start"]
     env_file:
       - ../frontend/.env.example
+    environment:
+      BACKEND_INTERNAL_URL: http://backend:8000
     depends_on:
       - backend
     ports:

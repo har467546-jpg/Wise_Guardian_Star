@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.api.v1.endpoints import vuln_library as vuln_library_endpoint
 from app.core.celery_app import celery_app
-from app.core.config import settings
+from app.core.config import read_runtime_env_value, settings
 from app.db.models.agent_message import AgentMessage
 from app.db.models.agent_session import AgentSession
 from app.db.models.asset import Asset
@@ -54,6 +54,7 @@ from app.schemas.agent import (
     AgentMessageRead,
     AgentPlanPendingEvent,
     AgentProposedActionRead,
+    AgentStateEvent,
     AgentSessionSnapshotEvent,
     AgentSessionRead,
     AgentTaskUpdateEvent,
@@ -127,6 +128,43 @@ AUTO_EXECUTE_ACTIONS = {
     "create_discovery_job",
     "verify_asset_risks",
     "install_runner",
+}
+ACTION_POLICY_REGISTRY: dict[str, dict[str, Any]] = {
+    "create_discovery_job": {
+        "required_slots": ["cidr"],
+        "risk_level": "low",
+        "needs_confirmation": False,
+        "auto_execute_allowed": True,
+        "task_followup_strategy": "watch_task",
+    },
+    "verify_asset_risks": {
+        "required_slots": ["asset_id"],
+        "risk_level": "low",
+        "needs_confirmation": False,
+        "auto_execute_allowed": True,
+        "task_followup_strategy": "watch_task",
+    },
+    "install_runner": {
+        "required_slots": ["asset_id"],
+        "risk_level": "low",
+        "needs_confirmation": False,
+        "auto_execute_allowed": True,
+        "task_followup_strategy": "watch_task",
+    },
+    "create_or_resume_remediation_session": {
+        "required_slots": ["asset_id"],
+        "risk_level": "high",
+        "needs_confirmation": True,
+        "auto_execute_allowed": False,
+        "task_followup_strategy": "session",
+    },
+    "approve_remediation_session": {
+        "required_slots": ["session_id"],
+        "risk_level": "high",
+        "needs_confirmation": True,
+        "auto_execute_allowed": False,
+        "task_followup_strategy": "watch_task",
+    },
 }
 SUPPORTED_UI_ACTIONS = {
     "navigate",
@@ -275,6 +313,17 @@ class AgentExecutionResult:
     summary: str
     child_task_id: str | None = None
     payload: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _AgentStepPlan:
+    step_kind: Literal["answer", "clarify", "read", "ui", "auto_execute", "propose_plan", "watch_task"]
+    reason: str | None = None
+    waiting_for: str | None = None
+    next_step: str | None = None
+    expected_outcome: str | None = None
+    missing_slots: list[str] | None = None
+    evidence: list[dict[str, Any]] | None = None
 
 
 def _now() -> datetime:
@@ -537,6 +586,7 @@ def _normalize_browser_context(browser_context: dict[str, Any] | None) -> dict[s
     semantic_page_context = payload.get("semantic_page_context") if isinstance(payload.get("semantic_page_context"), dict) else {}
     summary_json = payload.get("summary_json") if isinstance(payload.get("summary_json"), dict) else {}
     dom_snapshot = payload.get("dom_snapshot") if isinstance(payload.get("dom_snapshot"), list) else []
+    summary_json = payload.get("summary_json") if isinstance(payload.get("summary_json"), dict) else {}
     normalized = {
         "pathname": sanitize_text(str(payload.get("pathname") or "/"), max_length=255) or "/",
         "origin": sanitize_text(str(payload.get("origin") or ""), max_length=255, single_line=True) or None,
@@ -982,8 +1032,404 @@ def _extract_explicit_working_context(content: str, page_context: dict[str, Any]
     return {}
 
 
+def _agent_target_summary(target: dict[str, Any] | None) -> str | None:
+    payload = target if isinstance(target, dict) else {}
+    finding_id = _sanitize_line(str(payload.get("finding_id") or ""), max_length=64)
+    asset_id = _sanitize_line(str(payload.get("asset_id") or ""), max_length=64)
+    task_id = _sanitize_line(str(payload.get("task_id") or ""), max_length=64)
+    session_id = _sanitize_line(str(payload.get("session_id") or ""), max_length=64)
+    cidr_value = _extract_cidr_target(str(payload.get("cidr") or ""))
+    if finding_id and asset_id:
+        return f"风险 {finding_id} / 资产 {asset_id}"
+    if finding_id:
+        return f"风险 {finding_id}"
+    if asset_id:
+        return f"资产 {asset_id}"
+    if task_id:
+        return f"任务 {task_id}"
+    if session_id:
+        return f"修复会话 {session_id}"
+    if cidr_value:
+        return f"网段 {cidr_value}"
+    return None
+
+
+def _normalize_agent_focus_target(target: dict[str, Any] | None) -> dict[str, Any]:
+    payload = target if isinstance(target, dict) else {}
+    normalized = {
+        "asset_id": _sanitize_line(str(payload.get("asset_id") or ""), max_length=64) or None,
+        "finding_id": _sanitize_line(str(payload.get("finding_id") or ""), max_length=64) or None,
+        "task_id": _sanitize_line(str(payload.get("task_id") or ""), max_length=64) or None,
+        "session_id": _sanitize_line(str(payload.get("session_id") or ""), max_length=64) or None,
+        "cidr": _extract_cidr_target(str(payload.get("cidr") or "")),
+        "source": _sanitize_line(str(payload.get("source") or ""), max_length=64) or None,
+        "summary": sanitize_text(str(payload.get("summary") or ""), max_length=255) or None,
+    }
+    if not any(normalized.get(key) for key in ("asset_id", "finding_id", "task_id", "session_id", "cidr")):
+        return {}
+    if normalized["finding_id"]:
+        target_type = "finding"
+    elif normalized["asset_id"]:
+        target_type = "asset"
+    elif normalized["task_id"]:
+        target_type = "task"
+    elif normalized["session_id"]:
+        target_type = "session"
+    else:
+        target_type = "cidr"
+    normalized["target_type"] = target_type
+    normalized["summary"] = normalized["summary"] or _agent_target_summary(normalized)
+    normalized["source"] = normalized["source"] or "session"
+    return normalized
+
+
+def _resolve_agent_focus(
+    *,
+    page_context: dict[str, Any] | None = None,
+    browser_context: dict[str, Any] | None = None,
+    working_context: dict[str, Any] | None = None,
+    dialog_state: dict[str, Any] | None = None,
+    user_content: str | None = None,
+    fallback_watch_task_id: str | None = None,
+) -> dict[str, Any]:
+    candidates: list[tuple[dict[str, Any], str]] = []
+
+    working_primary = _normalize_agent_focus_target(_working_context_primary_target(working_context))
+    if working_primary:
+        candidates.append((working_primary, "high"))
+
+    browser_target = _normalize_agent_focus_target(_build_working_context_from_browser_context(browser_context or {}, source="browser_context"))
+    if browser_target:
+        candidates.append((browser_target, "high"))
+
+    page_target = _normalize_agent_focus_target(_build_working_context_from_page_context(page_context or {}, source="page_context"))
+    if page_target:
+        candidates.append((page_target, "medium"))
+
+    dialog_targets = _dialog_state_working_context(dialog_state)
+    dialog_target = _normalize_agent_focus_target(_working_context_primary_target(dialog_targets))
+    if dialog_target:
+        candidates.append((dialog_target, "medium"))
+
+    explicit_target = _normalize_agent_focus_target(_extract_target_from_patterns(str(user_content or "")))
+    if explicit_target:
+        candidates.append((explicit_target, "high"))
+
+    cidr_value = _extract_cidr_target(str(user_content or ""))
+    if cidr_value:
+        candidates.append((_normalize_agent_focus_target({"cidr": cidr_value, "source": "user_text"}), "high"))
+
+    if fallback_watch_task_id:
+        candidates.append(
+            (
+                _normalize_agent_focus_target(
+                    {
+                        "task_id": fallback_watch_task_id,
+                        "source": "task_watch",
+                        "summary": f"任务 {fallback_watch_task_id}",
+                    }
+                ),
+                "medium",
+            )
+        )
+
+    for target, confidence in candidates:
+        if not target:
+            continue
+        return {
+            "summary": target.get("summary"),
+            "focus_type": target.get("target_type"),
+            "resolved": target,
+            "confidence": confidence,
+            "source": target.get("source"),
+        }
+    return {
+        "summary": "当前会话",
+        "focus_type": "session",
+        "resolved": {},
+        "confidence": "low",
+        "source": "session",
+    }
+
+
+def _normalize_agent_state(payload: dict[str, Any] | None, *, last_task_id: str | None = None) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    focus = raw.get("focus") if isinstance(raw.get("focus"), dict) else {}
+    execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}
+    explanation = raw.get("explanation") if isinstance(raw.get("explanation"), dict) else {}
+    watch = raw.get("watch") if isinstance(raw.get("watch"), dict) else {}
+
+    normalized_focus = {
+        "summary": sanitize_text(str(focus.get("summary") or ""), max_length=255) or None,
+        "focus_type": _sanitize_line(str(focus.get("focus_type") or ""), max_length=32) or None,
+        "resolved": sanitize_json_value(
+            _normalize_agent_focus_target(focus.get("resolved") if isinstance(focus.get("resolved"), dict) else {})
+        ),
+        "confidence": _sanitize_line(str(focus.get("confidence") or ""), max_length=16) or None,
+        "source": _sanitize_line(str(focus.get("source") or ""), max_length=64) or None,
+    }
+    if not normalized_focus["summary"] and isinstance(normalized_focus["resolved"], dict) and normalized_focus["resolved"]:
+        normalized_focus["summary"] = normalized_focus["resolved"].get("summary")
+        normalized_focus["focus_type"] = normalized_focus["focus_type"] or normalized_focus["resolved"].get("target_type")
+        normalized_focus["source"] = normalized_focus["source"] or normalized_focus["resolved"].get("source")
+
+    pending_ui_actions = execution.get("pending_ui_actions") if isinstance(execution.get("pending_ui_actions"), list) else []
+    normalized_execution = {
+        "stage": _sanitize_line(str(execution.get("stage") or ""), max_length=32) or "idle",
+        "step_kind": _sanitize_line(str(execution.get("step_kind") or ""), max_length=32) or None,
+        "step_label": sanitize_text(str(execution.get("step_label") or ""), max_length=160) or None,
+        "waiting_for": sanitize_text(str(execution.get("waiting_for") or ""), max_length=200) or None,
+        "missing_slots": [
+            _sanitize_line(str(item or ""), max_length=64)
+            for item in (execution.get("missing_slots") if isinstance(execution.get("missing_slots"), list) else [])
+            if _sanitize_line(str(item or ""), max_length=64)
+        ][:6],
+        "pending_ui_actions": sanitize_json_value(pending_ui_actions[:6]),
+    }
+
+    evidence = explanation.get("evidence") if isinstance(explanation.get("evidence"), list) else []
+    normalized_explanation = {
+        "reason": sanitize_text(str(explanation.get("reason") or ""), max_length=280) or None,
+        "decision_summary": sanitize_text(str(explanation.get("decision_summary") or ""), max_length=280) or None,
+        "expected_outcome": sanitize_text(str(explanation.get("expected_outcome") or ""), max_length=280) or None,
+        "next_step": sanitize_text(str(explanation.get("next_step") or ""), max_length=280) or None,
+        "evidence": sanitize_json_value(evidence[:4]),
+    }
+
+    primary_task_id = _sanitize_line(str(watch.get("primary_task_id") or last_task_id or ""), max_length=64) or None
+    related_task_ids = [
+        _sanitize_line(str(item or ""), max_length=64)
+        for item in (watch.get("related_task_ids") if isinstance(watch.get("related_task_ids"), list) else [])
+        if _sanitize_line(str(item or ""), max_length=64)
+    ][:6]
+    if primary_task_id and primary_task_id not in related_task_ids:
+        related_task_ids = [primary_task_id, *related_task_ids][:6]
+    normalized_watch = {
+        "primary_task_id": primary_task_id,
+        "related_task_ids": related_task_ids,
+        "status": _sanitize_line(str(watch.get("status") or ""), max_length=32) or None,
+        "watching": bool(watch.get("watching")) or bool(primary_task_id),
+        "last_task_message": sanitize_text(str(watch.get("last_task_message") or ""), max_length=280) or None,
+    }
+
+    return {
+        "focus": normalized_focus,
+        "execution": normalized_execution,
+        "explanation": normalized_explanation,
+        "watch": normalized_watch,
+    }
+
+
+def _session_agent_state(session: AgentSession) -> dict[str, Any]:
+    return _normalize_agent_state(
+        session.agent_state_json if isinstance(getattr(session, "agent_state_json", None), dict) else {},
+        last_task_id=_session_last_task_id(session),
+    )
+
+
+def _session_last_task_id(session: AgentSession | Any) -> str | None:
+    return _sanitize_line(str(getattr(session, "last_task_id", "") or ""), max_length=64) or None
+
+
+def _build_agent_state_delta(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    delta: dict[str, Any] = {}
+    for key in ("focus", "execution", "explanation", "watch"):
+        if sanitize_json_value(previous.get(key)) != sanitize_json_value(current.get(key)):
+            delta[key] = sanitize_json_value(current.get(key))
+    return delta
+
+
+def _apply_agent_state_patch(
+    session: AgentSession,
+    *,
+    focus: dict[str, Any] | None = None,
+    execution: dict[str, Any] | None = None,
+    explanation: dict[str, Any] | None = None,
+    watch: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current = _session_agent_state(session)
+    next_state = {
+        "focus": {**(current.get("focus") if isinstance(current.get("focus"), dict) else {})},
+        "execution": {**(current.get("execution") if isinstance(current.get("execution"), dict) else {})},
+        "explanation": {**(current.get("explanation") if isinstance(current.get("explanation"), dict) else {})},
+        "watch": {**(current.get("watch") if isinstance(current.get("watch"), dict) else {})},
+    }
+    if focus:
+        next_state["focus"].update(sanitize_json_value(focus))
+    if execution:
+        next_state["execution"].update(sanitize_json_value(execution))
+    if explanation:
+        next_state["explanation"].update(sanitize_json_value(explanation))
+    if watch:
+        next_state["watch"].update(sanitize_json_value(watch))
+    normalized = _normalize_agent_state(next_state, last_task_id=_session_last_task_id(session))
+    session.agent_state_json = normalized
+    return _build_agent_state_delta(current, normalized)
+
+
+def _tool_trace_evidence(tool_traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for item in tool_traces[-4:]:
+        if not isinstance(item, dict):
+            continue
+        tool_name = _sanitize_line(str(item.get("tool_name") or ""), max_length=64)
+        if not tool_name:
+            continue
+        evidence.append(
+            {
+                "kind": "read_tool",
+                "tool_name": tool_name,
+                "ok": bool(item.get("ok")),
+                "arguments": sanitize_json_value(item.get("arguments") if isinstance(item.get("arguments"), dict) else {}),
+                "summary": sanitize_text(
+                    str(item.get("error") or (item.get("result") if item.get("ok") else "")),
+                    max_length=200,
+                )
+                or None,
+            }
+        )
+    return evidence
+
+
+def _collect_missing_slots(actions: list[dict[str, Any]]) -> list[str]:
+    missing: list[str] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        action_type = _sanitize_line(str(action.get("action_type") or ""), max_length=64)
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        policy = ACTION_POLICY_REGISTRY.get(action_type) or {}
+        for slot in policy.get("required_slots", []):
+            normalized_slot = _sanitize_line(str(slot or ""), max_length=64)
+            if not normalized_slot:
+                continue
+            value = params.get(normalized_slot)
+            if normalized_slot == "cidr":
+                if _extract_cidr_target(str(value or "")):
+                    continue
+            elif _sanitize_line(str(value or ""), max_length=64):
+                continue
+            if normalized_slot not in missing:
+                missing.append(normalized_slot)
+    return missing
+
+
+def _plan_agent_step(
+    *,
+    decision: _AgentModelDecision,
+    tool_traces: list[dict[str, Any]],
+    normalized_ui_actions: list[dict[str, Any]],
+    proposed_actions: list[dict[str, Any]],
+    auto_execute_actions: list[dict[str, Any]],
+    auto_execute_results: list[dict[str, Any]],
+) -> _AgentStepPlan:
+    evidence = _tool_trace_evidence(tool_traces)
+    if decision.conversation_state == "clarifying":
+        return _AgentStepPlan(
+            step_kind="clarify",
+            reason="当前目标缺少继续推进所需信息",
+            waiting_for="等待用户补充目标对象或确认执行意图",
+            next_step="收到补充后继续推进当前目标",
+            expected_outcome="补齐缺失槽位并恢复执行",
+            evidence=evidence,
+        )
+    if normalized_ui_actions:
+        return _AgentStepPlan(
+            step_kind="ui",
+            reason="当前页面已有足够语义动作可直接推进",
+            waiting_for="等待页面动作回执",
+            next_step="收到 UI 回执后继续判断下一步",
+            expected_outcome="完成站内跳转、展开、输入或提交",
+            evidence=evidence,
+        )
+    if auto_execute_results or auto_execute_actions:
+        child_task_ids = [
+            _sanitize_line(str(item.get("child_task_id") or ""), max_length=64)
+            for item in auto_execute_results
+            if isinstance(item, dict)
+        ]
+        child_task_ids = [item for item in child_task_ids if item]
+        return _AgentStepPlan(
+            step_kind="watch_task" if child_task_ids else "auto_execute",
+            reason="已识别到明确的低风险执行意图",
+            waiting_for="等待后台任务完成" if child_task_ids else None,
+            next_step="任务完成后自动回显结果" if child_task_ids else "已直接完成当前低风险动作",
+            expected_outcome="启动并跟踪低风险动作结果",
+            evidence=evidence,
+        )
+    if proposed_actions:
+        return _AgentStepPlan(
+            step_kind="propose_plan",
+            reason="当前动作需要明确计划和人工确认",
+            waiting_for="等待管理员确认执行",
+            next_step="确认后进入后台编排执行",
+            expected_outcome="形成结构化待确认计划",
+            missing_slots=_collect_missing_slots(proposed_actions),
+            evidence=evidence,
+        )
+    if tool_traces:
+        return _AgentStepPlan(
+            step_kind="answer",
+            reason="已读取到当前对象或任务的最新平台数据",
+            next_step="如需继续可直接追问或要求执行后续动作",
+            expected_outcome="基于最新工具结果给出结论",
+            evidence=evidence,
+        )
+    return _AgentStepPlan(
+        step_kind="answer",
+        reason="已完成当前轮次决策",
+        next_step="如需继续可直接提出下一步目标",
+        expected_outcome="返回最终答复",
+        evidence=evidence,
+    )
+
+
+def _render_planned_step_content(
+    plan: _AgentStepPlan,
+    *,
+    decision: _AgentModelDecision,
+    fallback_content: str,
+    ui_actions: list[dict[str, Any]],
+    proposed_actions: list[dict[str, Any]],
+) -> str:
+    if plan.step_kind == "clarify":
+        return _normalize_assistant_reply_content(decision.clarifying_question or fallback_content) or fallback_content
+    if plan.step_kind == "ui":
+        return (
+            f"我将先在当前页面执行 {len(ui_actions)} 个站内动作：{_summarize_ui_actions(ui_actions)}。"
+            if ui_actions
+            else fallback_content
+        )
+    if plan.step_kind == "propose_plan":
+        lines = ["我已经整理出待确认计划："]
+        for item in proposed_actions[:4]:
+            title = sanitize_text(str(item.get("title") or item.get("action_type") or "待执行动作"), max_length=120) or "待执行动作"
+            reason = sanitize_text(str(item.get("reason") or ""), max_length=120) or ""
+            lines.append(f"- {title}{f'：{reason}' if reason else ''}")
+        lines.append("确认后我会开始执行，并持续回显进度。")
+        return _normalize_assistant_reply_content("\n".join(lines)) or fallback_content
+    return fallback_content
+
+
+def _build_message_state_metadata(
+    *,
+    decision_summary: str | None,
+    evidence: list[dict[str, Any]] | None,
+    state_delta: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if decision_summary:
+        payload["decision_summary"] = sanitize_text(decision_summary, max_length=280)
+    if evidence:
+        payload["evidence"] = sanitize_json_value(evidence[:4])
+    if state_delta:
+        payload["state_delta"] = sanitize_json_value(state_delta)
+    return payload
+
+
 def _normalize_dialog_state(dialog_state: dict[str, Any] | None) -> dict[str, Any]:
     payload = dialog_state if isinstance(dialog_state, dict) else {}
+    payload = _normalize_dialog_state_payload(payload)
     status_value = str(payload.get("status") or "").strip().lower() or "idle"
     if status_value != "awaiting_user_input":
         return {}
@@ -1012,6 +1458,27 @@ def _normalize_dialog_state(dialog_state: dict[str, Any] | None) -> dict[str, An
         if len(read_tools) >= 3:
             break
     normalized["candidate_read_tools"] = read_tools
+    return normalized
+
+
+_DIALOG_STATE_INTENT_KIND_ALIASES = {
+    "operate_low_risk": "prepare_plan",
+    "operate_high_risk": "prepare_plan",
+    "navigate": "read_followup",
+    "inspect": "read_followup",
+    "ask": "analyze",
+    "answer": "analyze",
+}
+
+
+def _normalize_dialog_state_payload(dialog_state: dict[str, Any] | None) -> dict[str, Any]:
+    payload = sanitize_json_value(dialog_state if isinstance(dialog_state, dict) else {})
+    if not isinstance(payload, dict):
+        return {}
+    normalized = dict(payload)
+    intent_kind = str(normalized.get("intent_kind") or "").strip().lower()
+    if intent_kind in _DIALOG_STATE_INTENT_KIND_ALIASES:
+        normalized["intent_kind"] = _DIALOG_STATE_INTENT_KIND_ALIASES[intent_kind]
     return normalized
 
 
@@ -1294,6 +1761,7 @@ def serialize_agent_session(session: AgentSession) -> AgentSessionRead:
     browser_runtime_json = _normalize_browser_runtime(
         session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
     )
+    agent_state_json = _session_agent_state(session)
     messages = [_serialize_message(item) for item in session.messages]
     return AgentSessionRead(
         session_id=session.id,
@@ -1304,6 +1772,7 @@ def serialize_agent_session(session: AgentSession) -> AgentSessionRead:
         dialog_state_json=dialog_state_json,
         pending_plan_json=pending_plan_json,
         browser_runtime_json=browser_runtime_json,
+        agent_state_json=agent_state_json,
         last_task_id=session.last_task_id,
         messages=messages,
         created_at=session.created_at,
@@ -1326,6 +1795,24 @@ def _emit_session_snapshot(stream_emitter: _AgentStreamEmitter | None, session: 
     _emit_stream_event(
         stream_emitter,
         AgentSessionSnapshotEvent(session=serialize_agent_session(session)).model_dump(mode="json"),
+    )
+    _emit_stream_event(
+        stream_emitter,
+        AgentStateEvent(agent_state_json=_session_agent_state(session)).model_dump(mode="json"),
+    )
+
+
+def _emit_agent_state(
+    stream_emitter: _AgentStreamEmitter | None,
+    session: AgentSession,
+    *,
+    turn_id: str | None = None,
+) -> None:
+    if stream_emitter is None:
+        return
+    _emit_stream_event(
+        stream_emitter,
+        AgentStateEvent(agent_state_json=_session_agent_state(session), turn_id=turn_id).model_dump(mode="json"),
     )
 
 
@@ -1506,6 +1993,64 @@ def _normalize_reply_signature(value: str) -> str:
     return re.sub(r"\s+", " ", sanitize_text(value, max_length=4000) or "").strip()
 
 
+_THINK_BLOCK_PATTERN = re.compile(r"(?is)<think\b[^>]*>.*?</think>")
+_THINK_TAG_PATTERN = re.compile(r"(?i)</?think\b[^>]*>")
+_INTERNAL_REPLY_LEAK_KEYS = (
+    "confirmed_reply_draft",
+    "working_context",
+    "tool_trace_summary",
+    "pending_dialog_state",
+    "followup_hint",
+)
+_INTERNAL_REPLY_LEAK_META_HINTS = (
+    "输出给用户",
+    "整理输出",
+    "准备好了回复",
+    "直接整理",
+    "说明没有需要",
+    "调用工具",
+    "都是空的",
+    "当前用户问题",
+    "只输出最终中文正文",
+    "不要泄露 json 结构",
+    "我需要把",
+)
+
+
+def _looks_like_internal_reply_leak_block(block: str) -> bool:
+    normalized = sanitize_text(block, max_length=4000) or ""
+    if not normalized:
+        return False
+    lower_block = normalized.lower()
+    if not any(key in lower_block for key in _INTERNAL_REPLY_LEAK_KEYS):
+        return False
+    if any(hint in normalized for hint in _INTERNAL_REPLY_LEAK_META_HINTS):
+        return True
+    if re.search(
+        r'(?i)["\']?(?:confirmed_reply_draft|working_context|tool_trace_summary|pending_dialog_state|followup_hint)["\']?\s*:',
+        normalized,
+    ):
+        return True
+    return "{" in normalized or "[" in normalized
+
+
+def _scrub_assistant_reply_leaks(content: str) -> str:
+    normalized = sanitize_text(content, max_length=4000) or ""
+    if not normalized:
+        return ""
+    without_think = _THINK_BLOCK_PATTERN.sub("\n\n", normalized)
+    without_think = _THINK_TAG_PATTERN.sub("", without_think).strip()
+    blocks = [block.strip() for block in re.split(r"\n{2,}", without_think) if block.strip()]
+    if not blocks:
+        return without_think
+    kept_blocks = [block for block in blocks if not _looks_like_internal_reply_leak_block(block)]
+    if kept_blocks:
+        return "\n\n".join(kept_blocks).strip()
+    if without_think != normalized or len(blocks) != len(kept_blocks):
+        return ""
+    return without_think
+
+
 def _is_list_like_reply_block(block: str) -> bool:
     lines = [line.strip() for line in block.splitlines() if line.strip()]
     if len(lines) < 2:
@@ -1550,7 +2095,7 @@ def _dedupe_consecutive_reply_sentences(block: str) -> str:
 
 
 def _normalize_assistant_reply_content(content: str) -> str:
-    normalized = sanitize_text(content, max_length=4000) or ""
+    normalized = _scrub_assistant_reply_leaks(content)
     if not normalized:
         return ""
     blocks = [block.strip() for block in re.split(r"\n{2,}", normalized) if block.strip()]
@@ -1652,7 +2197,7 @@ def _append_or_stream_assistant_message(
         stream_emitter,
         AgentAssistantMessageStartEvent(turn_id=turn_id, message_type=message_type).model_dump(mode="json"),
     )
-    emitted_chunks: list[str] = []
+    final_content = fallback_content
     if fallback_content and _runtime_provider_mode() != "mock":
         reply_request = _build_reply_stream_request(
             user_content=user_content,
@@ -1663,43 +2208,18 @@ def _append_or_stream_assistant_message(
         )
         provider = _build_runtime_provider().provider
         try:
-            for chunk in provider.stream_generate(reply_request):
-                normalized_chunk = str(chunk or "")
-                if not normalized_chunk:
-                    continue
-                emitted_chunks.append(normalized_chunk)
-                _emit_stream_event(
-                    stream_emitter,
-                    AgentAssistantDeltaEvent(turn_id=turn_id, delta=normalized_chunk).model_dump(mode="json"),
-                )
+            streamed_reply = "".join(str(chunk or "") for chunk in provider.stream_generate(reply_request))
+            resolved_reply = _normalize_assistant_reply_content(streamed_reply)
+            if resolved_reply:
+                final_content = resolved_reply
         except Exception as exc:
             logger.warning("haor reply stream failed, falling back to draft reply", exc_info=exc)
-            if emitted_chunks:
-                try:
-                    resolved_reply = _normalize_assistant_reply_content(provider.generate(reply_request))
-                except Exception:
-                    resolved_reply = ""
-                current_text = "".join(emitted_chunks)
-                if resolved_reply.startswith(current_text):
-                    suffix = resolved_reply[len(current_text) :]
-                    for chunk in _iter_stream_text_chunks(suffix):
-                        emitted_chunks.append(chunk)
-                        _emit_stream_event(
-                            stream_emitter,
-                            AgentAssistantDeltaEvent(turn_id=turn_id, delta=chunk).model_dump(mode="json"),
-                        )
-                else:
-                    logger.warning("haor reply stream fallback could not reconcile partial stream")
 
-    if not emitted_chunks:
-        for chunk in _iter_stream_text_chunks(fallback_content):
-            emitted_chunks.append(chunk)
-            _emit_stream_event(
-                stream_emitter,
-                AgentAssistantDeltaEvent(turn_id=turn_id, delta=chunk).model_dump(mode="json"),
-            )
-
-    final_content = _normalize_assistant_reply_content("".join(emitted_chunks).strip()) or fallback_content
+    for chunk in _iter_stream_text_chunks(final_content):
+        _emit_stream_event(
+            stream_emitter,
+            AgentAssistantDeltaEvent(turn_id=turn_id, delta=chunk).model_dump(mode="json"),
+        )
     message = _append_message(
         db,
         session=session,
@@ -2039,6 +2559,7 @@ def _create_session(db: Session, *, user: User) -> AgentSession:
         dialog_state_json={},
         pending_plan_json={},
         browser_runtime_json={},
+        agent_state_json={},
     )
     db.add(session)
     db.flush()
@@ -2083,14 +2604,44 @@ def append_agent_task_message(
     session = db.get(AgentSession, session_id)
     if session is None:
         return
+    normalized_payload = payload_json if isinstance(payload_json, dict) else {}
+    child_task = normalized_payload.get("child_task") if isinstance(normalized_payload.get("child_task"), dict) else {}
+    state_delta = sync_agent_task_watch_state(
+        session,
+        task_id=normalized_payload.get("task_id") or child_task.get("task_id"),
+        status=child_task.get("status") or ("failure" if message_type == "error" else "success"),
+        message=content,
+        action=normalized_payload.get("action") if isinstance(normalized_payload.get("action"), dict) else {},
+        watching=False,
+    )
     _append_message(
         db,
         session=session,
         role="assistant",
         message_type=message_type,
         content=content,
-        payload_json=payload_json,
+        payload_json={
+            **normalized_payload,
+            **_build_message_state_metadata(
+                decision_summary=content,
+                evidence=[],
+                state_delta=state_delta,
+            ),
+        },
     )
+
+
+def has_agent_task_followup_message(session: AgentSession, *, task_id: str) -> bool:
+    normalized_task_id = _sanitize_line(str(task_id or ""), max_length=64)
+    if not normalized_task_id:
+        return False
+    for item in reversed(list(session.messages or [])[-16:]):
+        payload = item.payload_json if isinstance(item.payload_json, dict) else {}
+        if _sanitize_line(str(payload.get("task_id") or ""), max_length=64) != normalized_task_id:
+            continue
+        if payload.get("auto_followup"):
+            return True
+    return False
 
 
 def _content_mentions_current_object(content: str) -> bool:
@@ -2870,17 +3421,22 @@ def _build_dialog_state_from_model_decision(
 
 
 def _runtime_provider_mode() -> str:
-    return str(settings.LLM_PROVIDER or "mock").strip().lower() or "mock"
+    return read_runtime_env_value("LLM_PROVIDER", str(settings.LLM_PROVIDER or "mock")).strip().lower() or "mock"
 
 
 def _build_runtime_provider():
+    model = read_runtime_env_value("LLM_MODEL", str(settings.LLM_MODEL or "gpt-4o-mini"))
+    base_url = read_runtime_env_value("LLM_BASE_URL", str(settings.LLM_BASE_URL or ""))
+    wire_api = read_runtime_env_value("LLM_WIRE_API", str(settings.LLM_WIRE_API or "responses"))
+    timeout_seconds = int(read_runtime_env_value("LLM_TIMEOUT_SECONDS", str(settings.LLM_TIMEOUT_SECONDS or 60)) or 60)
+    api_key = read_runtime_env_value("LLM_API_KEY", str(settings.LLM_API_KEY or ""))
     return build_provider(
         provider_name=_runtime_provider_mode(),
-        model=str(settings.LLM_MODEL or "gpt-4o-mini"),
-        base_url=str(settings.LLM_BASE_URL or ""),
-        wire_api=str(settings.LLM_WIRE_API or "responses"),
-        timeout_seconds=int(settings.LLM_TIMEOUT_SECONDS or 60),
-        api_key=str(settings.LLM_API_KEY or ""),
+        model=model,
+        base_url=base_url,
+        wire_api=wire_api,
+        timeout_seconds=timeout_seconds,
+        api_key=api_key,
         fallback_to_mock=False,
     )
 
@@ -3006,7 +3562,21 @@ def _parse_model_decision(raw: str) -> _AgentModelDecision:
         payload = json.loads(_extract_json_block(raw))
     except json.JSONDecodeError as exc:
         raise ValueError("模型返回的 JSON 结构无法解析") from exc
+    if isinstance(payload, dict) and isinstance(payload.get("dialog_state_update"), dict):
+        payload = dict(payload)
+        payload["dialog_state_update"] = _normalize_dialog_state_payload(payload.get("dialog_state_update"))
     return _AgentModelDecision.model_validate(payload)
+
+
+def _is_model_decision_contract_error(exc: Exception) -> bool:
+    if not isinstance(exc, ValueError):
+        return False
+    detail = sanitize_text(str(exc), max_length=200) or ""
+    return detail in {
+        "模型未返回内容",
+        "模型未返回合法 JSON",
+        "模型返回的 JSON 结构无法解析",
+    }
 
 
 def _compact_page_context(page_context: dict[str, Any]) -> dict[str, Any]:
@@ -3745,6 +4315,7 @@ def _run_agent_loop(
 ) -> tuple[_AgentModelDecision, list[dict[str, Any]]]:
     tool_traces: list[dict[str, Any]] = []
     working_context = _normalize_working_context(working_context)
+    session_last_task_id = _session_last_task_id(session)
     current_content = str(browser_runtime.get("last_user_intent") or "") or str(session.messages[-1].content if session.messages else "")
     objective = _build_current_objective(
         str(browser_runtime.get("current_objective") or "") or current_content,
@@ -3758,20 +4329,65 @@ def _run_agent_loop(
         proposed_write_actions=[],
         needs_confirmation=False,
     )
-    for _ in range(MAX_AGENT_LOOP_STEPS):
-        decision = _run_model_once(
-            session=session,
-            user=user,
+    _apply_agent_state_patch(
+        session,
+        focus=_resolve_agent_focus(
             page_context=page_context,
             browser_context=browser_context,
-            browser_runtime=browser_runtime,
             working_context=working_context,
             dialog_state=dialog_state,
-            followup_hint=followup_hint,
-            tool_traces=tool_traces,
-            allow_write_plans=allow_write_plans,
-            allow_auto_execute_actions=allow_auto_execute_actions,
-        )
+            user_content=current_content,
+            fallback_watch_task_id=session_last_task_id,
+        ),
+        execution={
+            "stage": "planning",
+            "step_kind": "answer",
+            "step_label": "解析当前目标",
+            "waiting_for": None,
+            "missing_slots": [],
+        },
+        explanation={
+            "reason": "正在解析当前用户目标并决定下一步动作",
+            "decision_summary": sanitize_text(str(objective.get("summary") or ""), max_length=280),
+            "expected_outcome": "确定是回答、追问、页面动作还是后台执行",
+            "next_step": "完成解析后进入单一步骤执行",
+            "evidence": [],
+        },
+        watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+    )
+    _emit_agent_state(stream_emitter, session, turn_id=turn_id)
+    for _ in range(MAX_AGENT_LOOP_STEPS):
+        try:
+            decision = _run_model_once(
+                session=session,
+                user=user,
+                page_context=page_context,
+                browser_context=browser_context,
+                browser_runtime=browser_runtime,
+                working_context=working_context,
+                dialog_state=dialog_state,
+                followup_hint=followup_hint,
+                tool_traces=tool_traces,
+                allow_write_plans=allow_write_plans,
+                allow_auto_execute_actions=allow_auto_execute_actions,
+            )
+        except Exception as exc:
+            if not _is_model_decision_contract_error(exc):
+                raise
+            fallback_decision = _build_action_first_fallback_decision(
+                content=current_content,
+                user=user,
+                page_context=page_context,
+                browser_context=browser_context,
+                working_context=working_context,
+                dialog_state=dialog_state,
+                followup_hint=followup_hint,
+                allow_write_plans=allow_write_plans,
+                allow_auto_execute_actions=allow_auto_execute_actions,
+            )
+            if fallback_decision is None:
+                raise
+            decision = fallback_decision
         if not _decision_has_agent_progress(decision, tool_traces=tool_traces):
             fallback_decision = _build_action_first_fallback_decision(
                 content=current_content,
@@ -3798,6 +4414,23 @@ def _run_agent_loop(
         executed_any = False
         for call in read_calls:
             executed_any = True
+            _apply_agent_state_patch(
+                session,
+                execution={
+                    "stage": "reading",
+                    "step_kind": "read",
+                    "step_label": f"读取 {call.tool_name}",
+                    "waiting_for": None,
+                },
+                explanation={
+                    "reason": f"需要先读取 {call.tool_name} 的平台数据",
+                    "decision_summary": f"执行只读工具 {call.tool_name}",
+                    "expected_outcome": "补齐回答或动作所需上下文",
+                    "next_step": "读取结果后继续决策",
+                    "evidence": _tool_trace_evidence(tool_traces),
+                },
+            )
+            _emit_agent_state(stream_emitter, session, turn_id=turn_id)
             try:
                 result = _execute_read_tool(db, tool_name=call.tool_name, arguments=call.arguments)
                 trace = {
@@ -3817,6 +4450,23 @@ def _run_agent_loop(
                 working_context = _promote_resolved_targets_from_tool_traces([trace], working_context)
                 if _has_object_target(working_context):
                     session.working_context_json = working_context
+                _apply_agent_state_patch(
+                    session,
+                    focus=_resolve_agent_focus(
+                        page_context=page_context,
+                        browser_context=browser_context,
+                        working_context=working_context,
+                        dialog_state=dialog_state,
+                        user_content=current_content,
+                        fallback_watch_task_id=session_last_task_id,
+                    ),
+                    explanation={
+                        "reason": f"已完成 {call.tool_name} 读取",
+                        "decision_summary": f"{call.tool_name} 已返回结果",
+                        "evidence": _tool_trace_evidence(tool_traces),
+                    },
+                )
+                _emit_agent_state(stream_emitter, session, turn_id=turn_id)
             except Exception as exc:
                 trace = {
                     "tool_name": call.tool_name,
@@ -3832,6 +4482,16 @@ def _run_agent_loop(
                         content=f"{call.tool_name} 执行失败：{sanitize_text(str(exc), max_length=120) or '未知错误'}",
                         trace=trace,
                     )
+                _apply_agent_state_patch(
+                    session,
+                    execution={"stage": "reading", "step_kind": "read", "step_label": f"{call.tool_name} 失败"},
+                    explanation={
+                        "reason": f"{call.tool_name} 读取失败",
+                        "decision_summary": sanitize_text(str(exc), max_length=240),
+                        "evidence": _tool_trace_evidence(tool_traces),
+                    },
+                )
+                _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         if not executed_any:
             return decision, tool_traces
     if decision.read_tool_calls:
@@ -4082,6 +4742,19 @@ def _execute_auto_actions(
         }
         if result.child_task_id and get_task_run(db, result.child_task_id) is not None:
             session.last_task_id = result.child_task_id
+            sync_agent_task_watch_state(
+                session,
+                task_id=result.child_task_id,
+                status=result.status,
+                message=result.summary,
+                action=payload,
+                watching=True,
+            )
+            enqueue_auto_action_followup_task(
+                session_id=session.id,
+                child_task_id=result.child_task_id,
+                action=payload,
+            )
         results.append(payload)
     return results
 
@@ -4153,6 +4826,133 @@ def _build_auto_execute_reply_markdown(
     return _normalize_assistant_reply_content("\n\n".join(replies)) or fallback
 
 
+def build_auto_action_task_followup_content(action: dict[str, Any], child_summary: dict[str, Any]) -> tuple[str, str]:
+    action_type = _sanitize_line(str(action.get("action_type") or ""), max_length=64)
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    status = _normalize_task_status(child_summary.get("status"))
+    task_message = sanitize_text(str(child_summary.get("message") or ""), max_length=300) or ""
+
+    if action_type == "create_discovery_job":
+        cidr = sanitize_text(str(params.get("cidr") or ""), max_length=64, single_line=True) or "目标网段"
+        if status == TaskExecutionStatus.SUCCESS.value:
+            message = f"{cidr} 的扫描任务已完成。"
+            if task_message:
+                message = f"{message}{task_message}。"
+            return "task_update", f"{message} 如需继续，我可以帮你分析该网段的资产和漏洞。"
+        detail = task_message or "请查看任务详情或事件日志"
+        return "error", f"{cidr} 的扫描任务未成功完成：{detail}"
+
+    if action_type == "verify_asset_risks":
+        asset_id = _sanitize_line(str(params.get("asset_id") or ""), max_length=64) or "目标资产"
+        if status == TaskExecutionStatus.SUCCESS.value:
+            message = f"资产 {asset_id} 的风险验证任务已完成。"
+            if task_message:
+                message = f"{message}{task_message}。"
+            return "task_update", f"{message} 如需继续，我可以帮你分析最新验证结果。"
+        detail = task_message or "请查看验证任务详情"
+        return "error", f"资产 {asset_id} 的风险验证任务未成功完成：{detail}"
+
+    if action_type == "install_runner":
+        asset_id = _sanitize_line(str(params.get("asset_id") or ""), max_length=64) or "目标资产"
+        if status == TaskExecutionStatus.SUCCESS.value:
+            message = f"资产 {asset_id} 的 Runner 安装任务已完成。"
+            if task_message:
+                message = f"{message}{task_message}。"
+            return "task_update", f"{message} 如需继续，我可以帮你检查 Runner 状态和后续问题。"
+        detail = task_message or "请查看安装任务详情"
+        return "error", f"资产 {asset_id} 的 Runner 安装任务未成功完成：{detail}"
+
+    detail = task_message or (status if status else "请查看任务详情")
+    if status == TaskExecutionStatus.SUCCESS.value:
+        return "task_update", f"关联任务已完成：{detail}"
+    return "error", f"关联任务未成功完成：{detail}"
+
+
+def sync_agent_task_watch_state(
+    session: AgentSession,
+    *,
+    task_id: str | None,
+    status: str | None,
+    message: str | None,
+    action: dict[str, Any] | None = None,
+    watching: bool | None = None,
+) -> dict[str, Any]:
+    normalized_task_id = _sanitize_line(str(task_id or ""), max_length=64) or None
+    normalized_status = _normalize_task_status(status)
+    normalized_action = action if isinstance(action, dict) else {}
+    action_params = normalized_action.get("params") if isinstance(normalized_action.get("params"), dict) else {}
+    action_target = _normalize_agent_focus_target(
+        {
+            "asset_id": action_params.get("asset_id"),
+            "finding_id": action_params.get("finding_id"),
+            "task_id": normalized_task_id,
+            "session_id": action_params.get("session_id"),
+            "cidr": action_params.get("cidr"),
+            "source": "task_watch",
+        }
+    )
+    current_context = session.working_context_json if isinstance(session.working_context_json, dict) else {}
+    focus = _resolve_agent_focus(
+        working_context=current_context,
+        user_content=str(action_params.get("cidr") or ""),
+        fallback_watch_task_id=normalized_task_id,
+    )
+    if action_target:
+        focus["resolved"] = action_target
+        focus["summary"] = action_target.get("summary")
+        focus["focus_type"] = action_target.get("target_type")
+        focus["source"] = action_target.get("source")
+        focus["confidence"] = "high"
+    effective_watching = bool(normalized_task_id) if watching is None else bool(watching)
+    stage = "watching_task" if effective_watching else ("failed" if normalized_status in {"failure", "canceled"} else "completed")
+    return _apply_agent_state_patch(
+        session,
+        focus=focus,
+        execution={
+            "stage": stage,
+            "step_kind": "watch_task",
+            "step_label": "跟踪后台任务进度" if effective_watching else "后台任务已结束",
+            "waiting_for": "等待后台任务完成" if effective_watching else None,
+            "missing_slots": [],
+            "pending_ui_actions": [],
+        },
+        explanation={
+            "reason": sanitize_text(str(normalized_action.get("reason") or normalized_action.get("title") or "跟踪后台任务"), max_length=280)
+            or "跟踪后台任务",
+            "decision_summary": sanitize_text(str(message or normalized_status or normalized_task_id or ""), max_length=280),
+            "expected_outcome": "持续同步后台任务状态并在结束后回显",
+            "next_step": "任务结束后追加结果消息" if effective_watching else "等待新的目标",
+            "evidence": [],
+        },
+        watch={
+            "primary_task_id": normalized_task_id,
+            "related_task_ids": [normalized_task_id] if normalized_task_id else [],
+            "status": normalized_status or None,
+            "watching": effective_watching,
+            "last_task_message": sanitize_text(str(message or ""), max_length=280) or None,
+        },
+    )
+
+
+def enqueue_auto_action_followup_task(*, session_id: str, child_task_id: str, action: dict[str, Any]) -> None:
+    normalized_session_id = _sanitize_line(str(session_id or ""), max_length=64)
+    normalized_task_id = _sanitize_line(str(child_task_id or ""), max_length=64)
+    if not normalized_session_id or not normalized_task_id:
+        return
+    try:
+        celery_app.send_task(
+            "app.tasks.agent_tasks.run_agent_auto_followup_task",
+            args=[normalized_session_id, normalized_task_id, sanitize_json_value(action if isinstance(action, dict) else {})],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to enqueue agent auto follow-up task for session=%s child_task=%s: %s",
+            normalized_session_id,
+            normalized_task_id,
+            exc,
+        )
+
+
 def _apply_agent_decision(
     db: Session,
     *,
@@ -4176,6 +4976,7 @@ def _apply_agent_decision(
     turn_id: str | None = None,
 ) -> None:
     current_objective = _build_current_objective(user_content, dialog_state=dialog_state, followup_hint=followup_hint)
+    session_last_task_id = _session_last_task_id(session)
     final_working_context = _promote_resolved_targets_from_tool_traces(tool_traces, working_context)
     if _has_object_target(final_working_context):
         session.working_context_json = final_working_context
@@ -4239,7 +5040,24 @@ def _apply_agent_decision(
         proposed_actions = []
         needs_confirmation = False
 
-    assistant_payload = {
+    resolved_focus = _resolve_agent_focus(
+        page_context=page_context,
+        browser_context=browser_context,
+        working_context=final_working_context,
+        dialog_state=dialog_state,
+        user_content=user_content,
+        fallback_watch_task_id=session_last_task_id,
+    )
+    planned_step = _plan_agent_step(
+        decision=decision,
+        tool_traces=tool_traces,
+        normalized_ui_actions=normalized_ui_actions,
+        proposed_actions=proposed_actions,
+        auto_execute_actions=auto_execute_actions,
+        auto_execute_results=auto_execute_results,
+    )
+    decision_summary = planned_step.reason or sanitize_text(str(decision.stop_reason or decision.objective or ""), max_length=280) or None
+    base_assistant_payload = {
         "tool_traces": tool_traces,
         "ui_actions": normalized_ui_actions,
         "proposed_write_actions": proposed_actions,
@@ -4252,6 +5070,13 @@ def _apply_agent_decision(
         "working_context": final_working_context,
         "followup_hint": followup_hint,
     }
+    rendered_content = _render_planned_step_content(
+        planned_step,
+        decision=decision,
+        fallback_content=_normalize_assistant_reply_content(decision.reply_markdown) or decision.reply_markdown,
+        ui_actions=normalized_ui_actions,
+        proposed_actions=proposed_actions,
+    )
 
     if decision.conversation_state == "clarifying":
         _preserve_or_reset_pending_plan(
@@ -4265,7 +5090,6 @@ def _apply_agent_decision(
             working_context=final_working_context,
             page_context=page_context,
         )
-        assistant_payload["dialog_state"] = sanitize_json_value(session.dialog_state_json)
         _clear_browser_runtime(
             session,
             browser_context=browser_context,
@@ -4276,11 +5100,42 @@ def _apply_agent_decision(
             last_message_request_id=message_request_id,
             last_message_ack_at=message_request_ack_at,
         )
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=resolved_focus,
+            execution={
+                "stage": "waiting_user_input",
+                "step_kind": "clarify",
+                "step_label": "等待用户补充信息",
+                "waiting_for": planned_step.waiting_for,
+                "missing_slots": session.dialog_state_json.get("expected_slots")
+                if isinstance(session.dialog_state_json.get("expected_slots"), list)
+                else [],
+                "pending_ui_actions": [],
+            },
+            explanation={
+                "reason": planned_step.reason,
+                "decision_summary": decision_summary,
+                "expected_outcome": planned_step.expected_outcome,
+                "next_step": planned_step.next_step,
+                "evidence": planned_step.evidence,
+            },
+            watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+        )
+        assistant_payload = {
+            **base_assistant_payload,
+            "dialog_state": sanitize_json_value(session.dialog_state_json),
+            **_build_message_state_metadata(
+                decision_summary=decision_summary,
+                evidence=planned_step.evidence,
+                state_delta=state_delta,
+            ),
+        }
         message = _append_or_stream_assistant_message(
             db,
             session=session,
             message_type="clarifying",
-            content=decision.clarifying_question or decision.reply_markdown,
+            content=rendered_content,
             payload_json=assistant_payload,
             user_content=user_content,
             tool_traces=tool_traces,
@@ -4291,6 +5146,7 @@ def _apply_agent_decision(
         if isinstance(session.dialog_state_json, dict):
             session.dialog_state_json["last_agent_question"] = message.content
             db.add(session)
+        _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
     if normalized_ui_actions:
@@ -4311,13 +5167,40 @@ def _apply_agent_decision(
                 last_message_request_id=message_request_id,
                 last_message_ack_at=message_request_ack_at,
             )
+            state_delta = _apply_agent_state_patch(
+                session,
+                focus=resolved_focus,
+                execution={
+                    "stage": "failed",
+                    "step_kind": "ui",
+                    "step_label": "页面动作已达到上限",
+                    "waiting_for": None,
+                    "missing_slots": [],
+                    "pending_ui_actions": [],
+                },
+                explanation={
+                    "reason": "当前页面动作链路超过最大步数，已中止本轮自动推进",
+                    "decision_summary": "站内代理动作达到上限",
+                    "expected_outcome": "要求用户提供更具体的下一步目标",
+                    "next_step": "等待用户重新描述更精确的操作目标",
+                    "evidence": planned_step.evidence,
+                },
+                watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+            )
             message = _append_message(
                 db,
                 session=session,
                 role="assistant",
                 message_type="error",
                 content="站内代理动作已达到上限，请直接给我更具体的下一步目标。",
-                payload_json=assistant_payload,
+                payload_json={
+                    **base_assistant_payload,
+                    **_build_message_state_metadata(
+                        decision_summary="站内代理动作达到上限",
+                        evidence=planned_step.evidence,
+                        state_delta=state_delta,
+                    ),
+                },
             )
             if turn_id:
                 _emit_error_event(
@@ -4326,6 +5209,7 @@ def _apply_agent_decision(
                     turn_id=turn_id,
                     message=message,
                 )
+            _emit_agent_state(stream_emitter, session, turn_id=turn_id)
             return
         _set_browser_runtime(
             session,
@@ -4354,28 +5238,57 @@ def _apply_agent_decision(
             last_message_ack_at=message_request_ack_at,
             ui_pending_since=_now(),
         )
-        content = decision.reply_markdown.strip() or (
-            f"我将先在当前页面执行 {len(normalized_ui_actions)} 个站内动作：{_summarize_ui_actions(normalized_ui_actions)}。"
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=resolved_focus,
+            execution={
+                "stage": "awaiting_ui_feedback",
+                "step_kind": "ui",
+                "step_label": f"待执行 {len(normalized_ui_actions)} 个页面动作",
+                "waiting_for": planned_step.waiting_for,
+                "missing_slots": [],
+                "pending_ui_actions": normalized_ui_actions,
+            },
+            explanation={
+                "reason": planned_step.reason,
+                "decision_summary": decision_summary,
+                "expected_outcome": planned_step.expected_outcome,
+                "next_step": planned_step.next_step,
+                "evidence": planned_step.evidence,
+            },
+            watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
         )
+        assistant_payload = {
+            **base_assistant_payload,
+            "browser_runtime": sanitize_json_value(session.browser_runtime_json),
+            **_build_message_state_metadata(
+                decision_summary=decision_summary,
+                evidence=planned_step.evidence,
+                state_delta=state_delta,
+            ),
+        }
         message = _append_message(
             db,
             session=session,
             role="assistant",
             message_type="action_update",
-            content=content,
-            payload_json={
-                **assistant_payload,
-                "browser_runtime": sanitize_json_value(session.browser_runtime_json),
-            },
+            content=rendered_content,
+            payload_json=assistant_payload,
         )
         if turn_id:
             _emit_action_update(
                 stream_emitter,
                 turn_id=turn_id,
-                content=content,
+                content=rendered_content,
                 message=message,
             )
-            _emit_ui_actions_requested(stream_emitter, turn_id=turn_id, ui_actions=normalized_ui_actions, content=content)
+            _emit_ui_actions_requested(
+                stream_emitter,
+                turn_id=turn_id,
+                ui_actions=normalized_ui_actions,
+                content=rendered_content,
+            )
+        _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
     _clear_browser_runtime(
@@ -4405,11 +5318,39 @@ def _apply_agent_decision(
             ),
         }
         _clear_dialog_state(session)
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=resolved_focus,
+            execution={
+                "stage": "waiting_approval",
+                "step_kind": "propose_plan",
+                "step_label": f"待确认 {len(proposed_actions)} 个执行动作",
+                "waiting_for": planned_step.waiting_for,
+                "missing_slots": planned_step.missing_slots or [],
+                "pending_ui_actions": [],
+            },
+            explanation={
+                "reason": planned_step.reason,
+                "decision_summary": decision_summary,
+                "expected_outcome": planned_step.expected_outcome,
+                "next_step": planned_step.next_step,
+                "evidence": planned_step.evidence,
+            },
+            watch={"primary_task_id": _session_last_task_id(session), "watching": bool(_session_last_task_id(session))},
+        )
+        assistant_payload = {
+            **base_assistant_payload,
+            **_build_message_state_metadata(
+                decision_summary=decision_summary,
+                evidence=planned_step.evidence,
+                state_delta=state_delta,
+            ),
+        }
         message = _append_or_stream_assistant_message(
             db,
             session=session,
             message_type="plan",
-            content=decision.reply_markdown,
+            content=rendered_content,
             payload_json=assistant_payload,
             user_content=user_content,
             tool_traces=tool_traces,
@@ -4426,6 +5367,7 @@ def _apply_agent_decision(
                 message=message,
                 pending_plan_json=session.pending_plan_json,
             )
+        _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
     _preserve_or_reset_pending_plan(
@@ -4434,11 +5376,50 @@ def _apply_agent_decision(
         preserve_existing=has_pending_plan,
     )
     _clear_dialog_state(session)
+    child_task_ids = [
+        _sanitize_line(str(item.get("child_task_id") or ""), max_length=64)
+        for item in auto_execute_results
+        if isinstance(item, dict)
+    ]
+    child_task_ids = [item for item in child_task_ids if item]
+    state_delta = _apply_agent_state_patch(
+        session,
+        focus=resolved_focus,
+        execution={
+            "stage": "watching_task" if child_task_ids else "completed",
+            "step_kind": planned_step.step_kind,
+            "step_label": "等待后台任务完成" if child_task_ids else "已完成当前回复",
+            "waiting_for": planned_step.waiting_for if child_task_ids else None,
+            "missing_slots": planned_step.missing_slots or [],
+            "pending_ui_actions": [],
+        },
+        explanation={
+            "reason": planned_step.reason,
+            "decision_summary": decision_summary,
+            "expected_outcome": planned_step.expected_outcome,
+            "next_step": planned_step.next_step,
+            "evidence": planned_step.evidence,
+        },
+        watch={
+            "primary_task_id": child_task_ids[0] if child_task_ids else _session_last_task_id(session),
+            "related_task_ids": child_task_ids,
+            "status": "running" if child_task_ids else None,
+            "watching": bool(child_task_ids),
+        },
+    )
+    assistant_payload = {
+        **base_assistant_payload,
+        **_build_message_state_metadata(
+            decision_summary=decision_summary,
+            evidence=planned_step.evidence,
+            state_delta=state_delta,
+        ),
+    }
     _append_or_stream_assistant_message(
         db,
         session=session,
         message_type="text",
-        content=decision.reply_markdown,
+        content=rendered_content,
         payload_json=assistant_payload,
         user_content=user_content,
         tool_traces=tool_traces,
@@ -4446,6 +5427,7 @@ def _apply_agent_decision(
         stream_emitter=stream_emitter,
         turn_id=turn_id,
     )
+    _emit_agent_state(stream_emitter, session, turn_id=turn_id)
 
 
 def post_agent_message(
@@ -4464,6 +5446,7 @@ def post_agent_message(
         session = _create_session(db, user=user)
         db.flush()
     _raise_if_session_running(session, stage="message")
+    session_last_task_id = _session_last_task_id(session)
     client_message_id = _normalize_client_message_id(payload.client_message_id) or f"haor-msg-{uuid4().hex[:12]}"
 
     current_browser_runtime = _normalize_browser_runtime(
@@ -4585,6 +5568,33 @@ def post_agent_message(
         last_message_request_id=client_message_id,
         last_message_ack_at=accepted_at,
     )
+    _apply_agent_state_patch(
+        session,
+        focus=_resolve_agent_focus(
+            page_context=page_context,
+            browser_context=browser_context,
+            working_context=working_context,
+            dialog_state=current_dialog_state,
+            user_content=payload.content,
+            fallback_watch_task_id=session_last_task_id,
+        ),
+        execution={
+            "stage": "awaiting_agent_reply",
+            "step_kind": "answer",
+            "step_label": "正在解析用户请求",
+            "waiting_for": None,
+            "missing_slots": [],
+            "pending_ui_actions": [],
+        },
+        explanation={
+            "reason": "已接收新消息，正在解析目标与下一步动作",
+            "decision_summary": sanitize_text(str(current_objective.get("summary") or payload.content), max_length=280),
+            "expected_outcome": "确定当前轮次的单一步骤",
+            "next_step": "完成解析后进入追问、回答、页面动作或执行",
+            "evidence": [],
+        },
+        watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+    )
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -4622,6 +5632,16 @@ def post_agent_message(
                 "browser_context": browser_context,
                 "working_context": working_context,
                 "pending_plan_cleared": True,
+                **_build_message_state_metadata(
+                    decision_summary="已取消待确认计划",
+                    evidence=[],
+                    state_delta={
+                        "execution": {
+                            "stage": "completed",
+                            "step_label": "已取消待确认计划",
+                        }
+                    },
+                ),
             },
         )
         _clear_browser_runtime(
@@ -4630,6 +5650,25 @@ def post_agent_message(
             last_user_intent=payload.content,
             last_message_request_id=client_message_id,
             last_message_ack_at=accepted_at,
+        )
+        _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                page_context=page_context,
+                browser_context=browser_context,
+                working_context=working_context,
+                user_content=payload.content,
+                fallback_watch_task_id=session_last_task_id,
+            ),
+            execution={"stage": "completed", "step_kind": "answer", "step_label": "已取消待确认计划", "waiting_for": None, "missing_slots": [], "pending_ui_actions": []},
+            explanation={
+                "reason": "用户明确取消当前待确认计划",
+                "decision_summary": "已取消待确认计划",
+                "expected_outcome": "回到普通会话态，等待新的目标",
+                "next_step": "等待用户继续提问或发起新的执行意图",
+                "evidence": [],
+            },
+            watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
         )
         db.commit()
         db.refresh(session)
@@ -4675,6 +5714,16 @@ def post_agent_message(
                 "browser_context": browser_context,
                 "working_context": working_context,
                 "followup_resolution": {"status": "canceled"},
+                **_build_message_state_metadata(
+                    decision_summary="已取消上一轮补问",
+                    evidence=[],
+                    state_delta={
+                        "execution": {
+                            "stage": "completed",
+                            "step_label": "已取消上一轮补问",
+                        }
+                    },
+                ),
             },
         )
         _clear_browser_runtime(
@@ -4683,6 +5732,25 @@ def post_agent_message(
             last_user_intent=payload.content,
             last_message_request_id=client_message_id,
             last_message_ack_at=accepted_at,
+        )
+        _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                page_context=page_context,
+                browser_context=browser_context,
+                working_context=working_context,
+                user_content=payload.content,
+                fallback_watch_task_id=session_last_task_id,
+            ),
+            execution={"stage": "completed", "step_kind": "answer", "step_label": "已取消上一轮追问", "waiting_for": None, "missing_slots": [], "pending_ui_actions": []},
+            explanation={
+                "reason": "用户否定了上一轮追问的继续路径",
+                "decision_summary": "已取消上一轮补问",
+                "expected_outcome": "解除追问阻塞，返回普通会话态",
+                "next_step": "等待用户给出新的目标或对象",
+                "evidence": [],
+            },
+            watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
         )
         db.commit()
         db.refresh(session)
@@ -4792,6 +5860,17 @@ def post_agent_message(
                     "browser_context": browser_context,
                     "working_context": working_context,
                     "dialog_state": sanitize_json_value(session.dialog_state_json),
+                    **_build_message_state_metadata(
+                        decision_summary="进入预检追问",
+                        evidence=[],
+                        state_delta={
+                            "execution": {
+                                "stage": "waiting_user_input",
+                                "step_kind": "clarify",
+                                "step_label": "预检追问",
+                            }
+                        },
+                    ),
                 },
             )
             _clear_browser_runtime(
@@ -4800,6 +5879,35 @@ def post_agent_message(
                 last_user_intent=payload.content,
                 last_message_request_id=client_message_id,
                 last_message_ack_at=accepted_at,
+            )
+            _apply_agent_state_patch(
+                session,
+                focus=_resolve_agent_focus(
+                    page_context=page_context,
+                    browser_context=browser_context,
+                    working_context=working_context,
+                    dialog_state=session.dialog_state_json,
+                    user_content=payload.content,
+                    fallback_watch_task_id=session_last_task_id,
+                ),
+                execution={
+                    "stage": "waiting_user_input",
+                    "step_kind": "clarify",
+                    "step_label": "预检追问",
+                    "waiting_for": "等待用户补充目标对象或范围",
+                    "missing_slots": session.dialog_state_json.get("expected_slots")
+                    if isinstance(session.dialog_state_json.get("expected_slots"), list)
+                    else [],
+                    "pending_ui_actions": [],
+                },
+                explanation={
+                    "reason": "预检阶段发现当前目标对象或执行范围不明确",
+                    "decision_summary": "进入预检追问",
+                    "expected_outcome": "补齐目标对象或执行范围后继续推进",
+                    "next_step": "等待用户补充后继续解析",
+                    "evidence": [],
+                },
+                watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
             )
             db.commit()
             db.refresh(session)
@@ -4860,6 +5968,26 @@ def post_agent_message(
             last_message_request_id=client_message_id,
             last_message_ack_at=accepted_at,
         )
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                page_context=page_context,
+                browser_context=browser_context,
+                working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
+                dialog_state=current_dialog_state,
+                user_content=payload.content,
+                fallback_watch_task_id=session_last_task_id,
+            ),
+            execution={"stage": "failed", "step_kind": "answer", "step_label": "模型调用失败", "waiting_for": None, "missing_slots": [], "pending_ui_actions": []},
+            explanation={
+                "reason": "当前轮次在模型推理或决策解析阶段失败",
+                "decision_summary": _humanize_ai_error(exc),
+                "expected_outcome": "向用户暴露明确错误，等待重试或调整目标",
+                "next_step": "等待用户重试或切换目标",
+                "evidence": [],
+            },
+            watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+        )
         message = _append_message(
             db,
             session=session,
@@ -4871,6 +5999,11 @@ def post_agent_message(
                 "browser_context": browser_context,
                 "working_context": sanitize_json_value(
                     session.working_context_json if isinstance(session.working_context_json, dict) else {}
+                ),
+                **_build_message_state_metadata(
+                    decision_summary=_humanize_ai_error(exc),
+                    evidence=[],
+                    state_delta=state_delta,
                 ),
             },
         )
@@ -4969,6 +6102,7 @@ def post_agent_step(
     if session is None or not is_active_public_session_status(str(session.status or "")):
         raise AgentConflictError("当前没有可继续的 haor 会话", stage="step")
     _raise_if_session_running(session, stage="step")
+    session_last_task_id = _session_last_task_id(session)
 
     browser_context = _normalize_browser_context(payload.browser_context.model_dump(mode="json"))
     page_context = _page_context_from_browser_context(browser_context)
@@ -5006,6 +6140,24 @@ def post_agent_step(
             browser_context=browser_context,
             last_user_intent=str(current_browser_runtime.get("last_user_intent") or "") or None,
         )
+        _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                page_context=page_context,
+                browser_context=browser_context,
+                working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
+                fallback_watch_task_id=session_last_task_id,
+            ),
+            execution={"stage": "idle", "step_kind": "answer", "step_label": "没有待继续的页面动作", "waiting_for": None, "missing_slots": [], "pending_ui_actions": []},
+            explanation={
+                "reason": "当前没有挂起的 UI 动作需要继续处理",
+                "decision_summary": "忽略空的页面动作回执",
+                "expected_outcome": "保持会话空闲态",
+                "next_step": "等待新的消息或页面动作请求",
+                "evidence": [],
+            },
+            watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+        )
         db.commit()
         db.refresh(session)
         _emit_session_snapshot(stream_emitter, session)
@@ -5018,13 +6170,38 @@ def post_agent_step(
             last_user_intent=str(current_browser_runtime.get("last_user_intent") or "") or None,
             last_error="已达到站内代理动作上限，请重新描述更具体的目标。",
         )
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                page_context=page_context,
+                browser_context=browser_context,
+                working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
+                fallback_watch_task_id=session_last_task_id,
+            ),
+            execution={"stage": "failed", "step_kind": "ui", "step_label": "页面动作达到上限", "waiting_for": None, "missing_slots": [], "pending_ui_actions": []},
+            explanation={
+                "reason": "页面动作链路超过最大步数",
+                "decision_summary": "已达到站内代理动作上限",
+                "expected_outcome": "要求用户缩小目标范围",
+                "next_step": "等待用户给出更具体的操作目标",
+                "evidence": [],
+            },
+            watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+        )
         message = _append_message(
             db,
             session=session,
             role="assistant",
             message_type="error",
             content="站内代理动作已达到上限，请直接给我更具体的下一步目标。",
-            payload_json={"browser_context": browser_context},
+            payload_json={
+                "browser_context": browser_context,
+                **_build_message_state_metadata(
+                    decision_summary="已达到站内代理动作上限",
+                    evidence=[],
+                    state_delta=state_delta,
+                ),
+            },
         )
         db.commit()
         db.refresh(session)
@@ -5091,6 +6268,33 @@ def post_agent_step(
         last_step_request_id=step_request_id,
         last_step_ack_at=accepted_at,
     )
+    _apply_agent_state_patch(
+        session,
+        focus=_resolve_agent_focus(
+            page_context=page_context,
+            browser_context=browser_context,
+            working_context=working_context,
+            dialog_state=current_dialog_state,
+            user_content=last_user_intent,
+            fallback_watch_task_id=session_last_task_id,
+        ),
+        execution={
+            "stage": "resolving_ui_feedback",
+            "step_kind": "ui",
+            "step_label": "处理页面动作回执",
+            "waiting_for": None,
+            "missing_slots": [],
+            "pending_ui_actions": [],
+        },
+        explanation={
+            "reason": "已收到页面动作结果，正在决定下一步",
+            "decision_summary": _summarize_ui_results(ui_action_results),
+            "expected_outcome": "结合页面反馈继续推进当前目标",
+            "next_step": "重新进入代理决策",
+            "evidence": [],
+        },
+        watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+    )
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -5139,13 +6343,41 @@ def post_agent_step(
             last_user_intent=last_user_intent,
             last_error=_humanize_ai_error(exc),
         )
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                page_context=page_context,
+                browser_context=browser_context,
+                working_context=working_context,
+                dialog_state=current_dialog_state,
+                user_content=last_user_intent,
+                fallback_watch_task_id=session_last_task_id,
+            ),
+            execution={"stage": "failed", "step_kind": "ui", "step_label": "页面动作续处理失败", "waiting_for": None, "missing_slots": [], "pending_ui_actions": []},
+            explanation={
+                "reason": "页面动作回执后的模型决策失败",
+                "decision_summary": _humanize_ai_error(exc),
+                "expected_outcome": "向用户暴露错误并等待下一步指令",
+                "next_step": "等待用户重试、继续或新开目标",
+                "evidence": [],
+            },
+            watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+        )
         message = _append_message(
             db,
             session=session,
             role="assistant",
             message_type="error",
             content=f"当前 AI 调用失败：{_humanize_ai_error(exc)}",
-            payload_json={"error": _humanize_ai_error(exc), "browser_context": browser_context},
+            payload_json={
+                "error": _humanize_ai_error(exc),
+                "browser_context": browser_context,
+                **_build_message_state_metadata(
+                    decision_summary=_humanize_ai_error(exc),
+                    evidence=[],
+                    state_delta=state_delta,
+                ),
+            },
         )
         db.commit()
         db.refresh(session)
@@ -5392,6 +6624,14 @@ def approve_agent_session(
     session.dialog_state_json = {}
     session.browser_runtime_json = {}
     session.last_task_id = task_run.id
+    sync_agent_task_watch_state(
+        session,
+        task_id=task_run.id,
+        status=task_run.status.value if hasattr(task_run.status, "value") else str(task_run.status),
+        message=task_run.message,
+        action=sanitized_actions[0] if sanitized_actions else {},
+        watching=True,
+    )
     session.updated_at = _now()
     db.add(session)
     _append_message(

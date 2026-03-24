@@ -173,6 +173,25 @@ def consume_runtime_bootstrap_marker() -> bool:
     return True
 
 
+def read_runtime_env_snapshot() -> dict[str, str]:
+    runtime_env = _ensure_runtime_env_file()
+    snapshot: dict[str, str] = {}
+    for raw_line in runtime_env.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in raw_line:
+            continue
+        key, value = raw_line.split("=", 1)
+        snapshot[key.strip()] = value.strip()
+    return snapshot
+
+
+def read_runtime_env_value(key: str, fallback: str = "") -> str:
+    value = read_runtime_env_snapshot().get(key)
+    if value is None:
+        return str(fallback or "")
+    return str(value).strip()
+
+
 runtime_env_bootstrap_state = ensure_runtime_encryption_key()
 migrate_legacy_llm_api_key_storage()
 

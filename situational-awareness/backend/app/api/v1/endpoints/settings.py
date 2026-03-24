@@ -31,7 +31,10 @@ router = APIRouter()
 def get_platform_settings(
     _: User = Depends(get_admin_user),
 ) -> PlatformSettingsRead:
-    return get_platform_settings_read()
+    try:
+        return get_platform_settings_read()
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.put("", response_model=PlatformSettingsApplyResponse, status_code=status.HTTP_202_ACCEPTED)

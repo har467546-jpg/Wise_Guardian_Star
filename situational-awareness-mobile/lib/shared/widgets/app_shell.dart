@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/auth/session_controller.dart';
 import '../../core/network/api_client.dart';
+import '../../core/network/websocket_client.dart';
 import '../../features/alerts/device_alert_stream.dart';
 import '../../features/alerts/device_abnormal_notifications.dart';
 import '../../features/haor/mobile_haor_assistant.dart';
@@ -123,6 +124,7 @@ class _AppShellState extends ConsumerState<AppShell>
     final stream = DeviceAlertStreamController(
       token: token,
       onAlert: _handleRealtimeDeviceAlert,
+      webSocketClient: ref.read(webSocketClientProvider),
     );
     _deviceAlertStream = stream;
     await stream.start();

@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
@@ -9,6 +8,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/auth/session_controller.dart';
 import '../../core/network/api_client.dart';
+import '../../core/network/websocket_client.dart';
 import '../../shared/models/agent_models.dart';
 import '../../shared/models/app_models.dart';
 import 'haor_runtime.dart';
@@ -41,7 +41,7 @@ class _MobileHaorAssistantLauncherState
   final Map<String, String> _turnPhases = <String, String>{};
 
   StreamSubscription<dynamic>? _socketSubscription;
-  WebSocket? _socket;
+  WebSocketConnection? _socket;
   Timer? _reconnectTimer;
   bool _providerOpen = false;
   int _reconnectAttempts = 0;
@@ -280,14 +280,18 @@ class _MobileHaorAssistantLauncherState
     }
 
     try {
-      final socket = await WebSocket.connect(buildHaorSessionStreamUrl(token));
+      final socket =
+          await ref.read(webSocketClientProvider).connectAuthenticated(
+                uri: buildHaorSessionStreamUri(),
+                token: token,
+              );
       if (!_providerOpen) {
         await socket.close();
         return;
       }
       _socket = socket;
       _reconnectAttempts = 0;
-      _socketSubscription = socket.listen(
+      _socketSubscription = socket.stream.listen(
         _handleSocketData,
         onError: (_) {
           if (!mounted) {
@@ -665,10 +669,10 @@ class _MobileHaorAssistantLauncherState
   }
 
   bool _sendSocketFrame(Map<String, dynamic> frame) {
-    if (_socket == null || _socket!.readyState != WebSocket.open) {
+    if (_socket == null || !_socket!.isOpen) {
       return false;
     }
-    _socket!.add(jsonEncode(frame));
+    _socket!.addJson(frame.cast<String, Object?>());
     return true;
   }
 

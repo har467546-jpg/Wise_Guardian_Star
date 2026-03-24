@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -14,10 +15,17 @@ const _configuredApiBaseUrlFromEnv = String.fromEnvironment(
   'API_BASE_URL',
   defaultValue: '',
 );
+const _allowInsecureDevTransportFromEnv = String.fromEnvironment(
+  'ALLOW_INSECURE_DEV_TRANSPORT',
+  defaultValue: '',
+);
 const _apiBaseUrlStorageKey = 'sa.api_base_url';
 const _androidEmulatorApiBaseUrl = 'http://10.0.2.2:8000/api/v1';
 const _loopbackApiBaseUrl = 'http://127.0.0.1:8000/api/v1';
 String _runtimeApiBaseUrl = '';
+
+bool get allowInsecureDevTransport =>
+    kDebugMode && _isTruthy(_allowInsecureDevTransportFromEnv);
 
 String _defaultApiBaseUrl() {
   if (Platform.isAndroid) {
@@ -26,31 +34,56 @@ String _defaultApiBaseUrl() {
   return _loopbackApiBaseUrl;
 }
 
-String _normalizeApiBaseUrl(String value) {
-  final normalized = value.trim().replaceFirst(RegExp(r'/$'), '');
-  if (normalized.isEmpty) {
-    return _defaultApiBaseUrl();
-  }
-  final parsed = Uri.tryParse(normalized);
-  if (parsed == null || parsed.host.isEmpty || !parsed.hasScheme) {
-    return _defaultApiBaseUrl();
-  }
-  if (parsed.scheme != 'http' && parsed.scheme != 'https') {
-    return _defaultApiBaseUrl();
-  }
-  return parsed.toString();
-}
-
 String get configuredApiBaseUrl {
   final runtime = _runtimeApiBaseUrl.trim();
   if (runtime.isNotEmpty) {
     return runtime;
   }
-  final configured = _configuredApiBaseUrlFromEnv.trim();
-  if (configured.isNotEmpty) {
-    return _normalizeApiBaseUrl(configured);
+  return resolveConfiguredApiBaseUrl(
+    configured: _configuredApiBaseUrlFromEnv,
+    isAndroid: Platform.isAndroid,
+    allowInsecureDevTransport: allowInsecureDevTransport,
+  );
+}
+
+String resolveConfiguredApiBaseUrl({
+  required String configured,
+  required bool isAndroid,
+  required bool allowInsecureDevTransport,
+}) {
+  final fallbackBase =
+      isAndroid ? _androidEmulatorApiBaseUrl : _loopbackApiBaseUrl;
+  final configuredValue = configured.trim();
+  final rawBase = configuredValue.isNotEmpty ? configuredValue : fallbackBase;
+  return _normalizeApiBaseUrl(
+    rawBase,
+    fallback: fallbackBase,
+    allowInsecureDevTransport: allowInsecureDevTransport,
+  );
+}
+
+String _normalizeApiBaseUrl(
+  String value, {
+  String? fallback,
+  bool? allowInsecureDevTransport,
+}) {
+  final fallbackBase = fallback ?? _defaultApiBaseUrl();
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) {
+    return fallbackBase;
   }
-  return _defaultApiBaseUrl();
+  final allowInsecureTransport = _shouldAllowInsecureTransport(
+    trimmed,
+    explicitOptIn: allowInsecureDevTransport ?? false,
+  );
+  try {
+    return _normalizeApiBaseUrlUri(
+      trimmed,
+      allowInsecureDevTransport: allowInsecureTransport,
+    ).toString();
+  } catch (_) {
+    return fallbackBase;
+  }
 }
 
 Uri _buildApiUri(
@@ -97,11 +130,19 @@ Future<void> initializeConfiguredApiBaseUrl() async {
       : (_configuredApiBaseUrlFromEnv.trim().isNotEmpty
             ? _configuredApiBaseUrlFromEnv
             : _defaultApiBaseUrl());
-  _runtimeApiBaseUrl = _normalizeApiBaseUrl(nextValue);
+  _runtimeApiBaseUrl = resolveConfiguredApiBaseUrl(
+    configured: nextValue,
+    isAndroid: Platform.isAndroid,
+    allowInsecureDevTransport: allowInsecureDevTransport,
+  );
 }
 
 Future<void> persistConfiguredApiBaseUrl(String baseUrl) async {
-  final normalized = _normalizeApiBaseUrl(baseUrl);
+  final normalized = resolveConfiguredApiBaseUrl(
+    configured: baseUrl,
+    isAndroid: Platform.isAndroid,
+    allowInsecureDevTransport: allowInsecureDevTransport,
+  );
   final prefs = await SharedPreferences.getInstance();
   await prefs.setString(_apiBaseUrlStorageKey, normalized);
   _runtimeApiBaseUrl = normalized;
@@ -255,28 +296,141 @@ Future<String?> synchronizeApiBaseUrlForRef(
   return resolved;
 }
 
-String buildHaorSessionStreamUrl(String token) {
-  final parsed = Uri.parse(configuredApiBaseUrl);
-  final scheme = parsed.scheme == 'https' ? 'wss' : 'ws';
-  return _buildApiUri(
-    configuredApiBaseUrl,
-    const ['agent', 'haor', 'session', 'stream'],
-    queryParameters: {'token': token},
-  ).replace(
-    scheme: scheme,
-  ).toString();
+Uri buildHaorSessionStreamUri() {
+  return buildApiWebSocketUri('/api/v1/agent/haor/session/stream');
 }
 
-String buildDeviceAlertStreamUrl(String token) {
-  final parsed = Uri.parse(configuredApiBaseUrl);
-  final scheme = parsed.scheme == 'https' ? 'wss' : 'ws';
-  return _buildApiUri(
-    configuredApiBaseUrl,
-    const ['mobile', 'alerts', 'stream'],
-    queryParameters: {'token': token},
-  ).replace(
-    scheme: scheme,
-  ).toString();
+Uri buildDeviceAlertStreamUri() {
+  return buildApiWebSocketUri('/api/v1/mobile/alerts/stream');
+}
+
+Uri buildApiWebSocketUri(String streamPath, {String? baseUrl}) {
+  final rawBase = (baseUrl ?? configuredApiBaseUrl).trim();
+  final allowInsecureTransport = _shouldAllowInsecureTransport(
+    rawBase,
+    explicitOptIn: allowInsecureDevTransport,
+  );
+  final normalizedBase = _normalizeApiBaseUrlUri(
+    rawBase,
+    allowInsecureDevTransport: allowInsecureTransport,
+  );
+  final wsScheme = normalizedBase.scheme == 'https' ? 'wss' : 'ws';
+  if (wsScheme == 'ws' && !allowInsecureTransport) {
+    throw StateError(
+      'Insecure WebSocket transport is disabled. '
+      'Use a wss:// API endpoint or enable ALLOW_INSECURE_DEV_TRANSPORT=true in debug builds.',
+    );
+  }
+  final normalizedPath = _normalizeStreamPath(streamPath);
+  return normalizedBase.replace(
+    scheme: wsScheme,
+    path: normalizedPath,
+    query: null,
+    fragment: null,
+  );
+}
+
+bool _shouldAllowInsecureTransport(
+  String rawBase, {
+  required bool explicitOptIn,
+}) {
+  if (explicitOptIn) {
+    return true;
+  }
+  if (!kDebugMode) {
+    return false;
+  }
+  final parsed = Uri.tryParse(rawBase.trim());
+  if (parsed == null || parsed.scheme != 'http') {
+    return false;
+  }
+  return _isLocalOrPrivateHost(parsed.host);
+}
+
+bool _isLocalOrPrivateHost(String host) {
+  final normalizedHost = host.trim().toLowerCase();
+  if (normalizedHost.isEmpty) {
+    return false;
+  }
+  if (normalizedHost == 'localhost') {
+    return true;
+  }
+  final address = InternetAddress.tryParse(normalizedHost);
+  if (address == null) {
+    return false;
+  }
+  if (address.type == InternetAddressType.IPv4) {
+    final octets =
+        normalizedHost.split('.').map(int.parse).toList(growable: false);
+    final first = octets[0];
+    final second = octets[1];
+    return first == 10 ||
+        first == 127 ||
+        (first == 192 && second == 168) ||
+        (first == 172 && second >= 16 && second <= 31) ||
+        (first == 169 && second == 254);
+  }
+  return normalizedHost == '::1' ||
+      normalizedHost.startsWith('fc') ||
+      normalizedHost.startsWith('fd') ||
+      normalizedHost.startsWith('fe80:');
+}
+
+Uri _normalizeApiBaseUrlUri(
+  String rawBase, {
+  required bool allowInsecureDevTransport,
+}) {
+  final trimmed = rawBase.trim();
+  if (trimmed.isEmpty) {
+    throw StateError(
+      'API_BASE_URL is empty. '
+      'Provide an https:// endpoint or explicitly enable insecure debug transport.',
+    );
+  }
+  final parsed = Uri.parse(trimmed);
+  if (!parsed.hasScheme ||
+      (parsed.scheme != 'http' && parsed.scheme != 'https')) {
+    throw StateError('API_BASE_URL must start with http:// or https://.');
+  }
+  if (!allowInsecureDevTransport && parsed.scheme != 'https') {
+    throw StateError(
+      'Insecure HTTP transport is disabled. '
+      'Use an https:// API endpoint or enable ALLOW_INSECURE_DEV_TRANSPORT=true in debug builds.',
+    );
+  }
+  return parsed.replace(
+    path: _normalizeApiBasePath(parsed.path),
+    query: null,
+    fragment: null,
+  );
+}
+
+String _normalizeApiBasePath(String path) {
+  final sanitized = path.replaceAll(RegExp(r'/+$'), '');
+  if (sanitized.isEmpty) {
+    return '/api/v1';
+  }
+  return sanitized.startsWith('/') ? sanitized : '/$sanitized';
+}
+
+String _normalizeStreamPath(String path) {
+  final trimmed = path.trim();
+  if (trimmed.isEmpty) {
+    throw StateError('WebSocket stream path cannot be empty.');
+  }
+  return trimmed.startsWith('/') ? trimmed : '/$trimmed';
+}
+
+bool _isTruthy(String raw) {
+  switch (raw.trim().toLowerCase()) {
+    case '1':
+    case 'true':
+    case 'yes':
+    case 'on':
+      return true;
+    default:
+      return false;
+  }
 }
 
 class ApiClient {

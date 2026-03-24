@@ -12,7 +12,7 @@ export type PlatformSecretFieldState = {
   editable: boolean;
 };
 
-export type LLMProvider = "mock" | "openai" | "openai_compatible" | "ollama_remote";
+export type LLMProvider = "mock" | "openai" | "minimax" | "custom_proxy" | "ollama_remote";
 export type LLMWireAPI = "auto" | "chat_completions" | "responses";
 
 export type PlatformSettings = {

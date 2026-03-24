@@ -32,6 +32,7 @@ AgentUIActionType = Literal[
 AgentStreamClientType = Literal["hello", "message", "ui_step", "approve_plan", "ping"]
 AgentStreamServerType = Literal[
     "session_snapshot",
+    "agent_state",
     "turn_started",
     "action_update",
     "assistant_message_start",
@@ -221,6 +222,7 @@ class AgentSessionRead(BaseModel):
     dialog_state_json: dict[str, Any] = Field(default_factory=dict)
     pending_plan_json: dict[str, Any] = Field(default_factory=dict)
     browser_runtime_json: dict[str, Any] = Field(default_factory=dict)
+    agent_state_json: dict[str, Any] = Field(default_factory=dict)
     last_task_id: str | None = None
     messages: list[AgentMessageRead] = Field(default_factory=list)
     created_at: datetime
@@ -269,6 +271,12 @@ class AgentStreamClientEnvelope(BaseModel):
 class AgentSessionSnapshotEvent(BaseModel):
     type: Literal["session_snapshot"] = "session_snapshot"
     session: AgentSessionRead
+
+
+class AgentStateEvent(BaseModel):
+    type: Literal["agent_state"] = "agent_state"
+    agent_state_json: dict[str, Any] = Field(default_factory=dict)
+    turn_id: str | None = None
 
 
 class AgentTurnStartedEvent(BaseModel):

@@ -28,6 +28,7 @@ import type {
   AgentPlanPendingEvent,
   AgentProposedAction,
   AgentSession,
+  AgentState,
   AgentStreamServerEnvelope,
   AgentTaskUpdateEvent,
   AgentTurnDoneEvent,
@@ -219,6 +220,81 @@ function toPendingUiActions(session: AgentSession | null): AgentUIAction[] {
 
 function toBrowserRuntime(session: AgentSession | null): Record<string, unknown> {
   return session?.browser_runtime_json && typeof session.browser_runtime_json === "object" ? session.browser_runtime_json : {};
+}
+
+function toAgentState(session: AgentSession | null): AgentState {
+  return session?.agent_state_json && typeof session.agent_state_json === "object" ? session.agent_state_json : {};
+}
+
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function firstNonEmptyString(values: Array<unknown>): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+function summarizeAgentEvidence(state: AgentState): string {
+  const explanation = toRecord(state.explanation);
+  const evidence = Array.isArray(explanation.evidence) ? explanation.evidence : [];
+  const labels = evidence
+    .map((item) => {
+      const record = toRecord(item);
+      const toolName = typeof record.tool_name === "string" ? record.tool_name.trim() : "";
+      const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+      return firstNonEmptyString([toolName, summary]);
+    })
+    .filter(Boolean);
+  return labels.slice(0, 3).join(" / ");
+}
+
+function buildAgentStatePanel(state: AgentState, task: TaskRunDetail | null): { target: string; stage: string; evidence: string; next: string } {
+  const focus = toRecord(state.focus);
+  const execution = toRecord(state.execution);
+  const explanation = toRecord(state.explanation);
+  const watch = toRecord(state.watch);
+
+  const target = firstNonEmptyString([
+    focus.summary,
+    toRecord(focus.resolved).summary,
+    task?.id ? `任务 ${task.id}` : "",
+    "当前会话",
+  ]);
+
+  const stage = firstNonEmptyString([
+    execution.step_label,
+    execution.stage,
+    typeof task?.status === "string" ? statusLabel(task.status) : "",
+    "空闲",
+  ]);
+
+  const evidence = firstNonEmptyString([
+    explanation.reason,
+    typeof explanation.decision_summary === "string" ? explanation.decision_summary : "",
+    summarizeAgentEvidence(state),
+    "暂无额外依据",
+  ]);
+
+  const missingSlots = Array.isArray(execution.missing_slots)
+    ? execution.missing_slots.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+  const next = firstNonEmptyString([
+    execution.waiting_for,
+    missingSlots.length ? `缺少字段：${missingSlots.join("、")}` : "",
+    explanation.next_step,
+    Boolean(watch.watching) && typeof watch.primary_task_id === "string" && watch.primary_task_id.trim().length > 0
+      ? `正在跟踪任务 ${watch.primary_task_id.trim()}`
+      : "",
+    typeof explanation.expected_outcome === "string" ? explanation.expected_outcome : "",
+    "等待新的输入",
+  ]);
+
+  return { target, stage, evidence, next };
 }
 
 function isTerminalTaskStatus(status: string | null | undefined) {
@@ -487,6 +563,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
 
   const pageContext = useMemo(() => buildPageContext(pathname, searchParams), [pathname, searchParams]);
   const browserRuntime = useMemo(() => toBrowserRuntime(session), [session]);
+  const agentState = useMemo(() => toAgentState(session), [session]);
   const proposedActions = useMemo(() => toProposedActions(session), [session]);
   const visiblePendingUserMessages = useMemo(
     () => reconcilePendingUserMessages(pendingUserMessages, session?.messages || []),
@@ -550,6 +627,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
 
   const pendingPlanDetails = useMemo(() => buildPendingPlanDetails(proposedActions), [proposedActions]);
   const liveTaskDigest = useMemo(() => (task ? buildTaskDigest(task, taskEvents) : ""), [task, taskEvents]);
+  const agentStatePanel = useMemo(() => buildAgentStatePanel(agentState, task), [agentState, task]);
 
   const headerStatus = useMemo(() => {
     const waitingApproval = normalizeStatus(session?.status) === "waiting_approval";
@@ -939,6 +1017,9 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
         }
         return;
       }
+      case "agent_state":
+        setSession((current) => (current ? { ...current, agent_state_json: event.agent_state_json } : current));
+        return;
       case "turn_started":
         handleStreamTurnStarted(event);
         return;
@@ -1743,6 +1824,25 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
             </header>
 
             <div className="haor-chat-body">
+              <section className="haor-chat-state-panel" aria-label="haor 当前状态">
+                <div className="haor-chat-state-card">
+                  <span className="haor-chat-state-label">当前目标</span>
+                  <strong className="haor-chat-state-value">{agentStatePanel.target}</strong>
+                </div>
+                <div className="haor-chat-state-card">
+                  <span className="haor-chat-state-label">当前阶段</span>
+                  <strong className="haor-chat-state-value">{agentStatePanel.stage}</strong>
+                </div>
+                <div className="haor-chat-state-card">
+                  <span className="haor-chat-state-label">依据</span>
+                  <strong className="haor-chat-state-value">{agentStatePanel.evidence}</strong>
+                </div>
+                <div className="haor-chat-state-card">
+                  <span className="haor-chat-state-label">等待 / 下一步</span>
+                  <strong className="haor-chat-state-value">{agentStatePanel.next}</strong>
+                </div>
+              </section>
+
               <div ref={feedViewportRef} className="haor-chat-feed">
                 {loading && !session?.messages?.length ? (
                   <div className="haor-chat-empty">

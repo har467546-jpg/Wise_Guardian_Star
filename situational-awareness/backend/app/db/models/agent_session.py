@@ -24,6 +24,7 @@ class AgentSession(Base):
     dialog_state_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     pending_plan_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     browser_runtime_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    agent_state_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     last_task_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("task_runs.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(

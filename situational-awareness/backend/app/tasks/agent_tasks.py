@@ -9,8 +9,11 @@ from app.db.session import SessionLocal
 from app.repositories.task_repo import get_task_run, update_task_run
 from app.services.haor_agent_service import (
     append_agent_task_message,
+    build_auto_action_task_followup_content,
     execute_approved_action,
+    has_agent_task_followup_message,
     mark_agent_session_interrupted,
+    sync_agent_task_watch_state,
     wait_for_child_task,
 )
 from app.tasks.task_runtime import (
@@ -35,6 +38,7 @@ def run_agent_orchestrate_task(
     task_run_id: str,
     session_id: str,
 ) -> str:
+    actions: list[dict] = []
     try:
         with tracked_task(task_run_id, celery_task_id=self.request.id, retry_count=self.request.retries):
             ensure_task_not_canceled(task_run_id)
@@ -163,6 +167,14 @@ def run_agent_orchestrate_task(
                     session.dialog_state_json = {}
                     session.browser_runtime_json = {}
                     session.last_task_id = task_run_id
+                    sync_agent_task_watch_state(
+                        session,
+                        task_id=task_run_id,
+                        status=TaskExecutionStatus.SUCCESS.value,
+                        message="haor 编排任务完成",
+                        action=actions[0] if actions else {},
+                        watching=False,
+                    )
                     db.add(session)
                     append_agent_task_message(
                         db,
@@ -191,6 +203,14 @@ def run_agent_orchestrate_task(
                 session.dialog_state_json = {}
                 session.browser_runtime_json = {}
                 session.last_task_id = task_run_id
+                sync_agent_task_watch_state(
+                    session,
+                    task_id=task_run_id,
+                    status=TaskExecutionStatus.FAILURE.value,
+                    message=str(exc),
+                    action=actions[0] if actions else {},
+                    watching=False,
+                )
                 db.add(session)
                 append_agent_task_message(
                     db,
@@ -206,3 +226,48 @@ def run_agent_orchestrate_task(
         set_task_failure(task_run_id, self.request.retries, str(exc))
         raise
     return task_run_id
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.agent_tasks.run_agent_auto_followup_task",
+    max_retries=0,
+)
+def run_agent_auto_followup_task(
+    self: Task,
+    session_id: str,
+    child_task_id: str,
+    action: dict | None = None,
+) -> str:
+    normalized_action = action if isinstance(action, dict) else {}
+    try:
+        child_summary = wait_for_child_task(child_task_id, interval_seconds=0.5)
+    except Exception as exc:
+        child_summary = {
+            "task_id": child_task_id,
+            "status": TaskExecutionStatus.FAILURE.value,
+            "message": str(exc),
+            "error_json": {"error": str(exc)},
+        }
+
+    with SessionLocal() as db:
+        session = db.get(AgentSession, session_id)
+        if session is None:
+            return child_task_id
+        if has_agent_task_followup_message(session, task_id=child_task_id):
+            return child_task_id
+        message_type, content = build_auto_action_task_followup_content(normalized_action, child_summary)
+        append_agent_task_message(
+            db,
+            session_id=session_id,
+            content=content,
+            payload_json={
+                "task_id": child_task_id,
+                "auto_followup": True,
+                "action": normalized_action,
+                "child_task": child_summary,
+            },
+            message_type=message_type,
+        )
+        db.commit()
+    return child_task_id

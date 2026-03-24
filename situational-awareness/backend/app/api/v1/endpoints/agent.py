@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSo
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from app.api.websocket_auth import authenticate_websocket
 from app.api.deps import get_admin_user, get_current_user, get_db_session
 from app.core.security import SecurityError, decode_access_token
 from app.db.models.enums import UserRole
@@ -130,19 +131,15 @@ def interrupt_haor_session(
 
 @router.websocket("/haor/session/stream")
 async def stream_haor_session(websocket: WebSocket) -> None:
-    token = websocket.query_params.get("token") or ""
-    if not token:
-        await websocket.close(code=1008, reason="missing token")
-        return
     with SessionLocal() as db:
-        user = _resolve_websocket_user(db, token)
+        user = await authenticate_websocket(
+            websocket,
+            resolve_actor=lambda token: _resolve_websocket_user(db, token),
+        )
         if user is None:
-            await websocket.close(code=1008, reason="unauthorized")
             return
         user_id = user.id
         user_role = str(user.role.value if hasattr(user.role, "value") else user.role)
-
-    await websocket.accept()
     task_monitor: asyncio.Task[None] | None = None
     monitored_task_id = ""
 
@@ -172,6 +169,7 @@ async def stream_haor_session(websocket: WebSocket) -> None:
 
     initial_session = await asyncio.to_thread(_load_ws_session_snapshot, user_id)
     await websocket.send_json({"type": "session_snapshot", "session": initial_session})
+    await websocket.send_json({"type": "agent_state", "agent_state_json": initial_session.get("agent_state_json") or {}})
     await ensure_task_monitor(initial_session.get("last_task_id"))
 
     try:
@@ -195,6 +193,7 @@ async def stream_haor_session(websocket: WebSocket) -> None:
             if frame.type == "hello":
                 snapshot = await asyncio.to_thread(_load_ws_session_snapshot, user_id)
                 await websocket.send_json({"type": "session_snapshot", "session": snapshot})
+                await websocket.send_json({"type": "agent_state", "agent_state_json": snapshot.get("agent_state_json") or {}})
                 await ensure_task_monitor(snapshot.get("last_task_id"))
                 continue
 
@@ -416,6 +415,38 @@ def _load_ws_session_snapshot(user_id: str) -> dict:
         return get_or_create_agent_session(db, user=user).model_dump(mode="json")
 
 
+def _session_snapshot_has_task_followup(session_snapshot: dict | None, *, task_id: str) -> bool:
+    if not isinstance(session_snapshot, dict):
+        return False
+    messages = session_snapshot.get("messages") if isinstance(session_snapshot.get("messages"), list) else []
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        return False
+    for item in reversed(messages[-12:]):
+        if not isinstance(item, dict):
+            continue
+        payload = item.get("payload_json") if isinstance(item.get("payload_json"), dict) else {}
+        if str(payload.get("task_id") or "").strip() != normalized_task_id:
+            continue
+        if payload.get("auto_followup"):
+            return True
+    return False
+
+
+async def _await_terminal_session_snapshot(user_id: str, task_id: str, initial_snapshot: dict | None) -> dict:
+    latest_snapshot = initial_snapshot if isinstance(initial_snapshot, dict) else {}
+    if _session_snapshot_has_task_followup(latest_snapshot, task_id=task_id):
+        return latest_snapshot
+    for _ in range(5):
+        await asyncio.sleep(0.3)
+        candidate = await asyncio.to_thread(_load_ws_session_snapshot, user_id)
+        if isinstance(candidate, dict) and candidate:
+            latest_snapshot = candidate
+            if _session_snapshot_has_task_followup(candidate, task_id=task_id):
+                return candidate
+    return latest_snapshot
+
+
 async def _stream_task_updates(websocket: WebSocket, *, user_id: str, task_id: str) -> None:
     last_signature: tuple[str, int | None, str | None] | None = None
     try:
@@ -449,7 +480,11 @@ async def _stream_task_updates(websocket: WebSocket, *, user_id: str, task_id: s
             if payload.get("terminal"):
                 session_snapshot = payload.get("session_snapshot")
                 if isinstance(session_snapshot, dict) and session_snapshot:
+                    session_snapshot = await _await_terminal_session_snapshot(user_id, task_id, session_snapshot)
                     await websocket.send_json({"type": "session_snapshot", "session": session_snapshot})
+                    await websocket.send_json(
+                        {"type": "agent_state", "agent_state_json": session_snapshot.get("agent_state_json") or {}}
+                    )
                 return
             await asyncio.sleep(0.8)
     except asyncio.CancelledError:

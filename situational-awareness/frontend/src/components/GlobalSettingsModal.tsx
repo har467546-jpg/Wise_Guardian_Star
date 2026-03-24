@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Button, Card, Form, Input, InputNumber, Modal, Select, Space, Spin, Switch, Tabs, Tag, Typography, message } from "antd";
+import { AutoComplete, Button, Card, Form, Input, InputNumber, Modal, Select, Space, Spin, Switch, Tabs, Tag, Typography, message } from "antd";
 
 import type { StoredUserRole } from "@/lib/auth";
 import { getPlatformSettings, listPlatformAIModels, updatePlatformSettings, validatePlatformAISettings } from "@/services/api";
@@ -129,6 +129,88 @@ const READ_ONLY_DEFAULTS: PlatformSettingsInput = {
   access_token_expire_minutes: 480,
 };
 
+type LLMProviderMeta = {
+  title: string;
+  description: string;
+  baseUrlLabel: string;
+  baseUrlExtra: string;
+  baseUrlPlaceholder: string;
+  apiKeyLabel: string;
+  apiKeyExtra: string;
+  defaultBaseUrl: string;
+  defaultWireApi: LLMWireAPI;
+  requireBaseUrl: boolean;
+  wireApiHint?: string;
+};
+
+const OPENAI_STYLE_ENDPOINT_SUFFIXES = ["/models", "/responses", "/chat/completions"] as const;
+const OLLAMA_ENDPOINT_SUFFIXES = ["/api/tags", "/api/generate"] as const;
+
+const LLM_PROVIDER_META: Record<LLMProvider, LLMProviderMeta> = {
+  mock: {
+    title: "Mock 回退模式",
+    description: "不连接外部模型，系统会直接返回模板化摘要，适合作为离线兜底。",
+    baseUrlLabel: "Base URL",
+    baseUrlExtra: "Mock 模式不会使用该地址，但会保留已填写的配置，便于后续切换。",
+    baseUrlPlaceholder: "https://api.openai.com/v1",
+    apiKeyLabel: "API Key",
+    apiKeyExtra: "Mock 模式不会使用该密钥，但可以提前保存以便后续切换。",
+    defaultBaseUrl: "",
+    defaultWireApi: "responses",
+    requireBaseUrl: false,
+  },
+  openai: {
+    title: "OpenAI 官方接口",
+    description: "适用于直接连接 OpenAI 官方服务，可选覆盖官方 Base URL。",
+    baseUrlLabel: "Base URL",
+    baseUrlExtra: "留空或只填域名时会自动规范为 https://api.openai.com/v1。",
+    baseUrlPlaceholder: "https://api.openai.com/v1",
+    apiKeyLabel: "OpenAI API Key",
+    apiKeyExtra: "填写新值时更新，留空则保持当前配置。",
+    defaultBaseUrl: "https://api.openai.com/v1",
+    defaultWireApi: "responses",
+    requireBaseUrl: false,
+  },
+  minimax: {
+    title: "MiniMax 官方接口",
+    description: "适用于 MiniMax 官方 OpenAI 兼容接口，默认走中国区地址。",
+    baseUrlLabel: "MiniMax Base URL",
+    baseUrlExtra: "留空或只填域名时会自动规范为 https://api.minimaxi.com/v1；国际区可改为 https://api.minimax.io/v1。",
+    baseUrlPlaceholder: "https://api.minimaxi.com/v1",
+    apiKeyLabel: "MiniMax API Key",
+    apiKeyExtra: "填写新值时更新，留空则保持当前配置。",
+    defaultBaseUrl: "https://api.minimaxi.com/v1",
+    defaultWireApi: "chat_completions",
+    requireBaseUrl: false,
+    wireApiHint: "MiniMax 官方兼容接口默认建议使用 `Chat Completions`；如上游后续支持更完整的 Responses，再手动切换。",
+  },
+  custom_proxy: {
+    title: "自定义中转",
+    description: "适用于 One API、New API、vLLM、LM Studio、企业自建中转等 OpenAI 兼容接口。",
+    baseUrlLabel: "兼容接口 Base URL",
+    baseUrlExtra: "可只填域名或根路径，系统会自动补齐为兼容接口根地址，例如 https://relay.example.com/v1。验证连接或获取模型列表后，如上游实际不需要 /v1，会自动回填实际地址。",
+    baseUrlPlaceholder: "https://relay.example.com/v1",
+    apiKeyLabel: "中转 API Key",
+    apiKeyExtra: "多数中转或兼容网关会要求 API Key；本地兼容服务可留空。",
+    defaultBaseUrl: "",
+    defaultWireApi: "auto",
+    requireBaseUrl: true,
+    wireApiHint: "自定义中转默认建议使用 `自动协商`，优先尝试 Responses，失败后再回退到 Chat Completions。",
+  },
+  ollama_remote: {
+    title: "远程 Ollama",
+    description: "适用于接入远程 Ollama 服务或带鉴权的 Ollama 反向代理。",
+    baseUrlLabel: "Ollama 地址",
+    baseUrlExtra: "可直接填写主机和端口，例如 192.168.1.10:11434；系统会自动补 http://，不会追加 /v1。",
+    baseUrlPlaceholder: "http://ollama.example.com:11434",
+    apiKeyLabel: "访问令牌（可选）",
+    apiKeyExtra: "标准 Ollama 默认不需要 API Key；如果前面挂了网关或反向代理，可在此填写令牌。",
+    defaultBaseUrl: "",
+    defaultWireApi: "responses",
+    requireBaseUrl: true,
+  },
+};
+
 function toFormValues(payload: PlatformSettings): PlatformSettingsInput {
   return {
     runner_poll_interval_seconds: payload.runner_poll_interval_seconds,
@@ -173,6 +255,79 @@ function toFormValues(payload: PlatformSettings): PlatformSettingsInput {
   };
 }
 
+function stripEndpointSuffix(baseUrl: string, suffixes: readonly string[]) {
+  const normalized = String(baseUrl || "").trim().replace(/\/+$/, "");
+  for (const suffix of suffixes) {
+    if (normalized.endsWith(suffix)) {
+      const trimmed = normalized.slice(0, -suffix.length).replace(/\/+$/, "");
+      return trimmed || normalized;
+    }
+  }
+  return normalized;
+}
+
+function matchesKnownEndpointPath(value: string, suffixes: readonly string[]) {
+  const normalized = String(value || "").trim();
+  if (!normalized || normalized.includes("://")) {
+    return false;
+  }
+  const normalizedPath = `/${normalized.replace(/^\/+/, "").replace(/\/+$/, "")}`;
+  return suffixes.includes(normalizedPath as (typeof suffixes)[number]);
+}
+
+function normalizeLLMBaseUrl(provider: LLMProvider, value: string, options?: { fillDefaultWhenEmpty?: boolean }) {
+  const meta = LLM_PROVIDER_META[provider] || LLM_PROVIDER_META.mock;
+  const fillDefaultWhenEmpty = Boolean(options?.fillDefaultWhenEmpty);
+  let raw = String(value || "").trim();
+  if (!raw) {
+    return fillDefaultWhenEmpty ? meta.defaultBaseUrl : "";
+  }
+  if (provider === "ollama_remote" && matchesKnownEndpointPath(raw, OLLAMA_ENDPOINT_SUFFIXES)) {
+    raw = fillDefaultWhenEmpty ? meta.defaultBaseUrl : "";
+  }
+  if (provider !== "ollama_remote" && matchesKnownEndpointPath(raw, OPENAI_STYLE_ENDPOINT_SUFFIXES)) {
+    raw = fillDefaultWhenEmpty ? meta.defaultBaseUrl : "";
+  }
+  if (!raw) {
+    return "";
+  }
+
+  const defaultScheme = provider === "ollama_remote" ? "http" : "https";
+  const withScheme = raw.includes("://") ? raw : `${defaultScheme}://${raw.replace(/^\/+/, "")}`;
+
+  try {
+    const parsed = new URL(withScheme);
+    let normalized = `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, "")}`;
+    if (provider === "ollama_remote") {
+      return stripEndpointSuffix(normalized, OLLAMA_ENDPOINT_SUFFIXES);
+    }
+    if (provider === "custom_proxy" && raw.includes("://") && !parsed.pathname.replace(/\/+$/, "")) {
+      return `${parsed.protocol}//${parsed.host}`;
+    }
+    normalized = stripEndpointSuffix(normalized, OPENAI_STYLE_ENDPOINT_SUFFIXES);
+    const normalizedUrl = new URL(normalized);
+    const normalizedPath = normalizedUrl.pathname.replace(/\/+$/, "");
+    if (!normalizedPath) {
+      return `${normalizedUrl.protocol}//${normalizedUrl.host}/v1`;
+    }
+    return `${normalizedUrl.protocol}//${normalizedUrl.host}${normalizedPath}`;
+  } catch {
+    return raw;
+  }
+}
+
+function usesProviderDefaultBaseUrl(provider: LLMProvider, value: string) {
+  const meta = LLM_PROVIDER_META[provider] || LLM_PROVIDER_META.mock;
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return true;
+  }
+  if (!meta.defaultBaseUrl) {
+    return false;
+  }
+  return normalizeLLMBaseUrl(provider, raw, { fillDefaultWhenEmpty: true }) === meta.defaultBaseUrl;
+}
+
 function SectionCard({ title, children }: { title: string; children: ReactNode }) {
   return (
     <Card className="panel-card global-settings-form-card" size="small" title={title}>
@@ -182,57 +337,26 @@ function SectionCard({ title, children }: { title: string; children: ReactNode }
 }
 
 function getLLMProviderMeta(provider: LLMProvider) {
-  if (provider === "openai") {
-    return {
-      title: "OpenAI 官方接口",
-      description: "适用于直接连接 OpenAI 官方服务，可选覆盖官方 Base URL。",
-      baseUrlLabel: "Base URL",
-      baseUrlExtra: "留空时默认使用 https://api.openai.com/v1；如接入网关可填写自定义地址。",
-      baseUrlPlaceholder: "https://api.openai.com/v1",
-      apiKeyLabel: "OpenAI API Key",
-      apiKeyExtra: "填写新值时更新，留空则保持当前配置。",
-    };
-  }
-  if (provider === "openai_compatible") {
-    return {
-      title: "OpenAI 兼容 / 自定义中转",
-      description: "适用于 One API、New API、vLLM、LM Studio、企业自建中转等 OpenAI 兼容接口。",
-      baseUrlLabel: "兼容接口 Base URL",
-      baseUrlExtra: "必须填写完整的兼容接口根地址，例如 https://relay.example.com/v1。",
-      baseUrlPlaceholder: "https://relay.example.com/v1",
-      apiKeyLabel: "中转 API Key",
-      apiKeyExtra: "多数中转或兼容网关会要求 API Key；本地兼容服务可留空。",
-    };
-  }
-  if (provider === "ollama_remote") {
-    return {
-      title: "远程 Ollama",
-      description: "适用于接入远程 Ollama 服务或带鉴权的 Ollama 反向代理。",
-      baseUrlLabel: "Ollama 地址",
-      baseUrlExtra: "必须填写远程 Ollama 的访问地址，例如 http://192.168.1.10:11434。",
-      baseUrlPlaceholder: "http://ollama.example.com:11434",
-      apiKeyLabel: "访问令牌（可选）",
-      apiKeyExtra: "标准 Ollama 默认不需要 API Key；如果前面挂了网关或反向代理，可在此填写令牌。",
-    };
-  }
-  return {
-    title: "Mock 回退模式",
-    description: "不连接外部模型，系统会直接返回模板化摘要，适合作为离线兜底。",
-    baseUrlLabel: "Base URL",
-    baseUrlExtra: "Mock 模式不会使用该地址，但会保留已填写的配置，便于后续切换。",
-    baseUrlPlaceholder: "https://api.openai.com/v1",
-    apiKeyLabel: "API Key",
-    apiKeyExtra: "Mock 模式不会使用该密钥，但可以提前保存以便后续切换。",
-  };
+  return LLM_PROVIDER_META[provider] || LLM_PROVIDER_META.mock;
 }
 
 function getLLMWireApiOptions(provider: LLMProvider): Array<{ label: string; value: LLMWireAPI }> {
-  const autoLabel = provider === "ollama_remote" ? "自动协商（Ollama 固定走远程生成）" : "自动协商（优先 Responses）";
-  return [
-    { label: "Responses API（推荐）", value: "responses" },
-    { label: autoLabel, value: "auto" },
-    { label: "Chat Completions", value: "chat_completions" },
-  ];
+  const labels: Record<LLMWireAPI, string> = {
+    responses: "Responses API",
+    auto: provider === "ollama_remote" ? "自动协商（Ollama 固定走远程生成）" : "自动协商",
+    chat_completions: "Chat Completions",
+  };
+  const preferredOrder: Record<LLMProvider, LLMWireAPI[]> = {
+    mock: ["responses", "auto", "chat_completions"],
+    openai: ["responses", "auto", "chat_completions"],
+    minimax: ["chat_completions", "auto", "responses"],
+    custom_proxy: ["auto", "responses", "chat_completions"],
+    ollama_remote: ["responses", "auto", "chat_completions"],
+  };
+  return preferredOrder[provider].map((value) => ({
+    label: value === LLM_PROVIDER_META[provider].defaultWireApi ? `${labels[value]}（默认）` : labels[value],
+    value,
+  }));
 }
 
 function toModelSelectOptions(models: PlatformAIModelOption[]): Array<{ label: string; value: string }> {
@@ -312,6 +436,7 @@ function SwitchField(props: {
 export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalSettingsModalProps) {
   const isAdmin = userRole === "admin";
   const [form] = Form.useForm<PlatformSettingsInput>();
+  const previousProviderRef = useRef<LLMProvider>(READ_ONLY_DEFAULTS.llm_provider);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [validatingAI, setValidatingAI] = useState(false);
@@ -327,7 +452,7 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
   const llmWireApi = Form.useWatch("llm_wire_api", form) ?? READ_ONLY_DEFAULTS.llm_wire_api;
   const modelSelectOptions = toModelSelectOptions(aiDiscoveredModels);
   const requiresDiscoveredModel = llmProvider !== "mock";
-  const requireBaseUrl = llmProvider === "openai_compatible" || llmProvider === "ollama_remote";
+  const requireBaseUrl = llmProviderMeta.requireBaseUrl;
 
   useEffect(() => {
     if (!open) {
@@ -340,6 +465,7 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
       setSettingsState(null);
       setAiDiscoveredModels([]);
       form.setFieldsValue(READ_ONLY_DEFAULTS);
+      previousProviderRef.current = READ_ONLY_DEFAULTS.llm_provider;
       return;
     }
     let canceled = false;
@@ -351,6 +477,7 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
         }
         setSettingsState(payload);
         form.setFieldsValue(toFormValues(payload));
+        previousProviderRef.current = payload.llm_provider;
         setAiDiscoveredModels([]);
       })
       .catch((error) => {
@@ -370,6 +497,20 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
   }, [form, isAdmin, open]);
 
   const apiKeyState = settingsState?.llm_api_key;
+  const normalizeBaseUrlForProvider = (
+    provider: LLMProvider,
+    value: string,
+    options: { fillDefaultWhenEmpty: boolean },
+  ) => normalizeLLMBaseUrl(provider, value, { fillDefaultWhenEmpty: options.fillDefaultWhenEmpty });
+  const syncResolvedBaseUrl = (resolvedBaseUrl: string | null | undefined) => {
+    const normalized = String(resolvedBaseUrl || "").trim();
+    if (!normalized) {
+      return;
+    }
+    if (normalized !== String(form.getFieldValue("llm_base_url") || "").trim()) {
+      form.setFieldValue("llm_base_url", normalized);
+    }
+  };
 
   const revealValidationError = (error: unknown, fallbackTab: SettingsTabKey = activeTab) => {
     const errorFields =
@@ -398,6 +539,13 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
         ...form.getFieldsValue(true),
         ...validatedValues,
       };
+      const normalizedBaseUrl = normalizeBaseUrlForProvider(values.llm_provider, values.llm_base_url, {
+        fillDefaultWhenEmpty: !getLLMProviderMeta(values.llm_provider).requireBaseUrl,
+      });
+      if (normalizedBaseUrl !== values.llm_base_url) {
+        form.setFieldValue("llm_base_url", normalizedBaseUrl);
+        values.llm_base_url = normalizedBaseUrl;
+      }
       setSaving(true);
       const payload: PlatformSettingsInput = {
         ...values,
@@ -433,6 +581,7 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
         clear_llm_api_key: Boolean(form.getFieldValue("clear_llm_api_key")),
       };
       const result = await validatePlatformAISettings(payload);
+      syncResolvedBaseUrl(result.resolved_base_url);
       setAiValidationResult(result);
       if (result.ok) {
         message.success(result.message);
@@ -465,16 +614,10 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
         clear_llm_api_key: Boolean(form.getFieldValue("clear_llm_api_key")),
       };
       const result = await listPlatformAIModels(payload);
+      syncResolvedBaseUrl(result.resolved_base_url);
       setAiModelListResult(result);
       setAiDiscoveredModels(result.models);
       if (result.ok) {
-        const currentModelValue = String(form.getFieldValue("llm_model") || "").trim();
-        const currentModelStillValid = result.models.some((item) => item.id === currentModelValue);
-        if (result.models.length === 0) {
-          form.setFieldValue("llm_model", undefined);
-        } else if (!currentModelStillValid) {
-          form.setFieldValue("llm_model", result.models[0].id);
-        }
         message.success(result.message);
       } else {
         message.error(result.message);
@@ -531,14 +674,29 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
               form.setFieldValue("clear_llm_api_key", false);
             }
             const changedKeys = Object.keys(changedValues || {});
+            if ("llm_provider" in changedValues) {
+              const nextProvider = changedValues.llm_provider as LLMProvider;
+              const previousProvider = previousProviderRef.current;
+              const currentBaseUrl = String(form.getFieldValue("llm_base_url") || "");
+              const nextProviderMeta = getLLMProviderMeta(nextProvider);
+              const shouldReplaceBaseUrl = !currentBaseUrl.trim() || usesProviderDefaultBaseUrl(previousProvider, currentBaseUrl);
+              const nextBaseUrl = shouldReplaceBaseUrl ? nextProviderMeta.defaultBaseUrl : currentBaseUrl;
+              if (nextBaseUrl !== currentBaseUrl) {
+                form.setFieldValue("llm_base_url", nextBaseUrl);
+              }
+              form.setFieldValue("llm_wire_api", nextProviderMeta.defaultWireApi);
+              if (nextProvider === "mock") {
+                form.setFieldValue("llm_model", READ_ONLY_DEFAULTS.llm_model);
+              } else {
+                form.setFieldValue("llm_model", undefined);
+              }
+              previousProviderRef.current = nextProvider;
+            }
             if (changedKeys.some((key) => AI_FIELD_KEYS.has(key))) {
               setAiValidationResult(null);
               setAiModelListResult(null);
               if (changedKeys.some((key) => ["llm_provider", "llm_base_url", "llm_wire_api", "llm_api_key", "clear_llm_api_key"].includes(key))) {
                 setAiDiscoveredModels([]);
-                if ((form.getFieldValue("llm_provider") as LLMProvider | undefined) !== "mock") {
-                  form.setFieldValue("llm_model", undefined);
-                }
               }
             }
           }}
@@ -659,7 +817,8 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
                         options={[
                           { label: "Mock", value: "mock" },
                           { label: "OpenAI", value: "openai" },
-                          { label: "OpenAI 兼容 / 自定义中转", value: "openai_compatible" },
+                          { label: "MiniMax", value: "minimax" },
+                          { label: "自定义中转", value: "custom_proxy" },
                           { label: "远程 Ollama", value: "ollama_remote" },
                         ]}
                       />
@@ -677,7 +836,18 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
                           },
                         ]}
                       >
-                        <Input disabled={disabled} placeholder={llmProviderMeta.baseUrlPlaceholder} />
+                        <Input
+                          disabled={disabled}
+                          placeholder={llmProviderMeta.baseUrlPlaceholder}
+                          onBlur={(event) => {
+                            const normalized = normalizeBaseUrlForProvider(llmProvider, event.target.value, {
+                              fillDefaultWhenEmpty: !llmProviderMeta.requireBaseUrl,
+                            });
+                            if (normalized !== event.target.value) {
+                              form.setFieldValue("llm_base_url", normalized);
+                            }
+                          }}
+                        />
                       </Form.Item>
                       <SelectField
                         name="llm_wire_api"
@@ -685,48 +855,39 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
                         disabled={disabled || llmProvider === "mock" || llmProvider === "ollama_remote"}
                         options={getLLMWireApiOptions(llmProvider)}
                       />
-                      {llmProvider === "openai_compatible" ? (
+                      {llmProviderMeta.wireApiHint ? (
                         <Typography.Text type="secondary" style={{ display: "block", marginTop: -4, marginBottom: 12 }}>
-                          兼容中转默认优先走 `Responses API`；如果上游只兼容旧协议，再切回 `Chat Completions`。
+                          {llmProviderMeta.wireApiHint}
                         </Typography.Text>
                       ) : null}
                       <Form.Item
                         name="llm_model"
                         label="模型名称"
-                        extra="请先获取上游 /models 列表，再从返回结果中选择模型。"
+                        extra="可直接手动输入模型名称；若已获取上游模型列表，这里会显示建议项供选择。"
                         rules={[
                           {
                             validator: async (_, value) => {
                               const normalized = String(value || "").trim();
                               if (!normalized) {
-                                throw new Error(requiresDiscoveredModel ? "请先获取模型列表并选择模型" : "模型名称不能为空");
-                              }
-                              if (!requiresDiscoveredModel) {
-                                return;
-                              }
-                              if (aiDiscoveredModels.length === 0) {
-                                throw new Error("请先点击“获取模型列表”再选择模型");
-                              }
-                              if (!aiDiscoveredModels.some((item) => item.id === normalized)) {
-                                throw new Error("模型名称必须从已获取的模型列表中选择");
+                                throw new Error("模型名称不能为空");
                               }
                             },
                           },
                         ]}
                       >
-                        <Select
-                          showSearch
-                          optionFilterProp="label"
+                        <AutoComplete
                           disabled={disabled}
-                          loading={loadingModels}
                           options={modelSelectOptions}
-                          placeholder={loadingModels ? "正在获取模型列表" : "先获取模型列表后选择"}
-                          notFoundContent={requiresDiscoveredModel ? "请先获取模型列表" : "暂无可选模型"}
-                        />
+                          filterOption={(inputValue, option) => String(option?.label || "").toLowerCase().includes(inputValue.toLowerCase())}
+                        >
+                          <Input
+                            placeholder={llmProvider === "mock" ? "输入模型名称" : "输入模型名称，例如 MiniMax-M2.5"}
+                          />
+                        </AutoComplete>
                       </Form.Item>
                       {requiresDiscoveredModel && settingsState?.llm_model && aiDiscoveredModels.length === 0 ? (
                         <Typography.Text type="secondary" style={{ display: "block", marginTop: -4, marginBottom: 12 }}>
-                          当前已保存模型：{settingsState.llm_model}。如需保存或验证，请先重新获取模型列表并选择。
+                          当前已保存模型：{settingsState.llm_model}。切换 Provider 或重新获取模型列表后，如模型不在返回结果中，需要重新选择。
                         </Typography.Text>
                       ) : null}
                       {isAdmin ? (

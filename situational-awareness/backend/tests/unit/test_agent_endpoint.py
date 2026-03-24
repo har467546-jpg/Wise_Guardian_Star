@@ -299,6 +299,7 @@ def test_post_haor_message_returns_clarifying_message_when_context_missing(monke
 def test_post_haor_message_returns_mock_reply_without_plan(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "mock")
 
     response = client.post(
         "/api/v1/agent/haor/session/messages",
@@ -474,7 +475,7 @@ def test_post_haor_message_returns_409_when_another_message_turn_is_pending(monk
 
 def test_model_clarifying_message_keeps_session_active(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
         return (
@@ -512,6 +513,7 @@ def test_model_clarifying_message_keeps_session_active(monkeypatch) -> None:  # 
 def test_post_haor_message_uses_fixed_scan_followup_and_affirm_executes_scan(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    monkeypatch.setattr(haor_agent_service.celery_app, "send_task", lambda *args, **kwargs: None)
     call_count = {"value": 0}
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -580,9 +582,56 @@ def test_post_haor_message_uses_fixed_scan_followup_and_affirm_executes_scan(mon
         assert session.dialog_state_json == {}
 
 
+def test_post_haor_message_falls_back_to_scan_when_model_returns_non_json(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, _ = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
+    monkeypatch.setattr(haor_agent_service.celery_app, "send_task", lambda *args, **kwargs: None)
+
+    class _FakeProvider:
+        def generate(self, _request):
+            return "好的，我会开始扫描 192.168.10.0/24 网段，并实时同步进度。"
+
+    class _FakeDelayResult:
+        id = "celery-scan-task-fallback"
+
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_build_runtime_provider",
+        lambda: SimpleNamespace(provider=_FakeProvider()),
+    )
+    monkeypatch.setattr(
+        haor_agent_service.run_asset_scan_task,
+        "delay",
+        lambda *args, **kwargs: _FakeDelayResult(),
+    )
+
+    response = client.post(
+        "/api/v1/agent/haor/session/messages",
+        json={
+            "content": "帮我扫描192.168.10.0/24网段，并实时告诉我进度",
+            "page_context": _page_context(pathname="/"),
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["last_task_id"] is not None
+    assert body["messages"][-2]["message_type"] == "action_update"
+    assert body["messages"][-1]["message_type"] == "text"
+    assert "已开始扫描 192.168.10.0/24" in body["messages"][-1]["content"]
+    assert body["messages"][-1]["message_type"] != "error"
+
+    with SessionLocal() as db:
+        task = db.get(TaskRun, body["last_task_id"])
+        assert task is not None
+        assert task.task_type == TaskType.ASSET_SCAN
+        assert task.celery_task_id == "celery-scan-task-fallback"
+
+
 def test_post_haor_message_can_continue_pending_clarification(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
         dialog_state = kwargs.get("dialog_state") or {}
@@ -656,7 +705,7 @@ def test_post_haor_message_can_continue_pending_clarification(monkeypatch) -> No
 
 def test_post_haor_message_reuses_recent_focus_for_followup_question(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
     call_count = {"value": 0}
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -708,7 +757,7 @@ def test_post_haor_message_reuses_recent_focus_for_followup_question(monkeypatch
 
 def test_post_haor_message_can_prepare_plan_from_recent_focus(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
     call_count = {"value": 0}
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -769,7 +818,7 @@ def test_post_haor_message_can_prepare_plan_from_recent_focus(monkeypatch) -> No
 
 def test_post_haor_message_keeps_recent_focus_after_ai_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
     call_count = {"value": 0}
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -828,7 +877,7 @@ def test_post_haor_message_keeps_recent_focus_after_ai_error(monkeypatch) -> Non
 
 def test_post_haor_message_can_cancel_pending_clarification(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
     call_count = {"value": 0}
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -876,7 +925,7 @@ def test_post_haor_message_can_cancel_pending_clarification(monkeypatch) -> None
 
 def test_admin_message_can_enter_waiting_approval(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
         return (
@@ -917,7 +966,7 @@ def test_admin_message_can_enter_waiting_approval(monkeypatch) -> None:  # type:
 
 def test_post_haor_message_can_drive_ui_step_roundtrip(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
     call_count = {"value": 0}
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -993,7 +1042,7 @@ def test_post_haor_message_can_drive_ui_step_roundtrip(monkeypatch) -> None:  # 
 
 def test_admin_message_can_auto_execute_safe_action(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
     asset_id = f"asset-{uuid4().hex[:8]}"
     task_id = f"task-{uuid4().hex[:8]}"
     asset_ip = f"192.168.{int(uuid4().hex[:2], 16) % 200}.{int(uuid4().hex[2:4], 16) % 200 + 1}"
@@ -1031,6 +1080,7 @@ def test_admin_message_can_auto_execute_safe_action(monkeypatch) -> None:  # typ
         )
 
     monkeypatch.setattr(haor_agent_service, "_run_agent_loop", _fake_run_loop)
+    monkeypatch.setattr(haor_agent_service.celery_app, "send_task", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         haor_agent_service,
         "execute_approved_action",
@@ -1061,7 +1111,7 @@ def test_admin_message_can_auto_execute_safe_action(monkeypatch) -> None:  # typ
 
 def test_post_haor_message_surfaces_upstream_5xx_detail(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
         request = httpx.Request("POST", "https://example.test/v1/responses")
@@ -1091,7 +1141,7 @@ def test_post_haor_message_surfaces_upstream_5xx_detail(monkeypatch) -> None:  #
 
 def test_post_haor_message_summarizes_html_502_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
         request = httpx.Request("POST", "https://risingsun.top/v1/responses")
@@ -1532,6 +1582,7 @@ def test_interrupt_haor_session_returns_409_when_no_running_task(monkeypatch) ->
 def test_soft_focus_is_not_rebound_by_page_change_without_reference(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "mock")
 
     first = client.post(
         "/api/v1/agent/haor/session/messages",
@@ -1558,6 +1609,7 @@ def test_soft_focus_is_not_rebound_by_page_change_without_reference(monkeypatch)
 def test_soft_focus_allows_switching_target_in_same_session(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "mock")
 
     client.post(
         "/api/v1/agent/haor/session/messages",
@@ -1593,6 +1645,139 @@ def test_haor_websocket_stream_sends_initial_snapshot(monkeypatch) -> None:  # t
     assert payload["session"]["agent_id"] == "haor"
 
 
+def test_haor_websocket_stream_sends_initial_agent_state(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    token = _build_ws_token(user_id, UserRole.ADMIN)
+
+    with SessionLocal() as db:
+        db.add(
+            AgentSession(
+                id=str(uuid4()),
+                agent_id="haor",
+                user_id=user_id,
+                status="active",
+                route_context_json=_page_context(pathname="/assets/asset-1", asset_id="asset-1"),
+                working_context_json={"asset_id": "asset-1"},
+                dialog_state_json={},
+                pending_plan_json={},
+                browser_runtime_json={},
+                agent_state_json={
+                    "focus": {
+                        "focus_type": "asset",
+                        "resolved": {"asset_id": "asset-1", "summary": "资产 asset-1", "source": "page_context"},
+                        "confidence": 0.91,
+                        "source": "page_context",
+                    },
+                    "execution": {
+                        "stage": "reading",
+                        "step_kind": "read",
+                        "waiting_for": [],
+                        "missing_slots": [],
+                    },
+                    "explanation": {
+                        "reason": "继续分析当前资产",
+                        "evidence": [{"tool_name": "get_asset_detail", "summary": "资产详情已加载"}],
+                        "expected_outcome": "输出风险摘要",
+                    },
+                    "watch": {
+                        "primary_task_id": "task-1",
+                        "related_task_ids": [],
+                        "status": "running",
+                    },
+                },
+            )
+        )
+        db.commit()
+
+    with client.websocket_connect(f"/api/v1/agent/haor/session/stream?token={token}") as websocket:
+        snapshot = websocket.receive_json()
+        state_event = websocket.receive_json()
+
+    assert snapshot["type"] == "session_snapshot"
+    assert state_event["type"] == "agent_state"
+    assert state_event["agent_state_json"]["focus"]["resolved"]["asset_id"] == "asset-1"
+    assert state_event["agent_state_json"]["watch"]["primary_task_id"] == "task-1"
+
+
+def test_haor_websocket_stream_accepts_auth_frame_without_query_token(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    token = _build_ws_token(user_id, UserRole.ADMIN)
+
+    with client.websocket_connect("/api/v1/agent/haor/session/stream") as websocket:
+        websocket.send_json({"type": "auth", "token": token})
+        payload = websocket.receive_json()
+
+    assert payload["type"] == "session_snapshot"
+    assert payload["session"]["agent_id"] == "haor"
+
+
+def test_haor_websocket_hello_refreshes_agent_state(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    token = _build_ws_token(user_id, UserRole.ADMIN)
+
+    with SessionLocal() as db:
+        session = AgentSession(
+            id=str(uuid4()),
+            agent_id="haor",
+            user_id=user_id,
+            status="active",
+            route_context_json=_page_context(pathname="/assets/asset-1", asset_id="asset-1"),
+            working_context_json={"asset_id": "asset-1"},
+            dialog_state_json={},
+            pending_plan_json={},
+            browser_runtime_json={},
+            agent_state_json={
+                "focus": {
+                    "focus_type": "asset",
+                    "resolved": {"asset_id": "asset-1", "summary": "资产 asset-1", "source": "page_context"},
+                    "confidence": 0.72,
+                    "source": "page_context",
+                },
+                "execution": {
+                    "stage": "waiting_user",
+                    "step_kind": "clarify",
+                    "waiting_for": ["asset_id"],
+                    "missing_slots": ["asset_id"],
+                },
+                "explanation": {
+                    "reason": "需要确认目标资产",
+                    "evidence": [],
+                    "expected_outcome": "补齐资产标识",
+                },
+                "watch": {
+                    "primary_task_id": None,
+                    "related_task_ids": [],
+                    "status": "idle",
+                },
+            },
+        )
+        db.add(session)
+        db.commit()
+
+    with client.websocket_connect(f"/api/v1/agent/haor/session/stream?token={token}") as websocket:
+        initial = websocket.receive_json()
+        initial_state = websocket.receive_json()
+        websocket.send_json(
+            {
+                "type": "hello",
+                "page_context": _page_context(pathname="/assets/asset-1", asset_id="asset-1"),
+                "browser_context": _browser_context(pathname="/assets/asset-1", asset_id="asset-1"),
+            }
+        )
+        refreshed_snapshot = websocket.receive_json()
+        refreshed_state = websocket.receive_json()
+
+    assert initial["type"] == "session_snapshot"
+    assert initial_state["type"] == "agent_state"
+    assert initial_state["agent_state_json"]["execution"]["step_kind"] == "clarify"
+    assert refreshed_snapshot["type"] == "session_snapshot"
+    assert refreshed_state["type"] == "agent_state"
+    assert refreshed_state["agent_state_json"]["focus"]["resolved"]["asset_id"] == "asset-1"
+
+
 def test_haor_websocket_hello_refreshes_snapshot_without_starting_turn(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, user_id = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
@@ -1600,6 +1785,7 @@ def test_haor_websocket_hello_refreshes_snapshot_without_starting_turn(monkeypat
 
     with client.websocket_connect(f"/api/v1/agent/haor/session/stream?token={token}") as websocket:
         initial = websocket.receive_json()
+        initial_state = websocket.receive_json()
         websocket.send_json(
             {
                 "type": "hello",
@@ -1608,15 +1794,19 @@ def test_haor_websocket_hello_refreshes_snapshot_without_starting_turn(monkeypat
             }
         )
         refreshed = websocket.receive_json()
+        refreshed_state = websocket.receive_json()
 
     assert initial["type"] == "session_snapshot"
+    assert initial_state["type"] == "agent_state"
     assert refreshed["type"] == "session_snapshot"
     assert refreshed["session"]["session_id"] == initial["session"]["session_id"]
+    assert refreshed_state["type"] == "agent_state"
 
 
 def test_haor_websocket_stream_message_turn_emits_deltas(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, user_id = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "mock")
     token = _build_ws_token(user_id, UserRole.ADMIN)
 
     with client.websocket_connect(f"/api/v1/agent/haor/session/stream?token={token}") as websocket:
@@ -1644,7 +1834,7 @@ def test_haor_websocket_stream_message_turn_emits_deltas(monkeypatch) -> None:  
 
 def test_haor_websocket_stream_message_turn_uses_provider_stream_reply(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, user_id = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
 
     def _fake_run_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
         return (
@@ -1687,13 +1877,13 @@ def test_haor_websocket_stream_message_turn_uses_provider_stream_reply(monkeypat
 
     deltas = [item["delta"] for item in events if item["type"] == "assistant_message_delta"]
     done_event = next(item for item in events if item["type"] == "assistant_message_done")
-    assert deltas == ["原生", "流式", "回复"]
+    assert deltas == ["原生流式回复"]
     assert done_event["message"]["content"] == "原生流式回复"
 
 
 def test_haor_websocket_ui_step_continues_turn_flow(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, user_id = _build_client()
-    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
     call_count = {"value": 0}
     step_request_id = "step-ws-1"
 

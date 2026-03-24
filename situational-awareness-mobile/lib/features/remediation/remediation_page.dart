@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -8,6 +7,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/auth/session_controller.dart';
 import '../../core/network/api_client.dart';
+import '../../core/network/websocket_client.dart';
 import '../../shared/models/app_models.dart';
 import '../../shared/widgets/adaptive_layout.dart';
 import '../../shared/widgets/app_widgets.dart';
@@ -240,8 +240,8 @@ class _RemediationWorkbenchPageState
   bool _sessionStreamHealthy = false;
   bool _taskStreamHealthy = false;
   Timer? _pollTimer;
-  WebSocket? _sessionSocket;
-  WebSocket? _taskSocket;
+  WebSocketConnection? _sessionSocket;
+  WebSocketConnection? _taskSocket;
   StreamSubscription<dynamic>? _sessionSubscription;
   StreamSubscription<dynamic>? _taskSubscription;
 
@@ -390,14 +390,16 @@ class _RemediationWorkbenchPageState
     _sessionStreamHealthy = false;
 
     try {
-      final socket = await WebSocket.connect(
-        _buildRemediationWebSocketUrl(
-          '/api/v1/remediation/sessions/${session.sessionId}/stream',
-          token,
-        ),
-      );
+      final socket =
+          await ref.read(webSocketClientProvider).connectAuthenticated(
+                uri: buildApiWebSocketUri(
+                  '/api/v1/remediation/sessions/${session.sessionId}/stream',
+                ),
+                token: token,
+              );
+      socket.pingInterval = const Duration(seconds: 20);
       _sessionSocket = socket;
-      _sessionSubscription = socket.listen(
+      _sessionSubscription = socket.stream.listen(
         (data) {
           _sessionStreamHealthy = true;
           _handleSessionStreamFrame(data);
@@ -425,14 +427,16 @@ class _RemediationWorkbenchPageState
     _taskStreamHealthy = false;
 
     try {
-      final socket = await WebSocket.connect(
-        _buildRemediationWebSocketUrl(
-          '/api/v1/remediation/tasks/$taskId/stream',
-          token,
-        ),
-      );
+      final socket =
+          await ref.read(webSocketClientProvider).connectAuthenticated(
+                uri: buildApiWebSocketUri(
+                  '/api/v1/remediation/tasks/$taskId/stream',
+                ),
+                token: token,
+              );
+      socket.pingInterval = const Duration(seconds: 20);
       _taskSocket = socket;
-      _taskSubscription = socket.listen(
+      _taskSubscription = socket.stream.listen(
         (data) {
           _taskStreamHealthy = true;
           _handleTaskStreamFrame(data);
@@ -855,18 +859,6 @@ class _RemediationWorkbenchPageState
       ),
     );
   }
-}
-
-String _buildRemediationWebSocketUrl(String streamPath, String token) {
-  final apiBase = Uri.parse(configuredApiBaseUrl);
-  final wsScheme = apiBase.scheme == 'https' ? 'wss' : 'ws';
-  return apiBase
-      .replace(
-        scheme: wsScheme,
-        path: streamPath,
-        queryParameters: {'token': token},
-      )
-      .toString();
 }
 
 class _RemediationAssetCard extends StatelessWidget {

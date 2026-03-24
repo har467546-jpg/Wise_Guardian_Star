@@ -47,6 +47,46 @@ export type AgentMessage = {
   proposed_write_actions: AgentProposedAction[];
 };
 
+export type AgentStateFocus = {
+  summary?: string | null;
+  focus_type?: string | null;
+  resolved?: Record<string, unknown>;
+  confidence?: string | null;
+  source?: string | null;
+};
+
+export type AgentStateExecution = {
+  stage?: string | null;
+  step_kind?: string | null;
+  step_label?: string | null;
+  waiting_for?: string | null;
+  missing_slots?: string[];
+  pending_ui_actions?: Array<Record<string, unknown>>;
+};
+
+export type AgentStateExplanation = {
+  reason?: string | null;
+  decision_summary?: string | null;
+  expected_outcome?: string | null;
+  next_step?: string | null;
+  evidence?: Array<Record<string, unknown>>;
+};
+
+export type AgentStateWatch = {
+  primary_task_id?: string | null;
+  related_task_ids?: string[];
+  status?: string | null;
+  watching?: boolean;
+  last_task_message?: string | null;
+};
+
+export type AgentState = {
+  focus?: AgentStateFocus;
+  execution?: AgentStateExecution;
+  explanation?: AgentStateExplanation;
+  watch?: AgentStateWatch;
+};
+
 export type AgentSession = {
   session_id: string;
   agent_id: string;
@@ -56,6 +96,7 @@ export type AgentSession = {
   dialog_state_json: Record<string, unknown>;
   pending_plan_json: Record<string, unknown>;
   browser_runtime_json: Record<string, unknown>;
+  agent_state_json: AgentState | Record<string, unknown>;
   last_task_id: string | null;
   messages: AgentMessage[];
   created_at: string;
@@ -260,6 +301,12 @@ export type AgentSessionSnapshotEvent = {
   session: AgentSession;
 };
 
+export type AgentStateEvent = {
+  type: "agent_state";
+  agent_state_json: Record<string, unknown>;
+  turn_id?: string | null;
+};
+
 export type AgentTurnStartedEvent = {
   type: "turn_started";
   turn_id: string;
@@ -331,6 +378,7 @@ export type AgentTurnDoneEvent = {
 
 export type AgentStreamServerEnvelope =
   | AgentSessionSnapshotEvent
+  | AgentStateEvent
   | AgentTurnStartedEvent
   | AgentAssistantMessageStartEvent
   | AgentAssistantDeltaEvent
