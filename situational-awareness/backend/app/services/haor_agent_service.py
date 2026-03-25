@@ -46,6 +46,7 @@ from app.schemas.agent import (
     AgentActionUpdateEvent,
     AgentApprovalRequest,
     AgentApprovalResponse,
+    AgentAttentionKind,
     AgentAssistantDeltaEvent,
     AgentAssistantMessageDoneEvent,
     AgentAssistantMessageStartEvent,
@@ -55,6 +56,7 @@ from app.schemas.agent import (
     AgentPlanPendingEvent,
     AgentProposedActionRead,
     AgentStateEvent,
+    AgentSessionSummaryRead,
     AgentSessionSnapshotEvent,
     AgentSessionRead,
     AgentTaskUpdateEvent,
@@ -84,6 +86,7 @@ from app.services.remediation_session_service import (
     get_remediation_session_read,
 )
 from app.services.task_observability_service import serialize_task_detail, serialize_task_event
+from app.tasks.scan_tasks import run_asset_scan_task
 from app.utils.local_asset import resolve_local_asset
 from app.utils.net import normalize_cidr
 from app.utils.sanitize import sanitize_json_value, sanitize_text
@@ -368,8 +371,20 @@ def _session_query(user_id: str):
     )
 
 
+def _summary_session_query(user_id: str):
+    return (
+        select(AgentSession)
+        .where(AgentSession.user_id == user_id, AgentSession.agent_id == AGENT_ID)
+        .order_by(AgentSession.updated_at.desc(), AgentSession.created_at.desc())
+    )
+
+
 def _load_recent_session(db: Session, *, user_id: str) -> AgentSession | None:
     return load_recent_session(query_builder=_session_query, db=db, user_id=user_id)
+
+
+def _load_recent_summary_session(db: Session, *, user_id: str) -> AgentSession | None:
+    return load_recent_session(query_builder=_summary_session_query, db=db, user_id=user_id)
 
 
 def _normalize_task_status(status: TaskExecutionStatus | str | None) -> str:
@@ -1780,6 +1795,42 @@ def serialize_agent_session(session: AgentSession) -> AgentSessionRead:
     )
 
 
+def _session_attention_kind(session: AgentSession | None) -> AgentAttentionKind:
+    if session is None:
+        return "none"
+    status = str(session.status or "").strip().lower()
+    browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    pending_ui_actions = browser_runtime.get("pending_ui_actions")
+    if status == "waiting_approval":
+        return "waiting_approval"
+    if isinstance(pending_ui_actions, list) and pending_ui_actions:
+        return "pending_ui_action"
+    if status == "running" and _sanitize_line(str(session.last_task_id or ""), max_length=64):
+        return "running_task"
+    return "none"
+
+
+def serialize_agent_session_summary(session: AgentSession | None) -> AgentSessionSummaryRead:
+    attention_kind = _session_attention_kind(session)
+    if session is None:
+        return AgentSessionSummaryRead(
+            has_attention=False,
+            attention_kind=attention_kind,
+            session_status=None,
+            last_task_id=None,
+            updated_at=None,
+        )
+    return AgentSessionSummaryRead(
+        has_attention=attention_kind != "none",
+        attention_kind=attention_kind,
+        session_status=session.status,
+        last_task_id=session.last_task_id,
+        updated_at=session.updated_at,
+    )
+
+
 _AgentStreamEmitter = Callable[[dict[str, Any]], None]
 
 
@@ -2575,6 +2626,14 @@ def get_or_create_agent_session(db: Session, *, user: User) -> AgentSessionRead:
         user=user,
     )
     return serialize_agent_session(session)
+
+
+def get_agent_session_summary(db: Session, *, user: User) -> AgentSessionSummaryRead:
+    session = _load_recent_summary_session(db, user_id=user.id)
+    if session is not None and _reconcile_session_runtime_state(db, session=session):
+        db.commit()
+        db.refresh(session)
+    return serialize_agent_session_summary(session)
 
 
 def reset_agent_session(db: Session, *, user: User) -> AgentSessionRead:
@@ -3944,7 +4003,11 @@ def _build_model_request(
             LLMMessage.from_text(
                 "user",
                 "已执行的只读工具结果如下，请基于这些结果继续回答当前用户问题：\n"
-                + json.dumps({"executed_read_tools": tool_traces[-8:]}, ensure_ascii=False, indent=2),
+                + json.dumps(
+                    sanitize_json_value({"executed_read_tools": tool_traces[-8:]}),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
             )
         )
     return LLMRequest(messages=messages)

@@ -176,6 +176,141 @@ def test_get_haor_session_creates_and_recovers_latest_session(monkeypatch) -> No
     assert first.json()["messages"] == []
 
 
+def test_get_haor_session_summary_returns_none_when_session_missing(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, _ = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+
+    response = client.get("/api/v1/agent/haor/summary")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "has_attention": False,
+        "attention_kind": "none",
+        "session_status": None,
+        "last_task_id": None,
+        "updated_at": None,
+    }
+
+
+def test_get_haor_session_summary_returns_waiting_approval_attention(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+
+    with SessionLocal() as db:
+        db.add(
+            AgentSession(
+                id=str(uuid4()),
+                agent_id="haor",
+                user_id=user_id,
+                status="waiting_approval",
+                route_context_json=_page_context(pathname="/"),
+                working_context_json={},
+                dialog_state_json={},
+                pending_plan_json={},
+                browser_runtime_json={},
+            )
+        )
+        db.commit()
+
+    response = client.get("/api/v1/agent/haor/summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["has_attention"] is True
+    assert payload["attention_kind"] == "waiting_approval"
+    assert payload["session_status"] == "waiting_approval"
+
+
+def test_get_haor_session_summary_returns_pending_ui_attention(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+
+    with SessionLocal() as db:
+        db.add(
+            AgentSession(
+                id=str(uuid4()),
+                agent_id="haor",
+                user_id=user_id,
+                status="active",
+                route_context_json=_page_context(pathname="/assets"),
+                working_context_json={},
+                dialog_state_json={},
+                pending_plan_json={},
+                browser_runtime_json={
+                    "pending_ui_actions": [
+                        {
+                            "action_id": "ui-action-1",
+                            "action_type": "navigate",
+                        }
+                    ]
+                },
+            )
+        )
+        db.commit()
+
+    response = client.get("/api/v1/agent/haor/summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["has_attention"] is True
+    assert payload["attention_kind"] == "pending_ui_action"
+    assert payload["session_status"] == "active"
+
+
+def test_get_haor_session_summary_returns_running_task_attention(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    session_id = str(uuid4())
+    task_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+
+    with SessionLocal() as db:
+        db.add(
+            TaskRun(
+                id=task_id,
+                task_type=TaskType.AGENT_ORCHESTRATE,
+                status=TaskExecutionStatus.RUNNING,
+                scope_type="agent_session",
+                scope_id=session_id,
+                progress=45,
+                message="正在执行 haor 编排",
+                retry_count=0,
+                result_json={},
+                error_json={},
+                created_at=now,
+                started_at=now,
+                finished_at=None,
+                updated_at=now,
+            )
+        )
+        db.add(
+            AgentSession(
+                id=session_id,
+                agent_id="haor",
+                user_id=user_id,
+                status="running",
+                route_context_json=_page_context(pathname="/"),
+                working_context_json={},
+                dialog_state_json={},
+                pending_plan_json={},
+                browser_runtime_json={},
+                last_task_id=task_id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.commit()
+
+    response = client.get("/api/v1/agent/haor/summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["has_attention"] is True
+    assert payload["attention_kind"] == "running_task"
+    assert payload["last_task_id"] == task_id
+    assert payload["session_status"] == "running"
+
+
 def test_get_haor_session_reconciles_stale_pending_ui_feedback_once(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, user_id = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")

@@ -11,6 +11,7 @@ import {
   approveHaorSession,
   buildHaorSessionStreamUrl,
   getHaorSession,
+  getHaorSessionSummary,
   getTask,
   getTaskEvents,
   interruptHaorSession,
@@ -28,6 +29,7 @@ import type {
   AgentPlanPendingEvent,
   AgentProposedAction,
   AgentSession,
+  AgentSessionSummary,
   AgentState,
   AgentStreamServerEnvelope,
   AgentTaskUpdateEvent,
@@ -41,6 +43,7 @@ import type { TaskEvent, TaskRunDetail } from "@/types/task";
 
 type HaorAgentDrawerProps = {
   userRole: StoredUserRole;
+  initialOpen?: boolean;
 };
 
 type StreamFeedItem = {
@@ -95,6 +98,14 @@ type PendingUiStepState = {
 const MESSAGE_TURN_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_FAIL_OPEN_TEXT = "上次页面动作未收到继续结果，已结束等待。你可以继续提问、重试，或新开会话。";
+const HAOR_SUMMARY_POLL_INTERVAL_MS = 15_000;
+const EMPTY_HAOR_SUMMARY: AgentSessionSummary = {
+  has_attention: false,
+  attention_kind: "none",
+  session_status: null,
+  last_task_id: null,
+  updated_at: null,
+};
 
 type ChatBubbleProps = {
   actions?: ReactNode;
@@ -216,6 +227,28 @@ function toPendingUiActions(session: AgentSession | null): AgentUIAction[] {
     return [];
   }
   return raw.filter((item): item is AgentUIAction => Boolean(item && typeof item === "object" && "action_type" in item)) as AgentUIAction[];
+}
+
+function deriveSessionSummary(session: AgentSession | null): AgentSessionSummary {
+  if (!session) {
+    return EMPTY_HAOR_SUMMARY;
+  }
+  const sessionStatus = normalizeStatus(session.status);
+  let attentionKind: AgentSessionSummary["attention_kind"] = "none";
+  if (sessionStatus === "waiting_approval") {
+    attentionKind = "waiting_approval";
+  } else if (toPendingUiActions(session).length > 0) {
+    attentionKind = "pending_ui_action";
+  } else if (sessionStatus === "running" && session.last_task_id) {
+    attentionKind = "running_task";
+  }
+  return {
+    has_attention: attentionKind !== "none",
+    attention_kind: attentionKind,
+    session_status: session.status,
+    last_task_id: session.last_task_id,
+    updated_at: session.updated_at,
+  };
 }
 
 function toBrowserRuntime(session: AgentSession | null): Record<string, unknown> {
@@ -519,7 +552,7 @@ function formatChatTime(value: string | null | undefined): string {
   });
 }
 
-export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
+export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorAgentDrawerProps) {
   const router = useRouter();
   const pathname = usePathname() || "/";
   const searchParams = useSearchParams();
@@ -540,8 +573,9 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   const shouldReconnectRef = useRef(false);
   const turnPhaseRef = useRef<Record<string, "message" | "ui_step" | "approve">>({});
 
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(initialOpen);
   const [session, setSession] = useState<AgentSession | null>(null);
+  const [summary, setSummary] = useState<AgentSessionSummary>(EMPTY_HAOR_SUMMARY);
   const [task, setTask] = useState<TaskRunDetail | null>(null);
   const [taskEvents, setTaskEvents] = useState<TaskEvent[]>([]);
   const [loading, setLoading] = useState(false);
@@ -560,10 +594,12 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   const [pendingUserMessages, setPendingUserMessages] = useState<PendingUserMessage[]>([]);
   const [streamFeed, setStreamFeed] = useState<StreamFeedItem[]>([]);
   const [pendingUiRequest, setPendingUiRequest] = useState<{ turnId: string; uiActions: AgentUIAction[]; content?: string | null } | null>(null);
+  const [sessionInitialized, setSessionInitialized] = useState(false);
 
   const pageContext = useMemo(() => buildPageContext(pathname, searchParams), [pathname, searchParams]);
   const browserRuntime = useMemo(() => toBrowserRuntime(session), [session]);
   const agentState = useMemo(() => toAgentState(session), [session]);
+  const sessionSummary = useMemo(() => deriveSessionSummary(session), [session]);
   const proposedActions = useMemo(() => toProposedActions(session), [session]);
   const visiblePendingUserMessages = useMemo(
     () => reconcilePendingUserMessages(pendingUserMessages, session?.messages || []),
@@ -582,10 +618,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   const confirmedRunningTask = rawRunningSession && linkedTaskLoaded && isActiveTaskStatus(task?.status);
   const runningStateResolving = rawRunningSession && !confirmedRunningTask;
   const showInterrupt = rawRunningSession;
-  const hasAttention =
-    normalizeStatus(session?.status) === "waiting_approval" ||
-    rawRunningSession ||
-    pendingUiActions.length > 0;
+  const hasAttention = open ? (session ? sessionSummary.has_attention : summary.has_attention) : summary.has_attention;
   const composerLocked = sending || stepping || approving || interrupting || resetting;
   const sendDisabled = composerLocked || confirmedRunningTask;
   const resetDisabled = resetting || interrupting;
@@ -593,6 +626,13 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
+
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+    setSummary(sessionSummary);
+  }, [session, sessionSummary]);
 
   useEffect(() => {
     taskRef.current = task;
@@ -1214,6 +1254,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
       if (!silent) {
         setErrorText(null);
       }
+      setSessionInitialized(true);
     } catch (error) {
       if (!silent) {
         setErrorText(error instanceof Error ? error.message : "无法恢复 haor 会话");
@@ -1226,8 +1267,53 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
   };
 
   useEffect(() => {
-    void loadSession();
-  }, []);
+    if (open && !sessionInitialized) {
+      void loadSession();
+    }
+  }, [open, sessionInitialized]);
+
+  useEffect(() => {
+    if (open) {
+      return undefined;
+    }
+    const token = getStoredToken();
+    if (!token) {
+      setSummary(EMPTY_HAOR_SUMMARY);
+      return undefined;
+    }
+    let disposed = false;
+
+    const refreshSummary = async () => {
+      try {
+        const result = await getHaorSessionSummary();
+        if (!disposed) {
+          setSummary(result);
+        }
+      } catch {
+        return;
+      }
+    };
+
+    const handleVisibilityRefresh = () => {
+      if (!document.hidden) {
+        void refreshSummary();
+      }
+    };
+
+    void refreshSummary();
+    const intervalId = window.setInterval(() => {
+      void refreshSummary();
+    }, HAOR_SUMMARY_POLL_INTERVAL_MS);
+    document.addEventListener("visibilitychange", handleVisibilityRefresh);
+    window.addEventListener("focus", handleVisibilityRefresh);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityRefresh);
+      window.removeEventListener("focus", handleVisibilityRefresh);
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!open) {
@@ -1361,10 +1447,10 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
     if (connectionState === "connected") {
       return undefined;
     }
-    if (!session?.last_task_id) {
+    if (!open) {
       return undefined;
     }
-    if (!open && normalizeStatus(session.status) !== "running") {
+    if (!session?.last_task_id) {
       return undefined;
     }
     const timer = window.setInterval(() => {
@@ -1757,6 +1843,7 @@ export default function HaorAgentDrawer({ userRole }: HaorAgentDrawerProps) {
       setStepping(false);
       setApproving(false);
       syncBrowserContext(pageContext);
+      setSummary(deriveSessionSummary(result));
     } catch (error) {
       const text = error instanceof Error ? error.message : "无法创建新会话";
       setErrorText(text);

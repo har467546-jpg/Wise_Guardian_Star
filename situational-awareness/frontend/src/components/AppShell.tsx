@@ -8,7 +8,7 @@ import { CloseOutlined, LogoutOutlined, MenuOutlined, SettingOutlined } from "@a
 import { Button, ConfigProvider, Spin, Tooltip } from "antd";
 
 import GlobalSettingsModal from "@/components/GlobalSettingsModal";
-import HaorAgentDrawer from "@/components/HaorAgentDrawer";
+import HaorAgentLauncher from "@/components/HaorAgentLauncher";
 import { clearStoredToken, getStoredToken, getStoredUserRole } from "@/lib/auth";
 
 // --- 类型定义与配置 ---
@@ -272,7 +272,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
           </div>
 
           <GlobalSettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} userRole={userRole} />
-          <HaorAgentDrawer userRole={userRole} />
+          <HaorAgentLauncher userRole={userRole} />
         </div>
       )}
     </ConfigProvider>

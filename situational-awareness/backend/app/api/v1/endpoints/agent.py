@@ -22,6 +22,7 @@ from app.schemas.agent import (
     AgentErrorEvent,
     AgentMessageCreateRequest,
     AgentSessionRead,
+    AgentSessionSummaryRead,
     AgentStreamClientEnvelope,
     AgentTaskUpdateEvent,
     AgentUIStepRequest,
@@ -29,6 +30,7 @@ from app.schemas.agent import (
 from app.services.haor_agent_service import (
     AgentServiceError,
     approve_agent_session,
+    get_agent_session_summary,
     get_or_create_agent_session,
     interrupt_agent_session,
     post_agent_message,
@@ -44,6 +46,17 @@ from app.tasks.agent_tasks import run_agent_orchestrate_task
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.get("/haor/summary", response_model=AgentSessionSummaryRead)
+def get_haor_session_summary(
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> AgentSessionSummaryRead:
+    try:
+        return get_agent_session_summary(db, user=user)
+    except Exception as exc:
+        _raise_agent_http_exception(exc, stage="get_summary", user=user)
 
 
 @router.get("/haor/session", response_model=AgentSessionRead)

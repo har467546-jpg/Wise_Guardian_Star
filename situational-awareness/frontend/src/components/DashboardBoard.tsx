@@ -5,15 +5,10 @@ import { Alert, Card, Col, Empty, List, Progress, Row, Skeleton, Space, Typograp
 
 import StatusTag from "@/components/StatusTag";
 import { formatDateTime, getTaskTypeLabel, localizeTaskMessage } from "@/lib/ui-text";
-import { getDashboardOverview, getPlatformLiveMetrics, listAssets, listAssetRisks, listTasks } from "@/services/api";
-import { Asset } from "@/types/asset";
-import { MobileOverview } from "@/types/mobile";
+import { getDashboardOverview, getPlatformLiveMetrics } from "@/services/api";
+import { DashboardOverview } from "@/types/dashboard";
 import { PlatformLiveMetrics } from "@/types/monitoring";
-import { RiskFinding } from "@/types/risk";
-import { TaskRun } from "@/types/task";
 
-const DASHBOARD_RISK_ASSET_LIMIT = 20;
-const DASHBOARD_RISK_CONCURRENCY = 6;
 const LIVE_METRICS_HISTORY_LIMIT = 24;
 const LIVE_METRICS_POLL_INTERVAL_MS = 4000;
 const LIVE_TREND_WIDTH = 168;
@@ -26,10 +21,6 @@ type LiveMetricHistoryPoint = {
   diskUsage: number;
   networkRate: number;
 };
-
-function severityRank(severity: RiskFinding["severity"] | null | undefined) {
-  return { critical: 4, high: 3, medium: 2, low: 1 }[severity || "low"] || 0;
-}
 
 function formatBytes(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) {
@@ -156,34 +147,8 @@ function LiveTrendCard({ label, color, value, detail, series, scaleLabel, maxVal
   );
 }
 
-async function mapWithConcurrency<T, R>(items: T[], limit: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
-  if (items.length === 0) {
-    return [];
-  }
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (true) {
-      const current = nextIndex;
-      nextIndex += 1;
-      if (current >= items.length) {
-        break;
-      }
-      results[current] = await mapper(items[current]);
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
-  await Promise.all(workers);
-  return results;
-}
-
 export default function DashboardBoard() {
-  const [assets, setAssets] = useState<Asset[]>([]);
-  const [tasks, setTasks] = useState<TaskRun[]>([]);
-  const [riskMap, setRiskMap] = useState<Record<string, RiskFinding[]>>({});
-  const [overview, setOverview] = useState<MobileOverview | null>(null);
+  const [overview, setOverview] = useState<DashboardOverview | null>(null);
   const [liveMetrics, setLiveMetrics] = useState<PlatformLiveMetrics | null>(null);
   const [liveMetricHistory, setLiveMetricHistory] = useState<LiveMetricHistoryPoint[]>([]);
   const [liveMetricsError, setLiveMetricsError] = useState<string | null>(null);
@@ -195,27 +160,8 @@ export default function DashboardBoard() {
     async function load() {
       try {
         setLoading(true);
-        const [assetRes, taskRes, overviewRes] = await Promise.all([
-          listAssets({ pageSize: 80 }),
-          listTasks({ pageSize: 20 }),
-          getDashboardOverview().catch(() => null),
-        ]);
-        setAssets(assetRes.items);
-        setTasks(taskRes.items);
+        const overviewRes = await getDashboardOverview();
         setOverview(overviewRes);
-        const riskTargets = assetRes.items.slice(0, DASHBOARD_RISK_ASSET_LIMIT);
-        const riskEntries = await mapWithConcurrency(
-          riskTargets,
-          DASHBOARD_RISK_CONCURRENCY,
-          async (asset) => {
-            try {
-              return [asset.id, (await listAssetRisks(asset.id)).items] as const;
-            } catch {
-              return [asset.id, []] as const;
-            }
-          },
-        );
-        setRiskMap(Object.fromEntries(riskEntries));
         setError(null);
       } catch (err) {
         setError((err as Error).message);
@@ -283,53 +229,6 @@ export default function DashboardBoard() {
       window.removeEventListener("focus", handleVisibilityRefresh);
     };
   }, [startLiveMetricsTransition]);
-
-  const metrics = useMemo(() => {
-    const onlineAssets = assets.filter((asset) => asset.status === "online").length;
-    const allFindings = Object.values(riskMap).flat();
-    const highRisk = overview?.high_risk_findings ?? allFindings.filter((finding) => ["high", "critical"].includes(finding.severity)).length;
-    const activeTasks = overview?.active_tasks ?? tasks.filter((task) => ["pending", "running", "retry"].includes(task.status)).length;
-    const severityTotals = {
-      critical: allFindings.filter((finding) => finding.severity === "critical").length,
-      high: allFindings.filter((finding) => finding.severity === "high").length,
-      medium: allFindings.filter((finding) => finding.severity === "medium").length,
-      low: allFindings.filter((finding) => finding.severity === "low").length,
-    };
-    const riskyAssets = assets
-      .map((asset) => {
-        const findings = riskMap[asset.id] || [];
-        const highest = [...findings].sort((a, b) => severityRank(b.severity) - severityRank(a.severity))[0]?.severity || null;
-        return {
-          id: asset.id,
-          ip: asset.ip,
-          hostname: asset.hostname,
-          findingCount: findings.length,
-          highest,
-        };
-      })
-      .filter((item) => item.findingCount > 0)
-      .sort((a, b) => severityRank(b.highest) - severityRank(a.highest) || b.findingCount - a.findingCount)
-      .slice(0, 5);
-    const taskHealth = tasks.slice(0, 8).map((task) => ({
-      id: task.id,
-      label: getTaskTypeLabel(task.task_type),
-      status: task.status,
-      progress: task.progress,
-      detail: localizeTaskMessage(task.message) || task.scope_id || "无附加信息",
-    }));
-    const coverageRate = assets.length ? Math.round((onlineAssets / assets.length) * 100) : 0;
-
-    return {
-      onlineAssets,
-      highRisk,
-      activeTasks,
-      riskyAssets,
-      totalFindings: allFindings.length,
-      severityTotals,
-      taskHealth,
-      coverageRate,
-    };
-  }, [assets, overview, riskMap, tasks]);
 
   const liveTrendData = useMemo(() => {
     const cpuSeries = liveMetricHistory.map((item) => item.cpuUsage);
@@ -499,10 +398,10 @@ export default function DashboardBoard() {
       <Row gutter={[14, 14]} className="dashboard-grid-row">
         <Col xs={24} lg={15}>
           <Card className="panel-card dashboard-panel-card" title="风险热点资产" extra={<Typography.Text type="secondary">按最高风险和命中数排序</Typography.Text>}>
-            {metrics.riskyAssets.length ? (
+            {overview?.risky_assets.length ? (
               <List
                 className="console-list"
-                dataSource={metrics.riskyAssets}
+                dataSource={overview.risky_assets}
                 renderItem={(item) => (
                   <List.Item className="console-list-item">
                     <Space direction="vertical" style={{ width: "100%" }} size={8}>
@@ -513,13 +412,13 @@ export default function DashboardBoard() {
                           </Typography.Text>
                           <Typography.Text type="secondary">{item.hostname || "未识别主机名"}</Typography.Text>
                         </Space>
-                        <StatusTag value={item.highest} />
+                        <StatusTag value={item.highest_severity} />
                       </Space>
                       <div className="console-keyline">
                         <span>风险命中</span>
-                        <strong>{item.findingCount} 条</strong>
+                        <strong>{item.finding_count} 条</strong>
                       </div>
-                      <Progress percent={Math.min(item.findingCount * 20, 100)} showInfo={false} strokeColor="#dc2626" trailColor="rgba(59, 130, 246, 0.08)" />
+                      <Progress percent={Math.min(item.finding_count * 20, 100)} showInfo={false} strokeColor="#dc2626" trailColor="rgba(59, 130, 246, 0.08)" />
                     </Space>
                   </List.Item>
                 )}
@@ -535,25 +434,31 @@ export default function DashboardBoard() {
               <div className="dashboard-threat-band">
                 <div className="dashboard-threat-column">
                   <span>严重</span>
-                  <strong>{metrics.severityTotals.critical}</strong>
+                  <strong>{overview?.severity_totals.critical || 0}</strong>
                 </div>
                 <div className="dashboard-threat-column">
                   <span>高危</span>
-                  <strong>{metrics.severityTotals.high}</strong>
+                  <strong>{overview?.severity_totals.high || 0}</strong>
                 </div>
                 <div className="dashboard-threat-column">
                   <span>中危</span>
-                  <strong>{metrics.severityTotals.medium}</strong>
+                  <strong>{overview?.severity_totals.medium || 0}</strong>
                 </div>
                 <div className="dashboard-threat-column">
                   <span>低危</span>
-                  <strong>{metrics.severityTotals.low}</strong>
+                  <strong>{overview?.severity_totals.low || 0}</strong>
                 </div>
               </div>
-              {tasks.length ? (
+              {overview?.task_health.length ? (
                 <List
                   className="console-list"
-                  dataSource={metrics.taskHealth}
+                  dataSource={overview.task_health.map((task) => ({
+                    id: task.id,
+                    label: getTaskTypeLabel(task.task_type),
+                    status: task.status,
+                    progress: task.progress,
+                    detail: localizeTaskMessage(task.message) || task.scope_id || "无附加信息",
+                  }))}
                   renderItem={(task) => (
                     <List.Item className="console-list-item">
                       <Space direction="vertical" style={{ width: "100%" }} size={6}>

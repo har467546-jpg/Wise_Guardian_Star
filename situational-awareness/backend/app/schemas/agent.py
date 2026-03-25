@@ -11,6 +11,7 @@ from app.db.models.enums import TaskExecutionStatus
 AgentSessionStatus = Literal["active", "waiting_approval", "running", "completed", "failed"]
 AgentRole = Literal["system", "user", "assistant"]
 AgentMessageType = Literal["text", "clarifying", "plan", "task_update", "action_update", "error"]
+AgentAttentionKind = Literal["none", "waiting_approval", "running_task", "pending_ui_action"]
 AgentWriteActionType = Literal[
     "create_discovery_job",
     "verify_asset_risks",
@@ -227,6 +228,14 @@ class AgentSessionRead(BaseModel):
     messages: list[AgentMessageRead] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+
+
+class AgentSessionSummaryRead(BaseModel):
+    has_attention: bool = False
+    attention_kind: AgentAttentionKind = "none"
+    session_status: AgentSessionStatus | str | None = None
+    last_task_id: str | None = None
+    updated_at: datetime | None = None
 
 
 class AgentMessageCreateRequest(BaseModel):

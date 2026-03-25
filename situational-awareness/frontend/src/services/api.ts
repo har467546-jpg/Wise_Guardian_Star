@@ -4,6 +4,7 @@ import {
   AgentApprovalResponse,
   AgentMessageCreateRequest,
   AgentSession,
+  AgentSessionSummary,
   AgentUIStepRequest,
 } from "@/types/agent";
 import {
@@ -18,6 +19,7 @@ import {
 } from "@/types/collection";
 import { DiscoveryJobCreateResponse, DiscoveryJobListResponse } from "@/types/discovery";
 import { getStoredToken } from "@/lib/auth";
+import { DashboardOverview } from "@/types/dashboard";
 import { PlatformLogListResponse, PlatformLogLevel, PlatformLogServiceName, PlatformLogSourceKind } from "@/types/logs";
 import { MobileOverview } from "@/types/mobile";
 import { PlatformLiveMetrics } from "@/types/monitoring";
@@ -510,7 +512,7 @@ export function listGlobalRisks(params?: {
 }
 
 export function getDashboardOverview() {
-  return apiFetch<MobileOverview>("/dashboard/overview");
+  return apiFetch<DashboardOverview>("/dashboard/overview");
 }
 
 export function getMobileOverview() {
@@ -724,6 +726,10 @@ export function getPlatformSettings() {
 
 export function getHaorSession() {
   return apiFetch<AgentSession>("/agent/haor/session", undefined, { preferBackendDetail: true });
+}
+
+export function getHaorSessionSummary() {
+  return apiFetch<AgentSessionSummary>("/agent/haor/summary", undefined, { preferBackendDetail: true });
 }
 
 export function buildHaorSessionStreamUrl(token: string) {

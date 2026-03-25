@@ -103,6 +103,16 @@ export type AgentSession = {
   updated_at: string;
 };
 
+export type AgentAttentionKind = "none" | "waiting_approval" | "running_task" | "pending_ui_action";
+
+export type AgentSessionSummary = {
+  has_attention: boolean;
+  attention_kind: AgentAttentionKind;
+  session_status: AgentSession["status"] | null;
+  last_task_id: string | null;
+  updated_at: string | null;
+};
+
 export type AgentPageContext = {
   pathname: string;
   query: Record<string, string>;
