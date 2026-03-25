@@ -116,6 +116,35 @@ def test_serialize_task_detail_supports_canceled_terminal_timing() -> None:
     assert detail["event_count"] == 3
 
 
+def test_serialize_task_detail_makes_datetime_and_enum_fields_json_safe() -> None:
+    base = datetime(2026, 3, 16, 8, 0, tzinfo=timezone.utc)
+    task = TaskRun(
+        id="task-json-safe-1",
+        task_type=TaskType.ASSET_SCAN,
+        status=TaskExecutionStatus.SUCCESS,
+        progress=100,
+        message="扫描完成",
+        retry_count=0,
+        result_json={"finished_at": base + timedelta(seconds=30)},
+        error_json={},
+        created_at=base,
+        started_at=base + timedelta(seconds=5),
+        finished_at=base + timedelta(seconds=30),
+        updated_at=base + timedelta(seconds=30),
+    )
+
+    detail = serialize_task_detail(task, events=[], now=base + timedelta(seconds=30))
+
+    assert detail["task_type"] == "asset_scan"
+    assert detail["status"] == "success"
+    assert detail["created_at"] == base.isoformat()
+    assert detail["started_at"] == (base + timedelta(seconds=5)).isoformat()
+    assert detail["finished_at"] == (base + timedelta(seconds=30)).isoformat()
+    assert detail["updated_at"] == (base + timedelta(seconds=30)).isoformat()
+    assert detail["result_json"]["finished_at"] == (base + timedelta(seconds=30)).isoformat()
+    assert detail["last_event_at"] == (base + timedelta(seconds=30)).isoformat()
+
+
 def test_serialize_task_event_makes_datetime_payload_json_safe() -> None:
     base = datetime(2026, 3, 16, 9, 30, tzinfo=timezone.utc)
     task = TaskRun(

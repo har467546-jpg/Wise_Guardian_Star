@@ -87,6 +87,25 @@ export type AgentState = {
   watch?: AgentStateWatch;
 };
 
+export type AgentGoal = {
+  id: string;
+  user_id: string;
+  agent_id: string;
+  status: "active" | "blocked" | "completed" | "failed" | "canceled" | string;
+  title: string;
+  goal_kind: string;
+  success_criteria_json: Record<string, unknown>;
+  context_json: Record<string, unknown>;
+  plan_json: Record<string, unknown>;
+  progress_json: Record<string, unknown>;
+  blocked_reason: string | null;
+  last_session_id: string | null;
+  last_task_id: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+};
+
 export type AgentSession = {
   session_id: string;
   agent_id: string;
@@ -97,6 +116,8 @@ export type AgentSession = {
   pending_plan_json: Record<string, unknown>;
   browser_runtime_json: Record<string, unknown>;
   agent_state_json: AgentState | Record<string, unknown>;
+  current_goal_id: string | null;
+  current_goal_title: string | null;
   last_task_id: string | null;
   messages: AgentMessage[];
   created_at: string;
@@ -109,6 +130,8 @@ export type AgentSessionSummary = {
   has_attention: boolean;
   attention_kind: AgentAttentionKind;
   session_status: AgentSession["status"] | null;
+  current_goal_id: string | null;
+  current_goal_title: string | null;
   last_task_id: string | null;
   updated_at: string | null;
 };

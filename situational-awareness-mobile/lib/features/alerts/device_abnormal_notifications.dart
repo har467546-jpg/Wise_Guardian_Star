@@ -18,6 +18,7 @@ const _notificationPermissionPromptedKey =
     'sa.device_abnormal.notification_permission_prompted';
 const _highRiskSnapshotKey = 'sa.device_abnormal.high_risk_snapshot';
 const _seenRiskIdsSnapshotKey = 'sa.device_abnormal.seen_risk_ids_snapshot';
+const _openedRiskIdsSnapshotKey = 'sa.device_abnormal.opened_risk_ids_snapshot';
 const _backgroundTaskUniqueName = 'sa.device_abnormal.background_sync';
 const _backgroundTaskName = 'device_abnormal_background_sync';
 const _notificationChannelId = 'device_abnormal_alerts';
@@ -227,6 +228,7 @@ Future<DeviceAbnormalAlertSnapshot?> _readDeviceAbnormalAlertSnapshot() async {
   return DeviceAbnormalAlertSnapshot(
     highRiskFindings: highRiskFindings,
     seenRiskIds: seenRiskIds ?? const [],
+    openedRiskIds: prefs.getStringList(_openedRiskIdsSnapshotKey) ?? const [],
   );
 }
 
@@ -236,6 +238,32 @@ Future<void> _writeDeviceAbnormalAlertSnapshot(
   final prefs = await SharedPreferences.getInstance();
   await prefs.setInt(_highRiskSnapshotKey, snapshot.highRiskFindings);
   await prefs.setStringList(_seenRiskIdsSnapshotKey, snapshot.seenRiskIds);
+  await prefs.setStringList(_openedRiskIdsSnapshotKey, snapshot.openedRiskIds);
+}
+
+Future<void> rememberDeviceAbnormalRiskAlerted({
+  required String riskId,
+  int? highRiskFindings,
+}) async {
+  final normalizedRiskId = riskId.trim();
+  if (normalizedRiskId.isEmpty) {
+    return;
+  }
+
+  final previous = await _readDeviceAbnormalAlertSnapshot();
+  await _writeDeviceAbnormalAlertSnapshot(
+    DeviceAbnormalAlertSnapshot(
+      highRiskFindings: _resolveNextHighRiskFindings(
+        previous,
+        highRiskFindings,
+      ),
+      seenRiskIds: _mergeSnapshotRiskIds(
+        previous?.seenRiskIds ?? const [],
+        [normalizedRiskId],
+      ),
+      openedRiskIds: previous?.openedRiskIds ?? const [],
+    ),
+  );
 }
 
 Future<void> markDeviceAbnormalRiskSeen({
@@ -248,22 +276,49 @@ Future<void> markDeviceAbnormalRiskSeen({
   }
 
   final previous = await _readDeviceAbnormalAlertSnapshot();
-  final previousHighRiskFindings = previous?.highRiskFindings ?? 0;
-  final nextHighRiskFindings = highRiskFindings == null
-      ? previousHighRiskFindings
-      : (highRiskFindings > previousHighRiskFindings
-          ? highRiskFindings
-          : previousHighRiskFindings);
-
   await _writeDeviceAbnormalAlertSnapshot(
     DeviceAbnormalAlertSnapshot(
-      highRiskFindings: nextHighRiskFindings,
+      highRiskFindings: _resolveNextHighRiskFindings(
+        previous,
+        highRiskFindings,
+      ),
       seenRiskIds: _mergeSnapshotRiskIds(
         previous?.seenRiskIds ?? const [],
         [normalizedRiskId],
       ),
+      openedRiskIds: _mergeSnapshotRiskIds(
+        previous?.openedRiskIds ?? const [],
+        [normalizedRiskId],
+      ),
     ),
   );
+}
+
+Future<void> markDeviceAbnormalRouteSeen({
+  required String route,
+  int? highRiskFindings,
+}) async {
+  final riskId = extractDeviceAbnormalRiskIdFromRoute(route);
+  if (riskId == null) {
+    return;
+  }
+  await markDeviceAbnormalRiskSeen(
+    riskId: riskId,
+    highRiskFindings: highRiskFindings,
+  );
+}
+
+int _resolveNextHighRiskFindings(
+  DeviceAbnormalAlertSnapshot? previous,
+  int? highRiskFindings,
+) {
+  final previousHighRiskFindings = previous?.highRiskFindings ?? 0;
+  if (highRiskFindings == null) {
+    return previousHighRiskFindings;
+  }
+  return highRiskFindings > previousHighRiskFindings
+      ? highRiskFindings
+      : previousHighRiskFindings;
 }
 
 Future<void> showDeviceAbnormalSystemNotification({

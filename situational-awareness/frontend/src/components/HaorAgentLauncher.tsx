@@ -17,6 +17,8 @@ const EMPTY_HAOR_SUMMARY: AgentSessionSummary = {
   has_attention: false,
   attention_kind: "none",
   session_status: null,
+  current_goal_id: null,
+  current_goal_title: null,
   last_task_id: null,
   updated_at: null,
 };

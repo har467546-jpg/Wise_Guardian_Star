@@ -4,10 +4,12 @@ class DeviceAbnormalAlertSnapshot {
   const DeviceAbnormalAlertSnapshot({
     required this.highRiskFindings,
     required this.seenRiskIds,
+    this.openedRiskIds = const [],
   });
 
   final int highRiskFindings;
   final List<String> seenRiskIds;
+  final List<String> openedRiskIds;
 }
 
 class DeviceAbnormalAlert {
@@ -44,6 +46,7 @@ DeviceAbnormalAlertDecision evaluateDeviceAbnormalAlert({
       previous?.seenRiskIds ?? const [],
       overview.recentRisks,
     ),
+    openedRiskIds: _normalizeRiskIds(previous?.openedRiskIds ?? const []),
   );
 
   if (previous == null) {
@@ -86,6 +89,23 @@ DeviceAbnormalAlertDecision evaluateDeviceAbnormalAlert({
   return DeviceAbnormalAlertDecision(nextSnapshot: nextSnapshot);
 }
 
+String? extractDeviceAbnormalRiskIdFromRoute(String route) {
+  final normalizedRoute = route.trim();
+  if (normalizedRoute.isEmpty) {
+    return null;
+  }
+  final uri = Uri.tryParse(normalizedRoute);
+  if (uri == null) {
+    return null;
+  }
+  final segments = uri.pathSegments;
+  if (segments.length != 2 || segments.first != 'risks') {
+    return null;
+  }
+  final riskId = Uri.decodeComponent(segments[1]).trim();
+  return riskId.isEmpty ? null : riskId;
+}
+
 bool _isAbnormalSeverity(RiskSeverityLevel value) {
   return value == RiskSeverityLevel.high || value == RiskSeverityLevel.critical;
 }
@@ -119,4 +139,18 @@ List<String> _mergeSeenRiskIds(
     }
   }
   return merged;
+}
+
+List<String> _normalizeRiskIds(List<String> riskIds) {
+  final normalized = <String>[];
+  for (final riskId in riskIds) {
+    final value = riskId.trim();
+    if (value.isNotEmpty && !normalized.contains(value)) {
+      normalized.add(value);
+    }
+    if (normalized.length >= 64) {
+      break;
+    }
+  }
+  return normalized;
 }

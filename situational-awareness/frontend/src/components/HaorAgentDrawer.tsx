@@ -10,6 +10,7 @@ import { formatDateTime, getTaskEventTypeLabel, getTaskTypeLabel, localizeTaskMe
 import {
   approveHaorSession,
   buildHaorSessionStreamUrl,
+  getHaorGoal,
   getHaorSession,
   getHaorSessionSummary,
   getTask,
@@ -24,6 +25,7 @@ import type {
   AgentAssistantDeltaEvent,
   AgentBrowserContext,
   AgentErrorEvent,
+  AgentGoal,
   AgentMessage,
   AgentPageContext,
   AgentPlanPendingEvent,
@@ -103,6 +105,8 @@ const EMPTY_HAOR_SUMMARY: AgentSessionSummary = {
   has_attention: false,
   attention_kind: "none",
   session_status: null,
+  current_goal_id: null,
+  current_goal_title: null,
   last_task_id: null,
   updated_at: null,
 };
@@ -153,6 +157,11 @@ function ChatBubble({ actions, badge, content, metaNote, role, sender, stateTone
 
 function normalizeStatus(status: string | null | undefined) {
   return String(status || "").trim().toLowerCase();
+}
+
+function isUiFeedbackPhase(phase: string | null | undefined) {
+  const normalized = normalizeStatus(phase);
+  return normalized === "awaiting_ui_feedback" || normalized === "resolving_ui_feedback";
 }
 
 function buildPageContext(pathname: string, searchParams: URLSearchParams | null): AgentPageContext {
@@ -246,6 +255,8 @@ function deriveSessionSummary(session: AgentSession | null): AgentSessionSummary
     has_attention: attentionKind !== "none",
     attention_kind: attentionKind,
     session_status: session.status,
+    current_goal_id: session.current_goal_id,
+    current_goal_title: session.current_goal_title,
     last_task_id: session.last_task_id,
     updated_at: session.updated_at,
   };
@@ -328,6 +339,23 @@ function buildAgentStatePanel(state: AgentState, task: TaskRunDetail | null): { 
   ]);
 
   return { target, stage, evidence, next };
+}
+
+function goalStatusLabel(status: string | null | undefined): string {
+  switch (normalizeStatus(status)) {
+    case "active":
+      return "进行中";
+    case "blocked":
+      return "已阻塞";
+    case "completed":
+      return "已完成";
+    case "failed":
+      return "失败";
+    case "canceled":
+      return "已取消";
+    default:
+      return "未知";
+  }
 }
 
 function isTerminalTaskStatus(status: string | null | undefined) {
@@ -482,6 +510,14 @@ function upsertSessionMessage(session: AgentSession | null, nextMessage: AgentMe
   return { ...session, messages: nextMessages, updated_at: nextMessage.created_at || session.updated_at };
 }
 
+function isRemediationAutoSubmitAction(action: AgentProposedAction): boolean {
+  return action.action_type === "create_or_resume_remediation_session" && action.params?.submit_if_ready === true;
+}
+
+function hasRemediationAutoSubmitPlan(actions: AgentProposedAction[]): boolean {
+  return actions.some((action) => isRemediationAutoSubmitAction(action));
+}
+
 function buildPendingPlanDetails(actions: AgentProposedAction[]) {
   if (!actions.length) {
     return "";
@@ -498,7 +534,12 @@ function buildPendingPlanDetails(actions: AgentProposedAction[]) {
     if (action.reason) {
       lines.push(`原因：${action.reason}`);
     }
+    if (isRemediationAutoSubmitAction(action)) {
+      lines.push("执行方式：满足条件时直接提交自动修复。");
+      lines.push("条件不足时：仅创建修复会话，并在聊天里说明阻塞原因和下一步。");
+    }
     const paramsText = Object.entries(action.params || {})
+      .filter(([key]) => key !== "submit_if_ready")
       .map(([key, value]) => `${key}=${String(value)}`)
       .join("，");
     if (paramsText) {
@@ -576,6 +617,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const [open, setOpen] = useState(initialOpen);
   const [session, setSession] = useState<AgentSession | null>(null);
   const [summary, setSummary] = useState<AgentSessionSummary>(EMPTY_HAOR_SUMMARY);
+  const [currentGoal, setCurrentGoal] = useState<AgentGoal | null>(null);
   const [task, setTask] = useState<TaskRunDetail | null>(null);
   const [taskEvents, setTaskEvents] = useState<TaskEvent[]>([]);
   const [loading, setLoading] = useState(false);
@@ -601,6 +643,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const agentState = useMemo(() => toAgentState(session), [session]);
   const sessionSummary = useMemo(() => deriveSessionSummary(session), [session]);
   const proposedActions = useMemo(() => toProposedActions(session), [session]);
+  const remediationAutoSubmitPlan = useMemo(() => hasRemediationAutoSubmitPlan(proposedActions), [proposedActions]);
   const visiblePendingUserMessages = useMemo(
     () => reconcilePendingUserMessages(pendingUserMessages, session?.messages || []),
     [pendingUserMessages, session?.messages],
@@ -613,15 +656,29 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const runtimeError = typeof browserRuntime.last_error === "string" ? browserRuntime.last_error : "";
   const mockMode = isMockSession(session);
   const isRunningSession = normalizeStatus(session?.status) === "running";
+  const sessionPhase = normalizeStatus(typeof browserRuntime.phase === "string" ? browserRuntime.phase : "");
+  const snapshotAwaitingMessage = sessionPhase === "awaiting_agent_reply";
+  const snapshotUiInProgress = isUiFeedbackPhase(sessionPhase) || pendingUiActions.length > 0;
   const rawRunningSession = isRunningSession && Boolean(session?.last_task_id);
   const linkedTaskLoaded = Boolean(task && session?.last_task_id && task.id === session.last_task_id);
   const confirmedRunningTask = rawRunningSession && linkedTaskLoaded && isActiveTaskStatus(task?.status);
   const runningStateResolving = rawRunningSession && !confirmedRunningTask;
   const showInterrupt = rawRunningSession;
   const hasAttention = open ? (session ? sessionSummary.has_attention : summary.has_attention) : summary.has_attention;
-  const composerLocked = sending || stepping || approving || interrupting || resetting;
+  const composerLocked = snapshotAwaitingMessage || snapshotUiInProgress || sending || stepping || approving || interrupting || resetting;
   const sendDisabled = composerLocked || confirmedRunningTask;
   const resetDisabled = resetting || interrupting;
+  const approvalActionLabel = remediationAutoSubmitPlan ? "确认并自动修复" : "确认执行";
+  const approvalBlockedText = remediationAutoSubmitPlan ? "当前账号不是管理员，不能确认自动修复。" : "当前账号不是管理员，不能确认执行。";
+  const currentGoalTitle = currentGoal?.title || session?.current_goal_title || summary.current_goal_title || "当前未绑定目标";
+  const sidebarStatusText = session?.current_goal_id
+    ? goalStatusLabel(currentGoal?.status || "active")
+    : statusLabel(session?.status);
+  const sidebarUpdatedText = currentGoal?.updated_at
+    ? formatDateTime(currentGoal.updated_at)
+    : session?.updated_at
+      ? formatDateTime(session.updated_at)
+      : "等待新的会话更新";
 
   useEffect(() => {
     sessionRef.current = session;
@@ -683,9 +740,15 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
         tone: "muted" as const,
       };
     }
-    if (stepping || pendingUiActions.length > 0) {
+    if (snapshotUiInProgress || stepping) {
       return {
         text: "haor 正在执行当前页面动作，并会继续把结果沉淀到聊天记录里。",
+        tone: "muted" as const,
+      };
+    }
+    if (snapshotAwaitingMessage || sending) {
+      return {
+        text: "haor 正在处理上一轮消息，刷新后也会按当前会话快照继续恢复输入状态。",
         tone: "muted" as const,
       };
     }
@@ -703,7 +766,13 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     }
     if (waitingApproval) {
       return {
-        text: isAdmin ? "已生成待确认计划，确认后才会执行。" : "已生成待确认计划，当前账号无法确认执行。",
+        text: remediationAutoSubmitPlan
+          ? (
+              isAdmin
+                ? "已生成待确认修复计划。满足条件时会直接自动修复；条件不足时仅创建修复会话并说明阻塞原因。"
+                : "已生成待确认修复计划，但当前账号不是管理员，不能确认自动修复。"
+            )
+          : (isAdmin ? "已生成待确认计划，确认后才会执行。" : "已生成待确认计划，当前账号无法确认执行。"),
         tone: "warning" as const,
       };
     }
@@ -722,20 +791,23 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     runtimeError,
     streamError,
     connectionState,
+    snapshotAwaitingMessage,
+    snapshotUiInProgress,
     stepping,
-    pendingUiActions.length,
+    sending,
     confirmedRunningTask,
     runningStateResolving,
     session?.status,
     isAdmin,
+    remediationAutoSubmitPlan,
     mockMode,
   ]);
 
   const composerHint = confirmedRunningTask
     ? "当前任务执行中，输入已锁定"
-    : sending
+    : snapshotAwaitingMessage || sending
       ? "haor 正在生成回复…"
-      : stepping
+      : snapshotUiInProgress || stepping
         ? "haor 正在继续处理当前请求…"
         : runningStateResolving
           ? "正在校验最近任务状态；可继续输入，或先中断当前任务"
@@ -871,19 +943,32 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   };
 
   const syncPendingUiStepFromSession = (nextSession: AgentSession | null) => {
-    const current = pendingUiStepRef.current;
-    if (!current || !nextSession) {
+    if (!nextSession) {
       return;
     }
     const nextRuntime = toBrowserRuntime(nextSession);
+    const nextPhase = typeof nextRuntime.phase === "string" ? nextRuntime.phase.trim() : "";
     const nextLastStepRequestId =
       typeof nextRuntime.last_step_request_id === "string" ? nextRuntime.last_step_request_id.trim() : "";
     const nextPendingActions = toPendingUiActions(nextSession);
+    const uiStepStillActive = isUiFeedbackPhase(nextPhase) || nextPendingActions.length > 0;
+    const current = pendingUiStepRef.current;
+
+    if (!current) {
+      if (!uiStepStillActive) {
+        setStepping(false);
+        setAssistantPlaceholder((currentPlaceholder) =>
+          currentPlaceholder?.content === "正在继续处理当前请求…" ? null : currentPlaceholder,
+        );
+      }
+      return;
+    }
+
     if (nextLastStepRequestId && nextLastStepRequestId === current.stepRequestId) {
       settlePendingUiStep(current.stepRequestId);
       return;
     }
-    if (current.acked && !nextPendingActions.length) {
+    if (current.acked && !uiStepStillActive) {
       settlePendingUiStep(current.stepRequestId);
     }
   };
@@ -1236,6 +1321,17 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     }
   };
 
+  const loadCurrentGoal = async (goalId: string, silent = false) => {
+    try {
+      const result = await getHaorGoal(goalId);
+      setCurrentGoal(result);
+    } catch {
+      if (!silent) {
+        setCurrentGoal(null);
+      }
+    }
+  };
+
   const loadSession = async (silent = false) => {
     try {
       if (!silent) {
@@ -1245,6 +1341,11 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       syncPendingMessageTurnFromSession(result);
       syncPendingUiStepFromSession(result);
       setSession(result);
+      if (result.current_goal_id) {
+        void loadCurrentGoal(result.current_goal_id, true);
+      } else {
+        setCurrentGoal(null);
+      }
       if (result.last_task_id) {
         void loadTask(result.last_task_id, true);
       } else {
@@ -1271,6 +1372,17 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       void loadSession();
     }
   }, [open, sessionInitialized]);
+
+  useEffect(() => {
+    if (!open || !sessionInitialized) {
+      return;
+    }
+    if (!session?.current_goal_id) {
+      setCurrentGoal(null);
+      return;
+    }
+    void loadCurrentGoal(session.current_goal_id, true);
+  }, [open, sessionInitialized, session?.current_goal_id, session?.updated_at]);
 
   useEffect(() => {
     if (open) {
@@ -1827,6 +1939,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
         ignoredClientMessageIdsRef.current.add(item.clientMessageId);
       }
       setSession(result);
+      setCurrentGoal(null);
       setTask(null);
       setTaskEvents([]);
       setInputValue("");
@@ -1871,237 +1984,257 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
           <button type="button" className="haor-chat-backdrop" onClick={() => setOpen(false)} aria-label="关闭 haor 聊天窗口" />
 
           <section className="haor-chat-window" data-haor-agent-root="true">
-            <header className="haor-chat-header">
-              <div className="haor-chat-header-copy">
-                <span className="haor-chat-kicker">Chat Assistant</span>
-                <div className="haor-chat-title-row">
-                  <h2 className="haor-chat-title">haor</h2>
-                  <span className={`haor-chat-status haor-chat-status-${normalizeStatus(session?.status) || "active"}`}>
-                    {statusLabel(session?.status)}
-                  </span>
-                </div>
-                <p className={`haor-chat-subtitle haor-chat-subtitle-${headerStatus.tone}`}>{headerStatus.text}</p>
-              </div>
-
-              <div className="haor-chat-header-actions">
-                {showInterrupt ? (
-                  <Button
-                    danger
-                    size="small"
-                    className="haor-chat-header-button haor-chat-header-button-danger"
-                    onClick={() => void handleInterrupt()}
-                    loading={interrupting}
-                  >
-                    中断任务
-                  </Button>
-                ) : null}
-                <Button
-                  size="small"
-                  className="haor-chat-header-button haor-chat-header-button-primary"
-                  onClick={() => void handleReset()}
-                  loading={resetting}
-                  disabled={resetDisabled}
-                >
-                  新会话
-                </Button>
-                <Button size="small" className="haor-chat-header-button" onClick={() => setOpen(false)}>
-                  关闭
-                </Button>
-              </div>
-            </header>
-
             <div className="haor-chat-body">
-              <section className="haor-chat-state-panel" aria-label="haor 当前状态">
-                <div className="haor-chat-state-card">
-                  <span className="haor-chat-state-label">当前目标</span>
-                  <strong className="haor-chat-state-value">{agentStatePanel.target}</strong>
-                </div>
-                <div className="haor-chat-state-card">
-                  <span className="haor-chat-state-label">当前阶段</span>
-                  <strong className="haor-chat-state-value">{agentStatePanel.stage}</strong>
-                </div>
-                <div className="haor-chat-state-card">
-                  <span className="haor-chat-state-label">依据</span>
-                  <strong className="haor-chat-state-value">{agentStatePanel.evidence}</strong>
-                </div>
-                <div className="haor-chat-state-card">
-                  <span className="haor-chat-state-label">等待 / 下一步</span>
-                  <strong className="haor-chat-state-value">{agentStatePanel.next}</strong>
-                </div>
-              </section>
-
-              <div ref={feedViewportRef} className="haor-chat-feed">
-                {loading && !session?.messages?.length ? (
-                  <div className="haor-chat-empty">
-                    <strong>正在恢复会话</strong>
-                    <span>haor 正在同步最近的聊天记录和任务状态。</span>
+              <aside className="haor-chat-sidebar" aria-label="haor 会话侧栏">
+                <div className="haor-chat-sidebar-top">
+                  <div className="haor-chat-header-copy">
+                    <span className="haor-chat-kicker">Chat Assistant</span>
+                    <div className="haor-chat-title-row">
+                      <h2 className="haor-chat-title">haor</h2>
+                      <span className={`haor-chat-status haor-chat-status-${normalizeStatus(session?.status) || "active"}`}>
+                        {statusLabel(session?.status)}
+                      </span>
+                    </div>
+                    <p className={`haor-chat-subtitle haor-chat-subtitle-${headerStatus.tone}`}>{headerStatus.text}</p>
                   </div>
-                ) : null}
+                </div>
 
-                {!loading && !session?.messages?.length && !proposedActions.length && !task ? (
-                  <div className="haor-chat-empty">
-                    <strong>开始聊天</strong>
-                    <span>直接像聊天一样提问，或告诉 haor 你想在站内执行什么操作。</span>
+                <div className="haor-chat-sidebar-scroll">
+                  <section className="haor-chat-sidebar-section haor-chat-state-panel" aria-label="haor 关键信息">
+                    <div className="haor-chat-sidebar-heading">
+                      <span className="haor-chat-sidebar-kicker">Overview</span>
+                      <strong className="haor-chat-sidebar-title">关键信息</strong>
+                    </div>
+                    <div className="haor-chat-state-card">
+                      <span className="haor-chat-state-label">当前目标</span>
+                      <strong className="haor-chat-state-value">{currentGoalTitle}</strong>
+                    </div>
+                    <div className="haor-chat-state-card">
+                      <span className="haor-chat-state-label">当前状态</span>
+                      <strong className="haor-chat-state-value">{sidebarStatusText}</strong>
+                    </div>
+                    <div className="haor-chat-state-card">
+                      <span className="haor-chat-state-label">当前阶段</span>
+                      <strong className="haor-chat-state-value">{agentStatePanel.stage}</strong>
+                    </div>
+                    <div className="haor-chat-state-card">
+                      <span className="haor-chat-state-label">下一步</span>
+                      <strong className="haor-chat-state-value">{agentStatePanel.next}</strong>
+                    </div>
+                    <div className="haor-chat-sidebar-note">
+                      最近更新 {sidebarUpdatedText}
+                    </div>
+                  </section>
+                </div>
+              </aside>
+
+              <section className="haor-chat-main" aria-label="haor 聊天主区">
+                <header className="haor-chat-main-header">
+                  <div className="haor-chat-main-header-copy">
+                    <span className="haor-chat-main-kicker">Conversation</span>
+                    <strong className="haor-chat-main-title">聊天主区</strong>
                   </div>
-                ) : null}
 
-                {session?.messages?.map((item) => {
-                  const isPendingPlanMessage = Boolean(proposedActions.length && item.id === pendingPlanMessageId);
-                  const content = isPendingPlanMessage
-                    ? joinSections([item.content, pendingPlanDetails])
-                    : item.content;
-                  const actions = isPendingPlanMessage ? (
-                    isAdmin ? (
-                      <Button type="primary" size="small" onClick={() => void handleApprove()} loading={approving}>
-                        确认执行
+                  <div className="haor-chat-header-actions">
+                    {showInterrupt ? (
+                      <Button
+                        danger
+                        size="small"
+                        className="haor-chat-header-button haor-chat-header-button-danger"
+                        onClick={() => void handleInterrupt()}
+                        loading={interrupting}
+                      >
+                        中断任务
                       </Button>
-                    ) : (
-                      <span className="haor-chat-inline-note">当前账号不是管理员，不能确认执行。</span>
-                    )
-                  ) : undefined;
+                    ) : null}
+                    <Button
+                      size="small"
+                      className="haor-chat-header-button haor-chat-header-button-primary"
+                      onClick={() => void handleReset()}
+                      loading={resetting}
+                      disabled={resetDisabled}
+                    >
+                      新会话
+                    </Button>
+                    <Button size="small" className="haor-chat-header-button" onClick={() => setOpen(false)}>
+                      关闭
+                    </Button>
+                  </div>
+                </header>
 
-                  return (
-                    <ChatBubble
-                      key={item.id}
-                      actions={actions}
-                      badge={messageBadgeText(item)}
-                      content={content}
-                      role={item.role === "user" ? "user" : "assistant"}
-                      sender={item.role === "user" ? "你" : "haor"}
-                      time={formatChatTime(item.created_at)}
-                      tone={messageTone(item)}
-                    />
-                  );
-                })}
+                <div ref={feedViewportRef} className="haor-chat-feed">
+                  {loading && !session?.messages?.length ? (
+                    <div className="haor-chat-empty">
+                      <strong>正在恢复会话</strong>
+                      <span>haor 正在同步最近的聊天记录和任务状态。</span>
+                    </div>
+                  ) : null}
 
-                {visiblePendingUserMessages.map((item) => (
-                  <ChatBubble
-                    key={`pending-${item.clientMessageId}`}
-                    content={item.content}
-                    metaNote={item.status === "failed" ? "发送失败" : "发送中"}
-                    role="user"
-                    sender="你"
-                    stateTone={item.status === "failed" ? "failed" : "pending"}
-                    time={formatChatTime(item.createdAt)}
-                  />
-                ))}
+                  {!loading && !session?.messages?.length && !proposedActions.length && !task ? (
+                    <div className="haor-chat-empty">
+                      <strong>开始聊天</strong>
+                      <span>直接像聊天一样提问，或告诉 haor 你想在站内执行什么操作。</span>
+                    </div>
+                  ) : null}
 
-                {streamFeed.map((item) => (
-                  <ChatBubble
-                    key={item.id}
-                    badge={item.badge}
-                    content={item.content}
-                    role="assistant"
-                    sender={item.sender}
-                    time={formatChatTime(item.time)}
-                    tone={item.tone}
-                  />
-                ))}
-
-                {!draftAssistantMessage?.content && assistantPlaceholder ? (
-                  <ChatBubble
-                    badge={assistantPlaceholder.badge}
-                    content={assistantPlaceholder.content}
-                    role="assistant"
-                    sender="haor"
-                    time={formatChatTime(new Date().toISOString())}
-                    tone={assistantPlaceholder.tone}
-                  />
-                ) : null}
-
-                {draftAssistantMessage?.content ? (
-                  <ChatBubble
-                    badge={draftAssistantMessage.messageType === "clarifying" ? "追问" : null}
-                    content={draftAssistantMessage.content}
-                    role="assistant"
-                    sender="haor"
-                    time={formatChatTime(new Date().toISOString())}
-                    tone={draftAssistantMessage.messageType === "clarifying" ? undefined : undefined}
-                  />
-                ) : null}
-
-                {proposedActions.length && !pendingPlanMessageId ? (
-                  <ChatBubble
-                    actions={
+                  {session?.messages?.map((item) => {
+                    const isPendingPlanMessage = Boolean(proposedActions.length && item.id === pendingPlanMessageId);
+                    const content = isPendingPlanMessage
+                      ? joinSections([item.content, pendingPlanDetails])
+                      : item.content;
+                    const actions = isPendingPlanMessage ? (
                       isAdmin ? (
                         <Button type="primary" size="small" onClick={() => void handleApprove()} loading={approving}>
-                          确认执行
+                          {approvalActionLabel}
                         </Button>
                       ) : (
-                        <span className="haor-chat-inline-note">当前账号不是管理员，不能确认执行。</span>
+                        <span className="haor-chat-inline-note">{approvalBlockedText}</span>
                       )
-                    }
-                    badge="计划"
-                    content={joinSections([
-                      typeof session?.pending_plan_json?.reply_markdown === "string"
-                        ? String(session.pending_plan_json.reply_markdown)
-                        : "",
-                      pendingPlanDetails,
-                    ])}
-                    role="assistant"
-                    sender="haor"
-                    time={formatChatTime(session?.updated_at)}
-                    tone="plan"
-                  />
-                ) : null}
+                    ) : undefined;
 
-                {task && !isTerminalTaskStatus(task.status) ? (
-                  <ChatBubble
-                    actions={
-                      <>
-                        {showInterrupt && task.id === session?.last_task_id ? (
-                          <Button danger size="small" onClick={() => void handleInterrupt()} loading={interrupting}>
-                            中断任务
+                    return (
+                      <ChatBubble
+                        key={item.id}
+                        actions={actions}
+                        badge={messageBadgeText(item)}
+                        content={content}
+                        role={item.role === "user" ? "user" : "assistant"}
+                        sender={item.role === "user" ? "你" : "haor"}
+                        time={formatChatTime(item.created_at)}
+                        tone={messageTone(item)}
+                      />
+                    );
+                  })}
+
+                  {visiblePendingUserMessages.map((item) => (
+                    <ChatBubble
+                      key={`pending-${item.clientMessageId}`}
+                      content={item.content}
+                      metaNote={item.status === "failed" ? "发送失败" : "发送中"}
+                      role="user"
+                      sender="你"
+                      stateTone={item.status === "failed" ? "failed" : "pending"}
+                      time={formatChatTime(item.createdAt)}
+                    />
+                  ))}
+
+                  {streamFeed.map((item) => (
+                    <ChatBubble
+                      key={item.id}
+                      badge={item.badge}
+                      content={item.content}
+                      role="assistant"
+                      sender={item.sender}
+                      time={formatChatTime(item.time)}
+                      tone={item.tone}
+                    />
+                  ))}
+
+                  {!draftAssistantMessage?.content && assistantPlaceholder ? (
+                    <ChatBubble
+                      badge={assistantPlaceholder.badge}
+                      content={assistantPlaceholder.content}
+                      role="assistant"
+                      sender="haor"
+                      time={formatChatTime(new Date().toISOString())}
+                      tone={assistantPlaceholder.tone}
+                    />
+                  ) : null}
+
+                  {draftAssistantMessage?.content ? (
+                    <ChatBubble
+                      badge={draftAssistantMessage.messageType === "clarifying" ? "追问" : null}
+                      content={draftAssistantMessage.content}
+                      role="assistant"
+                      sender="haor"
+                      time={formatChatTime(new Date().toISOString())}
+                      tone={draftAssistantMessage.messageType === "clarifying" ? undefined : undefined}
+                    />
+                  ) : null}
+
+                  {proposedActions.length && !pendingPlanMessageId ? (
+                    <ChatBubble
+                      actions={
+                        isAdmin ? (
+                          <Button type="primary" size="small" onClick={() => void handleApprove()} loading={approving}>
+                            {approvalActionLabel}
                           </Button>
-                        ) : null}
-                        <Button size="small" onClick={() => router.push(`/tasks/${task.id}`)}>
-                          打开任务页
-                        </Button>
-                      </>
-                    }
-                    badge="任务"
-                    content={liveTaskDigest}
-                    role="assistant"
-                    sender="haor"
-                    time={formatChatTime(task.updated_at)}
-                    tone="task"
-                  />
-                ) : null}
-              </div>
-            </div>
+                        ) : (
+                          <span className="haor-chat-inline-note">{approvalBlockedText}</span>
+                        )
+                      }
+                      badge="计划"
+                      content={joinSections([
+                        typeof session?.pending_plan_json?.reply_markdown === "string"
+                          ? String(session.pending_plan_json.reply_markdown)
+                          : "",
+                        pendingPlanDetails,
+                      ])}
+                      role="assistant"
+                      sender="haor"
+                      time={formatChatTime(session?.updated_at)}
+                      tone="plan"
+                    />
+                  ) : null}
 
-            <footer className="haor-chat-composer">
-              <div className="haor-chat-composer-box">
-                <Input.TextArea
-                  autoSize={{ minRows: 2, maxRows: 6 }}
-                  rootClassName="haor-chat-composer-input"
-                  classNames={{ textarea: "haor-chat-composer-textarea" }}
-                  value={inputValue}
-                  placeholder="发送消息给 haor，像聊天一样提问、追问或描述你想执行的操作。"
-                  onChange={(event) => setInputValue(event.target.value)}
-                  onPressEnter={(event) => {
-                    if (event.shiftKey) {
-                      return;
-                    }
-                    event.preventDefault();
-                    void handleSend(inputValue);
-                  }}
-                  disabled={sendDisabled}
-                />
-                <div className="haor-chat-composer-footer">
-                  <span className="haor-chat-composer-hint">{composerHint}</span>
-                  <Button
-                    type="primary"
-                    className="haor-chat-send-button"
-                    onClick={() => void handleSend(inputValue)}
-                    loading={sending}
-                    disabled={sendDisabled || !inputValue.trim()}
-                  >
-                    发送
-                  </Button>
+                  {task && !isTerminalTaskStatus(task.status) ? (
+                    <ChatBubble
+                      actions={
+                        <>
+                          {showInterrupt && task.id === session?.last_task_id ? (
+                            <Button danger size="small" onClick={() => void handleInterrupt()} loading={interrupting}>
+                              中断任务
+                            </Button>
+                          ) : null}
+                          <Button size="small" onClick={() => router.push(`/tasks/${task.id}`)}>
+                            打开任务页
+                          </Button>
+                        </>
+                      }
+                      badge="任务"
+                      content={liveTaskDigest}
+                      role="assistant"
+                      sender="haor"
+                      time={formatChatTime(task.updated_at)}
+                      tone="task"
+                    />
+                  ) : null}
                 </div>
-              </div>
-            </footer>
+
+                <footer className="haor-chat-composer">
+                  <div className="haor-chat-composer-box">
+                    <Input.TextArea
+                      autoSize={{ minRows: 2, maxRows: 6 }}
+                      rootClassName="haor-chat-composer-input"
+                      classNames={{ textarea: "haor-chat-composer-textarea" }}
+                      value={inputValue}
+                      placeholder="发送消息给 haor，像聊天一样提问、追问或描述你想执行的操作。"
+                      onChange={(event) => setInputValue(event.target.value)}
+                      onPressEnter={(event) => {
+                        if (event.shiftKey) {
+                          return;
+                        }
+                        event.preventDefault();
+                        void handleSend(inputValue);
+                      }}
+                      disabled={sendDisabled}
+                    />
+                    <div className="haor-chat-composer-footer">
+                      <span className="haor-chat-composer-hint">{composerHint}</span>
+                      <Button
+                        type="primary"
+                        className="haor-chat-send-button"
+                        onClick={() => void handleSend(inputValue)}
+                        loading={sending}
+                        disabled={sendDisabled || !inputValue.trim()}
+                      >
+                        发送
+                      </Button>
+                    </div>
+                  </div>
+                </footer>
+              </section>
+            </div>
           </section>
         </div>
       ) : null}

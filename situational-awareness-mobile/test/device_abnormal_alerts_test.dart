@@ -46,6 +46,7 @@ void main() {
     expect(decision.alert, isNull);
     expect(decision.nextSnapshot.highRiskFindings, 1);
     expect(decision.nextSnapshot.seenRiskIds, contains('risk-1'));
+    expect(decision.nextSnapshot.openedRiskIds, isEmpty);
   });
 
   test('new high risk finding triggers direct detail alert', () {
@@ -105,6 +106,30 @@ void main() {
     );
 
     expect(decision.alert, isNull);
+  });
+
+  test('opened risk ids stay intact across syncs', () {
+    const previous = DeviceAbnormalAlertSnapshot(
+      highRiskFindings: 1,
+      seenRiskIds: ['risk-1'],
+      openedRiskIds: ['risk-1'],
+    );
+
+    final decision = evaluateDeviceAbnormalAlert(
+      previous: previous,
+      overview: _buildOverview(
+        highRiskFindings: 1,
+        recentRisks: const [_highRisk],
+      ),
+    );
+
+    expect(decision.nextSnapshot.openedRiskIds, contains('risk-1'));
+  });
+
+  test('detail route parser only extracts concrete risk route', () {
+    expect(extractDeviceAbnormalRiskIdFromRoute('/risks/risk-1'), 'risk-1');
+    expect(extractDeviceAbnormalRiskIdFromRoute('/risks?status=open'), isNull);
+    expect(extractDeviceAbnormalRiskIdFromRoute('/assets/asset-1'), isNull);
   });
 }
 

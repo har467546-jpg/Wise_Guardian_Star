@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -57,6 +58,8 @@ class _AppShellState extends ConsumerState<AppShell>
   bool _syncingAlerts = false;
   DeviceAlertStreamController? _deviceAlertStream;
   OverlayEntry? _deviceAlertOverlayEntry;
+  final Queue<_DeviceAlertPromptData> _pendingDeviceAlertPrompts = Queue();
+  _DeviceAlertPromptData? _activeDeviceAlertPrompt;
   StreamSubscription<DeviceAbnormalNotificationIntent>?
       _notificationIntentSubscription;
 
@@ -84,7 +87,8 @@ class _AppShellState extends ConsumerState<AppShell>
     WidgetsBinding.instance.removeObserver(this);
     _notificationIntentSubscription?.cancel();
     _pauseAlertPolling();
-    _dismissDeviceAlertPrompt();
+    _pendingDeviceAlertPrompts.clear();
+    _dismissDeviceAlertPrompt(showNext: false);
     unawaited(_stopRealtimeAlerts());
     super.dispose();
   }
@@ -168,10 +172,8 @@ class _AppShellState extends ConsumerState<AppShell>
         title: '设备异常提醒',
         message: alert.message,
         actionLabel: alert.actionLabel,
-        onOpen: () => _openRoute(
-          route: alert.route,
-          navigateWithGo: alert.navigateWithGo,
-        ),
+        route: alert.route,
+        navigateWithGo: alert.navigateWithGo,
       );
     } catch (_) {
       return;
@@ -190,10 +192,8 @@ class _AppShellState extends ConsumerState<AppShell>
       title: alert.title,
       message: alert.message,
       actionLabel: alert.actionLabel,
-      onOpen: () => _openRoute(
-        route: alert.route,
-        navigateWithGo: alert.navigateWithGo,
-      ),
+      route: alert.route,
+      navigateWithGo: alert.navigateWithGo,
     );
   }
 
@@ -201,8 +201,35 @@ class _AppShellState extends ConsumerState<AppShell>
     required String title,
     required String message,
     required String actionLabel,
-    required VoidCallback onOpen,
+    required String route,
+    required bool navigateWithGo,
   }) {
+    final prompt = _DeviceAlertPromptData(
+      title: title,
+      message: message,
+      actionLabel: actionLabel,
+      route: route,
+      navigateWithGo: navigateWithGo,
+    );
+    if (_containsDeviceAlertPrompt(prompt)) {
+      return;
+    }
+    if (_activeDeviceAlertPrompt != null) {
+      _pendingDeviceAlertPrompts.addLast(prompt);
+      return;
+    }
+    _presentDeviceAlertPrompt(prompt);
+  }
+
+  bool _containsDeviceAlertPrompt(_DeviceAlertPromptData prompt) {
+    final activePrompt = _activeDeviceAlertPrompt;
+    if (activePrompt != null && activePrompt.isSamePrompt(prompt)) {
+      return true;
+    }
+    return _pendingDeviceAlertPrompts.any((item) => item.isSamePrompt(prompt));
+  }
+
+  void _presentDeviceAlertPrompt(_DeviceAlertPromptData prompt) {
     if (!mounted) {
       return;
     }
@@ -210,7 +237,8 @@ class _AppShellState extends ConsumerState<AppShell>
     if (overlay == null) {
       return;
     }
-    _dismissDeviceAlertPrompt();
+    _dismissDeviceAlertPrompt(showNext: false);
+    _activeDeviceAlertPrompt = prompt;
     _deviceAlertOverlayEntry = OverlayEntry(
       builder: (context) {
         final topPadding = MediaQuery.paddingOf(context).top + 10;
@@ -219,13 +247,16 @@ class _AppShellState extends ConsumerState<AppShell>
           left: 12,
           right: 12,
           child: _DeviceAlertPromptCard(
-            title: title,
-            message: message,
-            actionLabel: actionLabel,
+            title: prompt.title,
+            message: prompt.message,
+            actionLabel: prompt.actionLabel,
             onDismiss: _dismissDeviceAlertPrompt,
             onOpen: () {
               _dismissDeviceAlertPrompt();
-              onOpen();
+              _openRoute(
+                route: prompt.route,
+                navigateWithGo: prompt.navigateWithGo,
+              );
             },
           ),
         );
@@ -238,11 +269,17 @@ class _AppShellState extends ConsumerState<AppShell>
     );
   }
 
-  void _dismissDeviceAlertPrompt() {
+  void _dismissDeviceAlertPrompt({bool showNext = true}) {
     _deviceAlertHideTimer?.cancel();
     _deviceAlertHideTimer = null;
     _deviceAlertOverlayEntry?.remove();
     _deviceAlertOverlayEntry = null;
+    _activeDeviceAlertPrompt = null;
+    if (!showNext || !mounted || _pendingDeviceAlertPrompts.isEmpty) {
+      return;
+    }
+    final nextPrompt = _pendingDeviceAlertPrompts.removeFirst();
+    _presentDeviceAlertPrompt(nextPrompt);
   }
 
   void _handleNotificationIntent(DeviceAbnormalNotificationIntent intent) {
@@ -262,6 +299,7 @@ class _AppShellState extends ConsumerState<AppShell>
     if (!mounted) {
       return;
     }
+    unawaited(markDeviceAbnormalRouteSeen(route: route));
     if (navigateWithGo) {
       context.go(route);
       return;
@@ -335,6 +373,30 @@ class _AppShellState extends ConsumerState<AppShell>
                 )
               : null,
     );
+  }
+}
+
+class _DeviceAlertPromptData {
+  const _DeviceAlertPromptData({
+    required this.title,
+    required this.message,
+    required this.actionLabel,
+    required this.route,
+    required this.navigateWithGo,
+  });
+
+  final String title;
+  final String message;
+  final String actionLabel;
+  final String route;
+  final bool navigateWithGo;
+
+  bool isSamePrompt(_DeviceAlertPromptData other) {
+    return title == other.title &&
+        message == other.message &&
+        actionLabel == other.actionLabel &&
+        route == other.route &&
+        navigateWithGo == other.navigateWithGo;
   }
 }
 

@@ -249,8 +249,8 @@ def build_stage_timings(
             {
                 "stage_code": _event_field(event, "stage_code"),
                 "stage_name": _event_field(event, "stage_name") or _event_field(event, "message"),
-                "started_at": started_at,
-                "finished_at": finished_at,
+                "started_at": _json_safe_value(started_at),
+                "finished_at": _json_safe_value(finished_at),
                 "duration_ms": _duration_ms(started_at, finished_at),
             }
         )
@@ -269,20 +269,20 @@ def serialize_task_run(
         timing_events = build_fallback_events(task)
     return {
         "id": task.id,
-        "task_type": task.task_type,
-        "status": task.status,
+        "task_type": _json_safe_value(task.task_type),
+        "status": _json_safe_value(task.status),
         "scope_type": task.scope_type,
         "scope_id": task.scope_id,
         "celery_task_id": task.celery_task_id,
         "progress": task.progress,
         "message": task.message,
         "retry_count": task.retry_count,
-        "result_json": task.result_json or {},
-        "error_json": task.error_json or {},
-        "created_at": task.created_at,
-        "started_at": task.started_at,
-        "finished_at": task.finished_at,
-        "updated_at": task.updated_at,
+        "result_json": _json_safe_value(task.result_json or {}),
+        "error_json": _json_safe_value(task.error_json or {}),
+        "created_at": _json_safe_value(task.created_at),
+        "started_at": _json_safe_value(task.started_at),
+        "finished_at": _json_safe_value(task.finished_at),
+        "updated_at": _json_safe_value(task.updated_at),
         "timing": build_task_timing(task, timing_events, now=now, has_event_logs=bool(active_events)),
     }
 
@@ -299,5 +299,5 @@ def serialize_task_detail(
     detail["stage_timings"] = build_stage_timings(task, detail_events, now=now)
     detail["event_count"] = len(detail_events)
     last_event = detail_events[-1] if detail_events else None
-    detail["last_event_at"] = _event_created_at(last_event) if last_event is not None else None
+    detail["last_event_at"] = _json_safe_value(_event_created_at(last_event)) if last_event is not None else None
     return detail

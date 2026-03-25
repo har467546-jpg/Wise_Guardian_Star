@@ -128,8 +128,8 @@ Future<void> initializeConfiguredApiBaseUrl() async {
   final nextValue = persisted.trim().isNotEmpty
       ? persisted
       : (_configuredApiBaseUrlFromEnv.trim().isNotEmpty
-            ? _configuredApiBaseUrlFromEnv
-            : _defaultApiBaseUrl());
+          ? _configuredApiBaseUrlFromEnv
+          : _defaultApiBaseUrl());
   _runtimeApiBaseUrl = resolveConfiguredApiBaseUrl(
     configured: nextValue,
     isAndroid: Platform.isAndroid,
@@ -149,16 +149,21 @@ Future<void> persistConfiguredApiBaseUrl(String baseUrl) async {
 }
 
 Future<bool> _isPlatformApiBaseUrlHealthy(String baseUrl) async {
-  final client = HttpClient()..connectionTimeout = const Duration(milliseconds: 600);
+  final client = HttpClient()
+    ..connectionTimeout = const Duration(milliseconds: 600);
   try {
     final request = await client
         .getUrl(_buildApiUri(baseUrl, const ['auth', 'bootstrap-status']))
         .timeout(const Duration(milliseconds: 800));
-    final response = await request.close().timeout(const Duration(milliseconds: 900));
+    final response =
+        await request.close().timeout(const Duration(milliseconds: 900));
     if (response.statusCode != 200) {
       return false;
     }
-    final body = await response.transform(utf8.decoder).join().timeout(const Duration(milliseconds: 900));
+    final body = await response
+        .transform(utf8.decoder)
+        .join()
+        .timeout(const Duration(milliseconds: 900));
     final decoded = jsonDecode(body);
     return decoded is Map && decoded.containsKey('can_bootstrap_admin');
   } catch (_) {
@@ -272,7 +277,8 @@ bool shouldAttemptApiBaseUrlSync(Object error) {
       message.contains('当前地址：');
 }
 
-Future<String?> synchronizeConfiguredApiBaseUrl({bool forceRescan = false}) async {
+Future<String?> synchronizeConfiguredApiBaseUrl(
+    {bool forceRescan = false}) async {
   await initializeConfiguredApiBaseUrl();
   final current = configuredApiBaseUrl;
   if (!forceRescan && await _isPlatformApiBaseUrlHealthy(current)) {
@@ -290,7 +296,8 @@ Future<String?> synchronizeApiBaseUrlForRef(
   Ref ref, {
   bool forceRescan = false,
 }) async {
-  final resolved = await synchronizeConfiguredApiBaseUrl(forceRescan: forceRescan);
+  final resolved =
+      await synchronizeConfiguredApiBaseUrl(forceRescan: forceRescan);
   ref.invalidate(dioProvider);
   ref.invalidate(apiClientProvider);
   return resolved;
@@ -302,6 +309,20 @@ Uri buildHaorSessionStreamUri() {
 
 Uri buildDeviceAlertStreamUri() {
   return buildApiWebSocketUri('/api/v1/mobile/alerts/stream');
+}
+
+Uri buildAuthenticatedDeviceAlertStreamUri(String token) {
+  final normalizedToken = token.trim();
+  final streamUri = buildDeviceAlertStreamUri();
+  if (normalizedToken.isEmpty) {
+    return streamUri;
+  }
+  return streamUri.replace(
+    queryParameters: {
+      ...streamUri.queryParameters,
+      'token': normalizedToken,
+    },
+  );
 }
 
 Uri buildApiWebSocketUri(String streamPath, {String? baseUrl}) {

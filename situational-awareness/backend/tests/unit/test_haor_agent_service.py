@@ -77,6 +77,54 @@ def test_build_model_request_uses_structured_messages() -> None:
     assert any("上一轮仍未完成的对话状态如下" in message.text_content() for message in request.messages if message.role == "user")
 
 
+def test_build_model_request_serializes_datetime_tool_trace_context() -> None:
+    base = datetime(2026, 3, 25, 2, 0, tzinfo=UTC)
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", message_type="text", content="继续"),
+        ]
+    )
+    user = SimpleNamespace(role="admin")
+
+    request = haor_agent_service._build_model_request(
+        session=session,
+        user=user,
+        page_context={"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+        browser_context={"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+        browser_runtime={},
+        working_context={
+            "task_id": "task-1",
+            "source": "task_watch",
+            "summary": "任务 task-1",
+            "primary_target": {"task_id": "task-1", "source": "task_watch", "summary": "任务 task-1"},
+            "recent_targets": [{"task_id": "task-1", "source": "task_watch", "summary": "任务 task-1"}],
+        },
+        dialog_state={},
+        followup_hint={},
+        tool_traces=[
+            {
+                "tool_name": "get_task_detail",
+                "arguments": {"task_id": "task-1"},
+                "ok": True,
+                "result": {
+                    "task_type": TaskType.ASSET_SCAN,
+                    "status": TaskExecutionStatus.SUCCESS,
+                    "created_at": base,
+                    "timing": {"last_seen_at": base},
+                },
+            }
+        ],
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    serialized_messages = [message.text_content() for message in request.messages if message.role == "user"]
+
+    assert any(base.isoformat() in message for message in serialized_messages)
+    assert any('"task_type": "asset_scan"' in message for message in serialized_messages)
+    assert any('"status": "success"' in message for message in serialized_messages)
+
+
 def test_parse_model_decision_allows_null_retryable_and_normalizes_it() -> None:
     decision = haor_agent_service._parse_model_decision(
         """
@@ -119,6 +167,27 @@ def test_parse_model_decision_normalizes_dialog_state_intent_kind_alias() -> Non
 
     assert decision.dialog_state_update is not None
     assert decision.dialog_state_update.intent_kind == "prepare_plan"
+
+
+def test_parse_model_decision_normalizes_schema_drift_aliases() -> None:
+    decision = haor_agent_service._parse_model_decision(
+        """
+        {
+          "reply_markdown": "我来继续推进。",
+          "conversation_state": "completed",
+          "read_tool_calls": null,
+          "needs_confirmation": "false",
+          "followup_resolution": "继续承接上一轮"
+        }
+        """
+    )
+
+    assert decision.conversation_state == "answer"
+    assert decision.read_tool_calls == []
+    assert decision.needs_confirmation is False
+    assert decision.followup_resolution is not None
+    assert decision.followup_resolution.status == "unknown"
+    assert decision.followup_resolution.summary == "继续承接上一轮"
 
 
 def test_normalize_dialog_state_accepts_objective_kind_alias() -> None:
@@ -872,10 +941,11 @@ def test_run_agent_loop_falls_back_to_action_first_decision_when_model_returns_n
             return "好的，我会开始扫描 192.168.10.0/24 网段，并实时同步进度。"
 
     monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "match_registered_playbook", lambda **kwargs: None)
     monkeypatch.setattr(
         haor_agent_service,
         "_build_runtime_provider",
-        lambda: SimpleNamespace(provider=_FakeProvider()),
+        lambda **kwargs: SimpleNamespace(provider=_FakeProvider()),
     )
 
     decision, tool_traces = haor_agent_service._run_agent_loop(
@@ -896,6 +966,155 @@ def test_run_agent_loop_falls_back_to_action_first_decision_when_model_returns_n
     assert decision.stop_reason == "action_first_auto_execute"
     assert decision.auto_execute_actions[0].action_type == "create_discovery_job"
     assert decision.auto_execute_actions[0].params["cidr"] == "192.168.10.0/24"
+
+
+def test_run_agent_loop_falls_back_when_model_returns_schema_invalid_json(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class _FakeProvider:
+        def generate(self, _request):
+            return """
+            {
+              "reply_markdown": "我来处理。",
+              "conversation_state": "answer",
+              "read_tool_calls": "oops"
+            }
+            """
+
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "match_registered_playbook", lambda **kwargs: None)
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_build_runtime_provider",
+        lambda **kwargs: SimpleNamespace(
+            provider_name="custom_proxy",
+            resolved_base_url="https://example.test/v1",
+            provider=SimpleNamespace(wire_api="responses", generate=_FakeProvider().generate),
+        ),
+    )
+
+    decision, tool_traces = haor_agent_service._run_agent_loop(
+        _FakeUnitDB(),
+        session=SimpleNamespace(messages=[SimpleNamespace(role="user", message_type="text", content="帮我扫描 192.168.10.0/24 网段")]),
+        user=SimpleNamespace(role="admin"),
+        page_context={"pathname": "/", "query": {}},
+        browser_context={"pathname": "/", "query": {}, "semantic_page_context": {"page_kind": "generic"}},
+        browser_runtime={},
+        working_context={},
+        dialog_state={},
+        followup_hint={},
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    assert tool_traces == []
+    assert decision.stop_reason == "action_first_auto_execute"
+    assert decision.auto_execute_actions[0].action_type == "create_discovery_job"
+
+
+def test_run_model_once_retries_custom_proxy_with_chat_completions_on_contract_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(messages=[SimpleNamespace(role="user", message_type="text", content="继续")])
+    user = SimpleNamespace(role="admin")
+    build_calls: list[tuple[str | None, bool]] = []
+
+    def _fake_build_runtime_provider(*, wire_api_override=None, chat_json_mode=False):  # type: ignore[no-untyped-def]
+        build_calls.append((wire_api_override, chat_json_mode))
+        if wire_api_override == "chat_completions":
+            return SimpleNamespace(
+                provider_name="custom_proxy",
+                resolved_base_url="https://example.test/v1",
+                provider=SimpleNamespace(
+                    wire_api="chat_completions",
+                    generate=lambda _request: '{"reply_markdown":"已恢复继续分析。","conversation_state":"answer"}',
+                ),
+            )
+        return SimpleNamespace(
+            provider_name="custom_proxy",
+            resolved_base_url="https://example.test/v1",
+            provider=SimpleNamespace(
+                wire_api="responses",
+                generate=lambda _request: '{"reply_markdown":"我来处理。","conversation_state":"answer","read_tool_calls":"oops"}',
+            ),
+        )
+
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "_build_runtime_provider", _fake_build_runtime_provider)
+
+    decision = haor_agent_service._run_model_once(
+        session=session,
+        user=user,
+        page_context={"pathname": "/", "query": {}},
+        browser_context={"pathname": "/", "query": {}, "semantic_page_context": {"page_kind": "generic"}},
+        browser_runtime={},
+        working_context={},
+        dialog_state={},
+        followup_hint={"reply_kind": "affirm", "raw_user_reply": "继续"},
+        tool_traces=[],
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    assert decision.reply_markdown == "已恢复继续分析。"
+    assert build_calls == [(None, False), ("chat_completions", True)]
+
+
+def test_build_action_first_fallback_decision_resumes_from_recent_resume_hint() -> None:
+    user = SimpleNamespace(role="admin")
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_verify_analysis",
+                        "working_context": {"asset_id": "asset-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "list_asset_risks", "arguments": {"asset_id": "asset-1", "limit": 10}}
+                        ],
+                        "suggested_reply_label": "分析验证结果",
+                    }
+                }
+            )
+        ]
+    )
+
+    decision = haor_agent_service._build_action_first_fallback_decision(
+        content="继续",
+        user=user,
+        page_context={"pathname": "/", "query": {}},
+        browser_context={"pathname": "/", "query": {}, "semantic_page_context": {"page_kind": "generic"}},
+        working_context={},
+        dialog_state={},
+        followup_hint={"reply_kind": "affirm", "raw_user_reply": "继续"},
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+        session=session,
+        tool_traces=[],
+    )
+
+    assert decision is not None
+    assert decision.stop_reason == "resume_hint_read"
+    assert decision.read_tool_calls[0].tool_name == "list_asset_risks"
+    assert decision.read_tool_calls[0].arguments["asset_id"] == "asset-1"
+
+
+def test_build_action_first_fallback_decision_clarifies_short_resume_without_context() -> None:
+    user = SimpleNamespace(role="admin")
+
+    decision = haor_agent_service._build_action_first_fallback_decision(
+        content="继续",
+        user=user,
+        page_context={"pathname": "/", "query": {}},
+        browser_context={"pathname": "/", "query": {}, "semantic_page_context": {"page_kind": "generic"}},
+        working_context={},
+        dialog_state={},
+        followup_hint={"reply_kind": "affirm", "raw_user_reply": "继续"},
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+        session=SimpleNamespace(messages=[]),
+        tool_traces=[],
+    )
+
+    assert decision is not None
+    assert decision.conversation_state == "clarifying"
+    assert "稳定承接上一轮" in decision.reply_markdown
 
 
 def test_reconcile_running_session_state_restores_active_after_canceled_task(monkeypatch) -> None:

@@ -133,13 +133,13 @@ export default function DiscoveryForm() {
 
       <Row gutter={[20, 20]}>
         <Col xs={24} lg={15}>
-          <Card className="panel-card discovery-command-card" bordered={false}>
+          <Card className="panel-card discovery-command-card" data-haor-section="任务配置" bordered={false}>
             <Title level={4}>任务配置</Title>
             <Paragraph type="secondary">
               系统将按照 <Text code>主机存活 -{">"} 端口指纹 -{">"} 风险验证</Text> 的顺序执行。
             </Paragraph>
 
-            <Form form={form} layout="vertical" onFinish={onSubmit} size="large">
+            <Form form={form} layout="vertical" onFinish={onSubmit} size="large" data-haor-section="扫描发起表单">
               <Form.Item
                 name="cidr"
                 label={<Text strong>CIDR 目标网段</Text>}
@@ -179,6 +179,7 @@ export default function DiscoveryForm() {
                 loading={submitting}
                 disabled={submitting}
                 className="discovery-submit-button"
+                data-haor-section="启动流水线"
               >
                 启动流水线
               </Button>
@@ -205,7 +206,7 @@ export default function DiscoveryForm() {
         </Col>
 
         <Col xs={24} lg={9}>
-          <Card className="panel-card discovery-stage-card" bordered={false} title={<Text strong>自动化流水线详情</Text>}>
+          <Card className="panel-card discovery-stage-card" data-haor-section="自动化流水线详情" bordered={false} title={<Text strong>自动化流水线详情</Text>}>
             <div className="workflow-stage-list">
               {pipelineStages.map((stage) => (
                 <div key={stage.code} className="workflow-stage-item">

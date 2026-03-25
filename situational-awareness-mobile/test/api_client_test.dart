@@ -36,14 +36,21 @@ void main() {
     );
   });
 
-  test('public http endpoint still requires explicit insecure opt-in', () {
+  test('device alert websocket endpoint carries token in query', () {
     expect(
-      () => resolveConfiguredApiBaseUrl(
+      buildAuthenticatedDeviceAlertStreamUri('token-123').toString(),
+      'ws://127.0.0.1:8000/api/v1/mobile/alerts/stream?token=token-123',
+    );
+  });
+
+  test('public http endpoint falls back without explicit insecure opt-in', () {
+    expect(
+      resolveConfiguredApiBaseUrl(
         configured: 'http://example.com/api/v1',
         isAndroid: false,
         allowInsecureDevTransport: false,
       ),
-      throwsStateError,
+      'http://127.0.0.1:8000/api/v1',
     );
   });
 

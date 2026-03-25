@@ -2568,11 +2568,11 @@ pre {
 .haor-chat-window {
   position: relative;
   z-index: 1;
-  width: min(1320px, calc(100vw - 32px));
+  width: min(1440px, calc(100vw - 32px));
   height: min(94vh, 960px);
   max-height: calc(100vh - 32px);
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  display: block;
+  min-height: 0;
   border-radius: 30px;
   overflow: hidden;
   border: 1px solid rgba(122, 146, 92, 0.18);
@@ -2584,20 +2584,7 @@ pre {
     0 10px 28px rgba(23, 33, 23, 0.08);
 }
 
-.haor-chat-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 22px 24px 18px;
-  border-bottom: 1px solid rgba(107, 124, 87, 0.12);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(244, 247, 238, 0.84));
-  backdrop-filter: blur(8px);
-}
-
 .haor-chat-header-copy {
-  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -2627,12 +2614,12 @@ pre {
 .haor-chat-status {
   display: inline-flex;
   align-items: center;
-  padding: 5px 10px;
+  padding: 7px 14px;
   border-radius: 999px;
   background: rgba(66, 75, 62, 0.08);
   color: #4c5847;
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 14px;
+  font-weight: 700;
 }
 
 .haor-chat-status-waiting_approval {
@@ -2735,29 +2722,124 @@ pre {
 }
 
 .haor-chat-body {
+  display: grid;
+  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.haor-chat-main {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: #ffffff;
+}
+
+.haor-chat-sidebar {
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  gap: 14px;
+  padding: 24px 16px 18px 18px;
+  border-right: 1px solid rgba(173, 199, 227, 0.16);
+  background: #ffffff;
+}
+
+.haor-chat-sidebar-top {
+  flex: 0 0 auto;
+  padding: 6px 6px 12px 4px;
+  border-bottom: 1px solid rgba(173, 199, 227, 0.16);
+}
+
+.haor-chat-sidebar-scroll {
+  flex: 1 1 auto;
   min-height: 0;
-  overflow: hidden;
-  padding: 0 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 2px 4px 4px 0;
+}
+
+.haor-chat-sidebar-section {
+  display: grid;
+  gap: 12px;
+}
+
+.haor-chat-sidebar-heading {
+  display: grid;
+  gap: 4px;
+  padding: 2px 4px 0;
+}
+
+.haor-chat-sidebar-kicker {
+  color: #688061;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.haor-chat-sidebar-title {
+  color: #20301e;
+  font-size: 17px;
+  line-height: 1.35;
+}
+
+.haor-chat-sidebar-note {
+  padding: 0 4px;
+  color: #6d7d8f;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.haor-chat-main-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px 24px 18px;
+  border-bottom: 1px solid rgba(107, 124, 87, 0.12);
   background:
-    radial-gradient(circle at top, rgba(145, 189, 114, 0.08), transparent 26%),
-    linear-gradient(180deg, rgba(241, 245, 236, 0.92), rgba(234, 239, 230, 0.92));
+    linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(244, 247, 238, 0.84));
+  backdrop-filter: blur(8px);
+}
+
+.haor-chat-main-header-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.haor-chat-main-kicker {
+  color: #688061;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.haor-chat-main-title {
+  color: #20301e;
+  font-size: 18px;
+  line-height: 1.35;
 }
 
 .haor-chat-state-panel {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  padding: 16px 8px 0;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  padding: 0;
 }
 
 .haor-chat-state-card {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
-  padding: 12px 14px;
+  padding: 14px 16px;
   border: 1px solid rgba(116, 147, 113, 0.18);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.72);
@@ -2766,9 +2848,9 @@ pre {
 }
 
 .haor-chat-state-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: #688061;
 }
@@ -2776,18 +2858,129 @@ pre {
 .haor-chat-state-value {
   min-width: 0;
   color: #20301e;
-  font-size: 13px;
-  line-height: 1.6;
+  font-size: 15px;
+  line-height: 1.65;
   white-space: normal;
   word-break: break-word;
 }
 
+.haor-chat-goal-panel {
+  display: grid;
+  gap: 12px;
+  padding: 0;
+}
+
+.haor-chat-goal-primary {
+  display: grid;
+  gap: 14px;
+  padding: 16px 18px;
+  border: 1px solid rgba(116, 147, 113, 0.18);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 10px 24px rgba(54, 79, 42, 0.06);
+}
+
+.haor-chat-goal-primary-header,
+.haor-chat-goal-footer,
+.haor-chat-goal-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.haor-chat-goal-primary-copy,
+.haor-chat-goal-item-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.haor-chat-goal-label,
+.haor-chat-goal-detail-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #688061;
+}
+
+.haor-chat-goal-title,
+.haor-chat-goal-detail-value,
+.haor-chat-goal-item-copy strong {
+  min-width: 0;
+  color: #20301e;
+  font-size: 15px;
+  line-height: 1.65;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.haor-chat-goal-status {
+  flex: none;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 700;
+  color: #2b5131;
+  background: rgba(78, 127, 90, 0.12);
+}
+
+.haor-chat-goal-status-blocked {
+  color: #8a5b16;
+  background: rgba(215, 140, 24, 0.14);
+}
+
+.haor-chat-goal-status-completed {
+  color: #165b39;
+  background: rgba(48, 151, 92, 0.14);
+}
+
+.haor-chat-goal-status-failed,
+.haor-chat-goal-status-canceled {
+  color: #9b2c2c;
+  background: rgba(220, 38, 38, 0.12);
+}
+
+.haor-chat-goal-details {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+.haor-chat-goal-detail {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(242, 247, 238, 0.9);
+}
+
+.haor-chat-goal-meta,
+.haor-chat-goal-item-copy span {
+  color: #60705c;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.haor-chat-goal-list {
+  display: grid;
+  gap: 8px;
+}
+
+.haor-chat-goal-item {
+  padding: 12px 14px;
+  border: 1px solid rgba(116, 147, 113, 0.16);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.66);
+}
+
 .haor-chat-feed {
-  flex: 1 1 auto;
   min-height: 0;
-  height: 100%;
   overflow-y: auto;
-  padding: 22px 8px 18px;
+  padding: 22px 24px 18px;
+  background: #ffffff;
 }
 
 .haor-chat-empty {
@@ -2922,12 +3115,12 @@ pre {
   display: inline-flex;
   align-items: center;
   margin-bottom: 8px;
-  padding: 3px 8px;
+  padding: 5px 10px;
   border-radius: 999px;
   background: rgba(18, 28, 18, 0.08);
   color: inherit;
-  font-size: 11px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .haor-chat-bubble-body {
@@ -2978,8 +3171,7 @@ pre {
 .haor-chat-composer {
   position: relative;
   z-index: 1;
-  flex: 0 0 auto;
-  padding: 16px 18px 18px;
+  padding: 16px 24px 20px;
   border-top: 1px solid rgba(107, 124, 87, 0.12);
   background:
     linear-gradient(180deg, rgba(248, 249, 242, 0.92), rgba(244, 247, 238, 0.98));
@@ -3037,7 +3229,7 @@ pre {
 
 .haor-chat-composer-hint {
   color: #5b6756;
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.5;
 }
 
@@ -3070,6 +3262,25 @@ pre {
   box-shadow: none;
 }
 
+@media (max-width: 1180px) {
+  .haor-chat-body {
+    grid-template-columns: 1fr;
+  }
+
+  .haor-chat-sidebar {
+    min-height: auto;
+    overflow: visible;
+    padding: 18px 14px 14px;
+    border-right: 0;
+    border-bottom: 1px solid rgba(173, 199, 227, 0.16);
+  }
+
+  .haor-chat-sidebar-scroll {
+    overflow: visible;
+    padding-right: 0;
+  }
+}
+
 @media (max-width: 768px) {
   .haor-chat-shell {
     padding: 10px;
@@ -3081,12 +3292,6 @@ pre {
     border-radius: 24px;
   }
 
-  .haor-chat-header {
-    flex-direction: column;
-    align-items: stretch;
-    padding: 18px 18px 16px;
-  }
-
   .haor-chat-header-actions,
   .haor-chat-composer-footer {
     justify-content: flex-start;
@@ -3094,16 +3299,28 @@ pre {
   }
 
   .haor-chat-body {
-    padding: 0 10px;
+    grid-template-columns: 1fr;
   }
 
-  .haor-chat-state-panel {
-    grid-template-columns: 1fr;
-    padding: 14px 2px 0;
+  .haor-chat-goal-primary-header,
+  .haor-chat-goal-footer,
+  .haor-chat-goal-item {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .haor-chat-sidebar-heading {
+    padding: 0 2px;
+  }
+
+  .haor-chat-main-header {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 18px 18px 16px;
   }
 
   .haor-chat-feed {
-    padding: 16px 2px 12px;
+    padding: 16px 18px 14px;
   }
 
   .haor-chat-stack {
@@ -3111,7 +3328,7 @@ pre {
   }
 
   .haor-chat-composer {
-    padding: 12px;
+    padding: 12px 18px 16px;
   }
 }
 

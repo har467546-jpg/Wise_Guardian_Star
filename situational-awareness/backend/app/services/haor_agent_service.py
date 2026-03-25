@@ -18,6 +18,7 @@ from app.api.v1.endpoints import vuln_library as vuln_library_endpoint
 from app.core.celery_app import celery_app
 from app.core.config import read_runtime_env_value, settings
 from app.db.models.agent_message import AgentMessage
+from app.db.models.agent_goal import AgentGoal
 from app.db.models.agent_session import AgentSession
 from app.db.models.asset import Asset
 from app.db.models.enums import (
@@ -69,6 +70,17 @@ from app.services.ai.providers import LLMMessage, LLMRequest, build_provider
 from app.services.agent.context_service import sanitize_browser_context_summary
 from app.services.agent.execution_registry import AgentActionExecutorContext, AgentExecutionResult
 from app.services.agent.execution_service import AgentExecutionService
+from app.services.agent_goal_service import (
+    attach_goal_to_session,
+    ensure_goal_for_message,
+    get_agent_goal as get_agent_goal_read,
+    list_agent_goals as list_agent_goal_reads,
+    mark_goal_blocked,
+    mark_goal_canceled,
+    resume_agent_goal_binding,
+    sync_goal_from_session,
+)
+from app.services.agent_playbook_service import AgentPlaybookDecision, match_registered_playbook
 from app.services.agent.session_service import (
     append_interrupted_task_message,
     ensure_active_session,
@@ -186,6 +198,37 @@ MESSAGE_TURN_STALE_SECONDS = 120
 UI_FEEDBACK_STALE_SECONDS = 300
 
 logger = logging.getLogger(__name__)
+
+_SHORT_FOLLOWUP_AFFIRM_MARKERS = {
+    "继续",
+    "好",
+    "好的",
+    "是",
+    "是的",
+    "行",
+    "可以",
+    "继续吧",
+    "看",
+    "查看",
+    "继续看",
+}
+_SHORT_FOLLOWUP_DENY_MARKERS = {
+    "不用了",
+    "算了",
+    "别看了",
+    "不用",
+    "不看了",
+    "不要了",
+    "取消",
+    "先不看",
+    "别继续了",
+}
+_MODEL_DECISION_CONVERSATION_STATE_ALIASES = {
+    "completed": "answer",
+    "done": "answer",
+    "finish": "answer",
+    "final": "answer",
+}
 
 
 class AgentServiceError(Exception):
@@ -366,7 +409,7 @@ def _session_query(user_id: str):
     return (
         select(AgentSession)
         .where(AgentSession.user_id == user_id, AgentSession.agent_id == AGENT_ID)
-        .options(joinedload(AgentSession.messages))
+        .options(joinedload(AgentSession.messages), joinedload(AgentSession.current_goal))
         .order_by(AgentSession.updated_at.desc(), AgentSession.created_at.desc())
     )
 
@@ -375,6 +418,7 @@ def _summary_session_query(user_id: str):
     return (
         select(AgentSession)
         .where(AgentSession.user_id == user_id, AgentSession.agent_id == AGENT_ID)
+        .options(joinedload(AgentSession.current_goal))
         .order_by(AgentSession.updated_at.desc(), AgentSession.created_at.desc())
     )
 
@@ -385,6 +429,42 @@ def _load_recent_session(db: Session, *, user_id: str) -> AgentSession | None:
 
 def _load_recent_summary_session(db: Session, *, user_id: str) -> AgentSession | None:
     return load_recent_session(query_builder=_summary_session_query, db=db, user_id=user_id)
+
+
+def _session_goal(session: AgentSession | None) -> AgentGoal | None:
+    if session is None:
+        return None
+    goal = getattr(session, "current_goal", None)
+    if isinstance(goal, AgentGoal):
+        return goal
+    return None
+
+
+def _sync_current_goal_state(
+    db: Session,
+    session: AgentSession,
+    *,
+    status_override: str | None = None,
+    blocked_reason: str | None = None,
+    latest_summary: str | None = None,
+) -> AgentGoal | None:
+    goal = _session_goal(session)
+    if goal is None and getattr(session, "current_goal_id", None):
+        goal = db.get(AgentGoal, session.current_goal_id)
+        if goal is not None:
+            session.current_goal = goal
+    if goal is None:
+        return None
+    sync_goal_from_session(
+        goal,
+        session,
+        status_override=status_override,
+        blocked_reason=blocked_reason,
+        latest_summary=latest_summary,
+    )
+    db.add(goal)
+    db.add(session)
+    return goal
 
 
 def _normalize_task_status(status: TaskExecutionStatus | str | None) -> str:
@@ -950,6 +1030,120 @@ def _merge_soft_focus_context(
             "recent_targets": recent_targets,
         }
     )
+
+
+def _read_tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> tuple[str, str]:
+    return (
+        _sanitize_line(tool_name, max_length=64),
+        json.dumps(sanitize_json_value(arguments), ensure_ascii=False, sort_keys=True),
+    )
+
+
+def _dedupe_read_tool_payloads(read_tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in read_tool_calls:
+        if not isinstance(item, dict):
+            continue
+        tool_name = _sanitize_line(str(item.get("tool_name") or ""), max_length=64)
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        if tool_name not in SUPPORTED_READ_TOOLS:
+            continue
+        signature = _read_tool_call_signature(tool_name, arguments)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(
+            {
+                "tool_name": tool_name,
+                "arguments": sanitize_json_value(arguments),
+            }
+        )
+        if len(deduped) >= 3:
+            break
+    return deduped
+
+
+def _default_resume_read_tools(
+    *,
+    kind: str,
+    working_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    normalized_context = _normalize_working_context(working_context)
+    primary_target = _working_context_primary_target(normalized_context)
+    asset_id = _sanitize_line(str(primary_target.get("asset_id") or normalized_context.get("asset_id") or ""), max_length=64)
+    finding_id = _sanitize_line(str(primary_target.get("finding_id") or normalized_context.get("finding_id") or ""), max_length=64)
+    task_id = _sanitize_line(str(primary_target.get("task_id") or normalized_context.get("task_id") or ""), max_length=64)
+    read_tool_calls: list[dict[str, Any]] = []
+
+    if kind == "post_scan_analysis" and task_id:
+        read_tool_calls.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
+        read_tool_calls.append({"tool_name": "get_task_events", "arguments": {"task_id": task_id, "limit": 12}})
+        return _dedupe_read_tool_payloads(read_tool_calls)
+
+    if kind == "post_verify_analysis" and asset_id:
+        read_tool_calls.append({"tool_name": "list_asset_risks", "arguments": {"asset_id": asset_id, "limit": 10}})
+        if task_id:
+            read_tool_calls.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
+        return _dedupe_read_tool_payloads(read_tool_calls)
+
+    if kind == "post_remediation_review" and asset_id:
+        read_tool_calls.append({"tool_name": "get_remediation_asset", "arguments": {"asset_id": asset_id}})
+        if task_id:
+            read_tool_calls.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
+        return _dedupe_read_tool_payloads(read_tool_calls)
+
+    if task_id:
+        read_tool_calls.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
+        read_tool_calls.append({"tool_name": "get_task_events", "arguments": {"task_id": task_id, "limit": 12}})
+    elif finding_id:
+        read_tool_calls.append({"tool_name": "get_risk_detail", "arguments": {"finding_id": finding_id}})
+        if asset_id:
+            read_tool_calls.append({"tool_name": "list_asset_risks", "arguments": {"asset_id": asset_id, "limit": 10}})
+    elif asset_id:
+        read_tool_calls.append({"tool_name": "list_asset_risks", "arguments": {"asset_id": asset_id, "limit": 10}})
+        read_tool_calls.append({"tool_name": "get_asset_detail", "arguments": {"asset_id": asset_id}})
+
+    return _dedupe_read_tool_payloads(read_tool_calls)
+
+
+def _normalize_resume_hint(hint: dict[str, Any] | None) -> dict[str, Any]:
+    payload = hint if isinstance(hint, dict) else {}
+    kind = _sanitize_line(str(payload.get("kind") or ""), max_length=64)
+    working_context = _normalize_working_context(
+        payload.get("working_context") if isinstance(payload.get("working_context"), dict) else {}
+    )
+    preferred_read_tools = _dedupe_read_tool_payloads(
+        payload.get("preferred_read_tools") if isinstance(payload.get("preferred_read_tools"), list) else []
+    )
+    if not preferred_read_tools and (kind or working_context):
+        preferred_read_tools = _default_resume_read_tools(kind=kind, working_context=working_context)
+    suggested_reply_label = sanitize_text(str(payload.get("suggested_reply_label") or ""), max_length=80, single_line=True) or None
+
+    normalized: dict[str, Any] = {}
+    if kind:
+        normalized["kind"] = kind
+    if working_context:
+        normalized["working_context"] = working_context
+    if preferred_read_tools:
+        normalized["preferred_read_tools"] = preferred_read_tools
+    if suggested_reply_label:
+        normalized["suggested_reply_label"] = suggested_reply_label
+    return normalized
+
+
+def _latest_resume_hint(session: AgentSession | Any | None) -> dict[str, Any]:
+    if session is None:
+        return {}
+    messages = list(getattr(session, "messages", []) or [])
+    for item in reversed(messages[-16:]):
+        payload = getattr(item, "payload_json", None)
+        if not isinstance(payload, dict):
+            continue
+        normalized = _normalize_resume_hint(payload.get("resume_hint") if isinstance(payload.get("resume_hint"), dict) else {})
+        if normalized:
+            return normalized
+    return {}
 
 
 def _build_working_context_from_page_context(page_context: dict[str, Any], *, source: str) -> dict[str, Any]:
@@ -1659,20 +1853,22 @@ def _extract_followup_short_values(content: str, expected_slots: list[str]) -> d
 
 
 def _build_followup_hint(content: str, dialog_state: dict[str, Any]) -> dict[str, Any]:
-    if not dialog_state:
-        return {}
     normalized = sanitize_text(content, max_length=300, single_line=True) or ""
     if not normalized:
         return {}
-    affirm_markers = {"继续", "好", "好的", "是", "是的", "行", "可以", "继续吧", "看", "查看", "继续看", "继续吧"}
-    deny_markers = {"不用了", "算了", "别看了", "不用", "不看了", "不要了", "取消", "先不看", "别继续了"}
+    if not dialog_state:
+        if normalized in _SHORT_FOLLOWUP_AFFIRM_MARKERS:
+            return {"reply_kind": "affirm", "raw_user_reply": normalized}
+        if normalized in _SHORT_FOLLOWUP_DENY_MARKERS:
+            return {"reply_kind": "deny", "raw_user_reply": normalized}
+        return {}
     extracted_values = _extract_followup_short_values(
         normalized,
         dialog_state.get("expected_slots") if isinstance(dialog_state.get("expected_slots"), list) else [],
     )
-    if normalized in deny_markers:
+    if normalized in _SHORT_FOLLOWUP_DENY_MARKERS:
         reply_kind = "deny"
-    elif normalized in affirm_markers:
+    elif normalized in _SHORT_FOLLOWUP_AFFIRM_MARKERS:
         reply_kind = "affirm"
     elif extracted_values:
         reply_kind = "short_value"
@@ -1778,6 +1974,7 @@ def serialize_agent_session(session: AgentSession) -> AgentSessionRead:
     )
     agent_state_json = _session_agent_state(session)
     messages = [_serialize_message(item) for item in session.messages]
+    current_goal = _session_goal(session)
     return AgentSessionRead(
         session_id=session.id,
         agent_id=session.agent_id,
@@ -1788,6 +1985,8 @@ def serialize_agent_session(session: AgentSession) -> AgentSessionRead:
         pending_plan_json=pending_plan_json,
         browser_runtime_json=browser_runtime_json,
         agent_state_json=agent_state_json,
+        current_goal_id=current_goal.id if current_goal is not None else None,
+        current_goal_title=current_goal.title if current_goal is not None else None,
         last_task_id=session.last_task_id,
         messages=messages,
         created_at=session.created_at,
@@ -1819,13 +2018,18 @@ def serialize_agent_session_summary(session: AgentSession | None) -> AgentSessio
             has_attention=False,
             attention_kind=attention_kind,
             session_status=None,
+            current_goal_id=None,
+            current_goal_title=None,
             last_task_id=None,
             updated_at=None,
         )
+    current_goal = _session_goal(session)
     return AgentSessionSummaryRead(
         has_attention=attention_kind != "none",
         attention_kind=attention_kind,
         session_status=session.status,
+        current_goal_id=current_goal.id if current_goal is not None else None,
+        current_goal_title=current_goal.title if current_goal is not None else None,
         last_task_id=session.last_task_id,
         updated_at=session.updated_at,
     )
@@ -2523,6 +2727,8 @@ def _reconcile_session_runtime_state(
         changed = True
     if _reconcile_stale_ui_feedback_state(db, session=session, source=stale_source):
         changed = True
+    if changed:
+        _sync_current_goal_state(db, session)
     return changed
 
 
@@ -2598,6 +2804,14 @@ def mark_agent_session_interrupted(
         restore_session_from_running_state_fn=_restore_session_from_running_state,
         append_interrupted_task_message_fn=_append_interrupted_task_message,
     )
+    session = db.get(AgentSession, session_id)
+    if session is not None:
+        _sync_current_goal_state(
+            db,
+            session,
+            status_override="blocked",
+            blocked_reason="当前目标已被用户中断，可稍后恢复继续",
+        )
 
 
 def _create_session(db: Session, *, user: User) -> AgentSession:
@@ -2636,7 +2850,80 @@ def get_agent_session_summary(db: Session, *, user: User) -> AgentSessionSummary
     return serialize_agent_session_summary(session)
 
 
+def list_agent_goals(db: Session, *, user: User, limit: int = 12) -> list[Any]:
+    return list_agent_goal_reads(db, user=user, limit=limit)
+
+
+def get_agent_goal(db: Session, *, user: User, goal_id: str) -> Any:
+    return get_agent_goal_read(db, user=user, goal_id=goal_id)
+
+
+def resume_agent_goal(db: Session, *, user: User, goal_id: str) -> AgentSessionRead:
+    session = _load_recent_session(db, user_id=user.id)
+    if session is not None and _reconcile_session_runtime_state(db, session=session):
+        db.flush()
+    if session is None or not is_active_public_session_status(str(session.status or "")):
+        session = _create_session(db, user=user)
+        db.flush()
+    _raise_if_session_running(session, stage="resume_goal")
+    goal = resume_agent_goal_binding(db, user=user, session=session, goal_id=goal_id)
+    goal_context = goal.context_json if isinstance(goal.context_json, dict) else {}
+    browser_context = goal_context.get("browser_summary") if isinstance(goal_context.get("browser_summary"), dict) else {}
+    current_objective = sanitize_text(
+        str(goal_context.get("current_objective") or goal.title or ""),
+        max_length=240,
+    ) or goal.title
+    objective_kind = _sanitize_line(str(goal_context.get("objective_kind") or goal.goal_kind or ""), max_length=64) or goal.goal_kind
+    session.status = "active"
+    _set_browser_runtime(
+        session,
+        phase="idle",
+        browser_context=browser_context,
+        last_user_intent=current_objective,
+        current_objective=current_objective,
+        objective_kind=objective_kind,
+        planned_steps=[],
+        step_cursor=0,
+        pending_ui_actions=[],
+        completed_ui_actions=[],
+        last_ui_results=[],
+        auto_executed_actions=[],
+        step_count=0,
+        retry_state={},
+        last_error=None,
+    )
+    _sync_current_goal_state(
+        db,
+        session,
+        status_override="active",
+        latest_summary=f"已恢复目标：{goal.title}",
+    )
+    db.commit()
+    db.refresh(session)
+    return serialize_agent_session(session)
+
+
+def cancel_agent_goal(db: Session, *, user: User, goal_id: str) -> Any:
+    goal = db.get(AgentGoal, goal_id)
+    if goal is None or goal.user_id != user.id or goal.agent_id != AGENT_ID:
+        raise AgentNotFoundError("当前目标不存在", stage="cancel_goal")
+    mark_goal_canceled(goal)
+    session = _load_recent_session(db, user_id=user.id)
+    if session is not None and session.current_goal_id == goal.id:
+        attach_goal_to_session(session, None)
+        db.add(session)
+    db.add(goal)
+    db.commit()
+    db.refresh(goal)
+    return get_agent_goal_read(db, user=user, goal_id=goal.id)
+
+
 def reset_agent_session(db: Session, *, user: User) -> AgentSessionRead:
+    current_session = _load_recent_session(db, user_id=user.id)
+    current_goal = _session_goal(current_session)
+    if current_session is not None and current_goal is not None and str(current_goal.status or "") not in {"completed", "failed", "canceled"}:
+        mark_goal_blocked(current_goal, reason="用户已新建会话，当前目标已暂停")
+        db.add(current_goal)
     return reset_agent_session_via_service(
         db,
         user=user,
@@ -2665,9 +2952,15 @@ def append_agent_task_message(
         return
     normalized_payload = payload_json if isinstance(payload_json, dict) else {}
     child_task = normalized_payload.get("child_task") if isinstance(normalized_payload.get("child_task"), dict) else {}
+    task_id = _sanitize_line(
+        str(normalized_payload.get("task_id") or child_task.get("task_id") or session.last_task_id or ""),
+        max_length=64,
+    ) or None
+    if task_id:
+        session.last_task_id = task_id
     state_delta = sync_agent_task_watch_state(
         session,
-        task_id=normalized_payload.get("task_id") or child_task.get("task_id"),
+        task_id=task_id,
         status=child_task.get("status") or ("failure" if message_type == "error" else "success"),
         message=content,
         action=normalized_payload.get("action") if isinstance(normalized_payload.get("action"), dict) else {},
@@ -2688,6 +2981,7 @@ def append_agent_task_message(
             ),
         },
     )
+    _sync_current_goal_state(db, session, latest_summary=content)
 
 
 def has_agent_task_followup_message(session: AgentSession, *, task_id: str) -> bool:
@@ -3104,6 +3398,79 @@ def _promote_resolved_targets_from_tool_traces(
     return promoted_context
 
 
+def _build_contract_error_clarifying_decision() -> _AgentModelDecision:
+    question = "我没能稳定承接上一轮，请直接告诉我要继续看什么，例如：资产结果、风险结果或任务详情。"
+    return _AgentModelDecision(
+        reply_markdown=question,
+        conversation_state="clarifying",
+        clarifying_question="你想继续看资产结果、风险结果，还是任务详情？",
+        stop_reason="contract_error_clarify",
+    )
+
+
+def _build_short_resume_fallback_decision(
+    *,
+    content: str,
+    session: AgentSession | Any | None,
+    working_context: dict[str, Any],
+    tool_traces: list[dict[str, Any]],
+) -> _AgentModelDecision | None:
+    normalized = sanitize_text(content, max_length=80, single_line=True) or ""
+    if normalized not in _SHORT_FOLLOWUP_AFFIRM_MARKERS:
+        return None
+
+    recent_resume_hint = _latest_resume_hint(session)
+    resume_context = _normalize_working_context(
+        recent_resume_hint.get("working_context") if isinstance(recent_resume_hint.get("working_context"), dict) else {}
+    )
+    effective_context = _normalize_working_context(working_context)
+    resume_target = _working_context_primary_target(resume_context)
+    if resume_target:
+        effective_context = _merge_soft_focus_context(effective_context, resume_target)
+
+    preferred_read_tools = _dedupe_read_tool_payloads(
+        recent_resume_hint.get("preferred_read_tools") if isinstance(recent_resume_hint.get("preferred_read_tools"), list) else []
+    )
+    if not preferred_read_tools and effective_context:
+        preferred_read_tools = _default_resume_read_tools(
+            kind=_sanitize_line(str(recent_resume_hint.get("kind") or ""), max_length=64),
+            working_context=effective_context,
+        )
+
+    executed_signatures = {
+        _read_tool_call_signature(
+            str(item.get("tool_name") or ""),
+            item.get("arguments") if isinstance(item.get("arguments"), dict) else {},
+        )
+        for item in tool_traces
+        if isinstance(item, dict)
+    }
+    pending_read_tools = [
+        item
+        for item in preferred_read_tools
+        if _read_tool_call_signature(
+            str(item.get("tool_name") or ""),
+            item.get("arguments") if isinstance(item.get("arguments"), dict) else {},
+        )
+        not in executed_signatures
+    ]
+    if pending_read_tools:
+        suggested_reply_label = sanitize_text(
+            str(recent_resume_hint.get("suggested_reply_label") or ""),
+            max_length=80,
+            single_line=True,
+        ) or "上一轮结果"
+        return _AgentModelDecision(
+            reply_markdown=f"我先承接上一轮结果，继续{suggested_reply_label}。",
+            conversation_state="answer",
+            objective=sanitize_text(content, max_length=240) or None,
+            read_tool_calls=[_ReadToolCall.model_validate(item) for item in pending_read_tools],
+            stop_reason="resume_hint_read",
+        )
+
+    return _build_contract_error_clarifying_decision()
+
+
 def _build_action_first_fallback_decision(
     *,
     content: str,
@@ -3115,7 +3482,17 @@ def _build_action_first_fallback_decision(
     followup_hint: dict[str, Any],
     allow_write_plans: bool,
     allow_auto_execute_actions: bool,
+    session: AgentSession | Any | None = None,
+    tool_traces: list[dict[str, Any]] | None = None,
 ) -> _AgentModelDecision | None:
+    resume_fallback = _build_short_resume_fallback_decision(
+        content=content,
+        session=session,
+        working_context=working_context,
+        tool_traces=tool_traces or [],
+    )
+    if resume_fallback is not None:
+        return resume_fallback
     objective = _build_current_objective(content, dialog_state=dialog_state, followup_hint=followup_hint)
     objective_kind = str(objective.get("objective_kind") or "ask")
     if objective_kind == "ask":
@@ -3217,6 +3594,7 @@ def _resolve_effective_working_context(
     current_context = _normalize_working_context(
         session.working_context_json if isinstance(session.working_context_json, dict) else {}
     )
+    recent_resume_hint = _latest_resume_hint(session)
     explicit_context = _extract_explicit_working_context(content, page_context)
     if _has_object_target(explicit_context):
         normalized_context = _merge_soft_focus_context(current_context, explicit_context)
@@ -3235,6 +3613,14 @@ def _resolve_effective_working_context(
         followup_hint,
         dialog_state=dialog_state,
     )
+
+    if not _has_object_target(effective_context) and sanitize_text(content, max_length=80, single_line=True) in _SHORT_FOLLOWUP_AFFIRM_MARKERS:
+        resume_context = _normalize_working_context(
+            recent_resume_hint.get("working_context") if isinstance(recent_resume_hint.get("working_context"), dict) else {}
+        )
+        resume_target = _working_context_primary_target(resume_context)
+        if resume_target:
+            effective_context = _merge_soft_focus_context(effective_context, resume_target)
 
     if _content_mentions_current_object(content):
         page_target = _build_working_context_from_page_context(page_context, source="page_reference")
@@ -3483,7 +3869,11 @@ def _runtime_provider_mode() -> str:
     return read_runtime_env_value("LLM_PROVIDER", str(settings.LLM_PROVIDER or "mock")).strip().lower() or "mock"
 
 
-def _build_runtime_provider():
+def _build_runtime_provider(
+    *,
+    wire_api_override: str | None = None,
+    chat_json_mode: bool = False,
+):
     model = read_runtime_env_value("LLM_MODEL", str(settings.LLM_MODEL or "gpt-4o-mini"))
     base_url = read_runtime_env_value("LLM_BASE_URL", str(settings.LLM_BASE_URL or ""))
     wire_api = read_runtime_env_value("LLM_WIRE_API", str(settings.LLM_WIRE_API or "responses"))
@@ -3493,9 +3883,10 @@ def _build_runtime_provider():
         provider_name=_runtime_provider_mode(),
         model=model,
         base_url=base_url,
-        wire_api=wire_api,
+        wire_api=wire_api_override or wire_api,
         timeout_seconds=timeout_seconds,
         api_key=api_key,
+        chat_json_mode=chat_json_mode,
         fallback_to_mock=False,
     )
 
@@ -3553,6 +3944,12 @@ def _classify_agent_service_error(
 ) -> AgentServiceError:
     if isinstance(exc, AgentServiceError):
         return exc
+    if _is_model_decision_contract_error(exc):
+        return AgentBadRequestError(
+            "我没能稳定承接上一轮，请直接告诉我要继续看什么",
+            session_id=session_id,
+            stage=stage,
+        )
     if isinstance(exc, httpx.HTTPError):
         return AgentUpstreamError(_humanize_ai_error(exc), session_id=session_id, stage=stage)
     if isinstance(exc, LookupError):
@@ -3616,25 +4013,74 @@ def _extract_json_block(raw: str) -> str:
     raise ValueError("模型未返回合法 JSON")
 
 
+def _normalize_model_decision_boolean(value: Any) -> bool | Any:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n", ""}:
+            return False
+    return value
+
+
+def _normalize_model_decision_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("模型返回的 JSON 顶层结构必须是对象")
+
+    normalized = dict(payload)
+    conversation_state = _sanitize_line(str(normalized.get("conversation_state") or ""), max_length=32).lower()
+    normalized["conversation_state"] = _MODEL_DECISION_CONVERSATION_STATE_ALIASES.get(
+        conversation_state,
+        conversation_state or "answer",
+    )
+
+    for field_name in ("read_tool_calls", "ui_actions", "proposed_write_actions", "auto_execute_actions"):
+        field_value = normalized.get(field_name)
+        if field_value == "" or field_value is None:
+            normalized[field_name] = []
+
+    for field_name in ("objective", "clarifying_question", "stop_reason"):
+        if normalized.get(field_name) == "":
+            normalized[field_name] = None
+
+    needs_confirmation = _normalize_model_decision_boolean(normalized.get("needs_confirmation"))
+    normalized["needs_confirmation"] = bool(needs_confirmation) if needs_confirmation is not None else False
+
+    if normalized.get("dialog_state_update") == "" or normalized.get("dialog_state_update") is None:
+        normalized["dialog_state_update"] = None
+    elif isinstance(normalized.get("dialog_state_update"), dict):
+        normalized["dialog_state_update"] = _normalize_dialog_state_payload(normalized.get("dialog_state_update"))
+
+    followup_resolution = normalized.get("followup_resolution")
+    if followup_resolution == "" or followup_resolution is None:
+        normalized["followup_resolution"] = None
+    elif isinstance(followup_resolution, str):
+        summary = sanitize_text(followup_resolution, max_length=240) or None
+        normalized["followup_resolution"] = {"status": "unknown", "summary": summary}
+
+    return normalized
+
+
 def _parse_model_decision(raw: str) -> _AgentModelDecision:
     try:
         payload = json.loads(_extract_json_block(raw))
     except json.JSONDecodeError as exc:
         raise ValueError("模型返回的 JSON 结构无法解析") from exc
-    if isinstance(payload, dict) and isinstance(payload.get("dialog_state_update"), dict):
-        payload = dict(payload)
-        payload["dialog_state_update"] = _normalize_dialog_state_payload(payload.get("dialog_state_update"))
+    payload = _normalize_model_decision_payload(payload)
     return _AgentModelDecision.model_validate(payload)
 
 
 def _is_model_decision_contract_error(exc: Exception) -> bool:
+    if isinstance(exc, ValidationError):
+        return True
     if not isinstance(exc, ValueError):
         return False
-    detail = sanitize_text(str(exc), max_length=200) or ""
+    detail = sanitize_text(str(exc), max_length=240) or ""
     return detail in {
         "模型未返回内容",
         "模型未返回合法 JSON",
         "模型返回的 JSON 结构无法解析",
+        "模型返回的 JSON 顶层结构必须是对象",
     }
 
 
@@ -3798,7 +4244,11 @@ def _build_model_context_payload(
         {
             "action_type": "create_or_resume_remediation_session",
             "description": "创建或恢复主机修复会话",
-            "required_params": {"asset_id": "资产 ID", "note": "可选备注"},
+            "required_params": {
+                "asset_id": "资产 ID",
+                "note": "可选备注",
+                "submit_if_ready": "可选布尔值；为 true 时在修复条件满足后直接提交自动修复",
+            },
         },
         {
             "action_type": "approve_remediation_session",
@@ -4013,6 +4463,32 @@ def _build_model_request(
     return LLMRequest(messages=messages)
 
 
+def _log_model_decision_contract_issue(
+    *,
+    provider_name: str,
+    wire_api: str,
+    resolved_base_url: str,
+    objective_kind: str,
+    followup_reply_kind: str,
+    raw_preview: str,
+    error_reason: str,
+    phase: str,
+) -> None:
+    logger.warning(
+        "haor model decision contract error",
+        extra={
+            "agent_provider": provider_name,
+            "agent_wire_api": wire_api,
+            "agent_base_url": resolved_base_url,
+            "agent_objective_kind": objective_kind,
+            "agent_followup_reply_kind": followup_reply_kind,
+            "agent_model_preview": raw_preview,
+            "agent_contract_error": error_reason,
+            "agent_contract_phase": phase,
+        },
+    )
+
+
 def _run_model_once(
     *,
     session: AgentSession,
@@ -4043,22 +4519,70 @@ def _run_model_once(
             tool_traces=tool_traces,
         )
     provider_result = _build_runtime_provider()
-    content = provider_result.provider.generate(
-        _build_model_request(
-            session=session,
-            user=user,
-            page_context=page_context,
-            browser_context=browser_context,
-            browser_runtime=browser_runtime,
-            working_context=working_context,
-            dialog_state=dialog_state,
-            followup_hint=followup_hint,
-            tool_traces=tool_traces,
-            allow_write_plans=allow_write_plans,
-            allow_auto_execute_actions=allow_auto_execute_actions,
-        )
+    request = _build_model_request(
+        session=session,
+        user=user,
+        page_context=page_context,
+        browser_context=browser_context,
+        browser_runtime=browser_runtime,
+        working_context=working_context,
+        dialog_state=dialog_state,
+        followup_hint=followup_hint,
+        tool_traces=tool_traces,
+        allow_write_plans=allow_write_plans,
+        allow_auto_execute_actions=allow_auto_execute_actions,
     )
-    return _parse_model_decision(content)
+    objective_kind = _sanitize_line(str(browser_runtime.get("objective_kind") or ""), max_length=32) or _classify_objective_kind(
+        current_content,
+        dialog_state=dialog_state,
+        followup_hint=followup_hint,
+    )
+    followup_reply_kind = _sanitize_line(str(followup_hint.get("reply_kind") or ""), max_length=32)
+    content = provider_result.provider.generate(request)
+    try:
+        return _parse_model_decision(content)
+    except Exception as exc:
+        if not _is_model_decision_contract_error(exc):
+            raise
+        _log_model_decision_contract_issue(
+            provider_name=_sanitize_line(str(getattr(provider_result, "provider_name", "") or _runtime_provider_mode()), max_length=64)
+            or _runtime_provider_mode(),
+            wire_api=_sanitize_line(str(getattr(provider_result.provider, "wire_api", "") or ""), max_length=32)
+            or _sanitize_line(str(read_runtime_env_value("LLM_WIRE_API", str(settings.LLM_WIRE_API or "responses")) or ""), max_length=32),
+            resolved_base_url=_sanitize_line(str(getattr(provider_result, "resolved_base_url", "") or ""), max_length=255),
+            objective_kind=objective_kind,
+            followup_reply_kind=followup_reply_kind,
+            raw_preview=sanitize_text(content, max_length=800) or "",
+            error_reason=sanitize_text(str(exc), max_length=400) or "unknown_contract_error",
+            phase="primary_parse",
+        )
+        if _sanitize_line(str(getattr(provider_result, "provider_name", "") or _runtime_provider_mode()), max_length=64) != "custom_proxy":
+            raise
+        retry_provider_result = _build_runtime_provider(
+            wire_api_override="chat_completions",
+            chat_json_mode=True,
+        )
+        retry_content = retry_provider_result.provider.generate(request)
+        try:
+            return _parse_model_decision(retry_content)
+        except Exception as retry_exc:
+            if _is_model_decision_contract_error(retry_exc):
+                _log_model_decision_contract_issue(
+                    provider_name=_sanitize_line(
+                        str(getattr(retry_provider_result, "provider_name", "") or _runtime_provider_mode()),
+                        max_length=64,
+                    )
+                    or _runtime_provider_mode(),
+                    wire_api=_sanitize_line(str(getattr(retry_provider_result.provider, "wire_api", "") or ""), max_length=32)
+                    or "chat_completions",
+                    resolved_base_url=_sanitize_line(str(getattr(retry_provider_result, "resolved_base_url", "") or ""), max_length=255),
+                    objective_kind=objective_kind,
+                    followup_reply_kind=followup_reply_kind,
+                    raw_preview=sanitize_text(retry_content, max_length=800) or "",
+                    error_reason=sanitize_text(str(retry_exc), max_length=400) or "unknown_contract_error",
+                    phase="chat_completions_retry",
+                )
+            raise
 
 
 def _build_mock_model_decision(
@@ -4380,6 +4904,12 @@ def _run_agent_loop(
     working_context = _normalize_working_context(working_context)
     session_last_task_id = _session_last_task_id(session)
     current_content = str(browser_runtime.get("last_user_intent") or "") or str(session.messages[-1].content if session.messages else "")
+    playbook_match = match_registered_playbook(
+        content=current_content,
+        page_context=page_context,
+        browser_context=browser_context,
+        working_context=working_context,
+    )
     objective = _build_current_objective(
         str(browser_runtime.get("current_objective") or "") or current_content,
         dialog_state=dialog_state,
@@ -4420,48 +4950,56 @@ def _run_agent_loop(
     )
     _emit_agent_state(stream_emitter, session, turn_id=turn_id)
     for _ in range(MAX_AGENT_LOOP_STEPS):
-        try:
-            decision = _run_model_once(
+        if playbook_match is not None:
+            decision = _build_model_decision_from_playbook(playbook_match)
+            playbook_match = None
+        else:
+            try:
+                decision = _run_model_once(
+                    session=session,
+                    user=user,
+                    page_context=page_context,
+                    browser_context=browser_context,
+                    browser_runtime=browser_runtime,
+                    working_context=working_context,
+                    dialog_state=dialog_state,
+                    followup_hint=followup_hint,
+                    tool_traces=tool_traces,
+                    allow_write_plans=allow_write_plans,
+                    allow_auto_execute_actions=allow_auto_execute_actions,
+                )
+            except Exception as exc:
+                if not _is_model_decision_contract_error(exc):
+                    raise
+                fallback_decision = _build_action_first_fallback_decision(
+                    content=current_content,
+                    session=session,
+                    user=user,
+                    page_context=page_context,
+                    browser_context=browser_context,
+                    working_context=working_context,
+                    dialog_state=dialog_state,
+                    followup_hint=followup_hint,
+                    allow_write_plans=allow_write_plans,
+                    allow_auto_execute_actions=allow_auto_execute_actions,
+                    tool_traces=tool_traces,
+                )
+                if fallback_decision is None:
+                    fallback_decision = _build_contract_error_clarifying_decision()
+                decision = fallback_decision
+        if not _decision_has_agent_progress(decision, tool_traces=tool_traces):
+            fallback_decision = _build_action_first_fallback_decision(
+                content=current_content,
                 session=session,
                 user=user,
                 page_context=page_context,
                 browser_context=browser_context,
-                browser_runtime=browser_runtime,
                 working_context=working_context,
                 dialog_state=dialog_state,
                 followup_hint=followup_hint,
+                allow_write_plans=allow_write_plans,
+                allow_auto_execute_actions=allow_auto_execute_actions,
                 tool_traces=tool_traces,
-                allow_write_plans=allow_write_plans,
-                allow_auto_execute_actions=allow_auto_execute_actions,
-            )
-        except Exception as exc:
-            if not _is_model_decision_contract_error(exc):
-                raise
-            fallback_decision = _build_action_first_fallback_decision(
-                content=current_content,
-                user=user,
-                page_context=page_context,
-                browser_context=browser_context,
-                working_context=working_context,
-                dialog_state=dialog_state,
-                followup_hint=followup_hint,
-                allow_write_plans=allow_write_plans,
-                allow_auto_execute_actions=allow_auto_execute_actions,
-            )
-            if fallback_decision is None:
-                raise
-            decision = fallback_decision
-        if not _decision_has_agent_progress(decision, tool_traces=tool_traces):
-            fallback_decision = _build_action_first_fallback_decision(
-                content=current_content,
-                user=user,
-                page_context=page_context,
-                browser_context=browser_context,
-                working_context=working_context,
-                dialog_state=dialog_state,
-                followup_hint=followup_hint,
-                allow_write_plans=allow_write_plans,
-                allow_auto_execute_actions=allow_auto_execute_actions,
             )
             if fallback_decision is not None:
                 decision = fallback_decision
@@ -4592,6 +5130,51 @@ def _normalize_model_ui_actions(actions: list[_UIAction]) -> list[dict[str, Any]
         if normalized_action:
             normalized.append(normalized_action)
     return normalized
+
+
+def _build_model_decision_from_playbook(playbook: AgentPlaybookDecision) -> _AgentModelDecision:
+    read_tool_calls: list[_ReadToolCall] = []
+    for item in playbook.read_tool_calls[:3]:
+        try:
+            call = _ReadToolCall.model_validate(item)
+        except ValidationError:
+            continue
+        if call.tool_name in SUPPORTED_READ_TOOLS:
+            read_tool_calls.append(call)
+
+    ui_actions: list[_UIAction] = []
+    for item in playbook.ui_actions[:MAX_UI_ACTION_BATCH]:
+        try:
+            ui_actions.append(_UIAction.model_validate(item))
+        except ValidationError:
+            continue
+
+    proposed_write_actions: list[_ProposedWriteAction] = []
+    for item in playbook.proposed_write_actions:
+        try:
+            proposed_write_actions.append(_ProposedWriteAction.model_validate(item))
+        except ValidationError:
+            continue
+
+    auto_execute_actions: list[_ProposedWriteAction] = []
+    for item in playbook.auto_execute_actions:
+        try:
+            auto_execute_actions.append(_ProposedWriteAction.model_validate(item))
+        except ValidationError:
+            continue
+
+    conversation_state = "plan" if playbook.needs_confirmation or proposed_write_actions else playbook.conversation_state
+    return _AgentModelDecision(
+        reply_markdown=_normalize_assistant_reply_content(playbook.reply_markdown) or playbook.reply_markdown,
+        conversation_state=conversation_state,
+        objective=playbook.objective,
+        read_tool_calls=read_tool_calls,
+        ui_actions=ui_actions,
+        proposed_write_actions=proposed_write_actions,
+        auto_execute_actions=auto_execute_actions,
+        needs_confirmation=playbook.needs_confirmation,
+        stop_reason=playbook.stop_reason or f"playbook:{playbook.playbook_id}",
+    )
 
 
 def _user_can_auto_execute(user: User) -> bool:
@@ -4889,11 +5472,93 @@ def _build_auto_execute_reply_markdown(
     return _normalize_assistant_reply_content("\n\n".join(replies)) or fallback
 
 
-def build_auto_action_task_followup_content(action: dict[str, Any], child_summary: dict[str, Any]) -> tuple[str, str]:
+def _build_task_followup_resume_hint(action: dict[str, Any], child_summary: dict[str, Any]) -> dict[str, Any]:
     action_type = _sanitize_line(str(action.get("action_type") or ""), max_length=64)
     params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    status = _normalize_task_status(child_summary.get("status"))
+    task_id = _sanitize_line(str(child_summary.get("task_id") or payload.get("submitted_task_id") or ""), max_length=64)
+    asset_id = (
+        _sanitize_line(str(params.get("asset_id") or payload.get("asset_id") or ""), max_length=64)
+        or None
+    )
+    session_id = _sanitize_line(str(payload.get("session_id") or ""), max_length=64) or None
+    cidr = sanitize_text(str(params.get("cidr") or ""), max_length=64, single_line=True) or None
+
+    primary_target: dict[str, Any] = {}
+    recent_targets: list[dict[str, Any]] = []
+    if action_type == "create_discovery_job" and task_id:
+        primary_target = {"task_id": task_id, "source": "task_followup"}
+    elif asset_id:
+        primary_target = {"asset_id": asset_id, "source": "task_followup"}
+        if task_id:
+            recent_targets.append({"task_id": task_id, "source": "task_followup"})
+    elif task_id:
+        primary_target = {"task_id": task_id, "source": "task_followup"}
+
+    working_context = _normalize_working_context(
+        {
+            "primary_target": primary_target,
+            "recent_targets": [primary_target, *recent_targets] if primary_target else recent_targets,
+            "source": "task_followup",
+        }
+    )
+
+    preferred_read_tools: list[dict[str, Any]] = []
+    kind = "task_detail"
+    suggested_reply_label = "查看任务详情"
+
+    if action_type == "create_discovery_job":
+        kind = "post_scan_analysis" if status == TaskExecutionStatus.SUCCESS.value else "task_detail"
+        suggested_reply_label = "分析扫描结果"
+        if cidr and status == TaskExecutionStatus.SUCCESS.value:
+            preferred_read_tools.append({"tool_name": "list_assets", "arguments": {"keyword": cidr, "limit": 5}})
+        if task_id:
+            preferred_read_tools.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
+            preferred_read_tools.append({"tool_name": "get_task_events", "arguments": {"task_id": task_id, "limit": 12}})
+    elif action_type == "verify_asset_risks":
+        kind = "post_verify_analysis" if status == TaskExecutionStatus.SUCCESS.value else "task_detail"
+        suggested_reply_label = "分析验证结果"
+        if asset_id:
+            preferred_read_tools.append({"tool_name": "list_asset_risks", "arguments": {"asset_id": asset_id, "limit": 10}})
+        if task_id:
+            preferred_read_tools.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
+    elif action_type == "create_or_resume_remediation_session":
+        kind = "post_remediation_review" if status == TaskExecutionStatus.SUCCESS.value else "task_detail"
+        suggested_reply_label = "复盘修复结果"
+        if asset_id:
+            preferred_read_tools.append({"tool_name": "get_remediation_asset", "arguments": {"asset_id": asset_id}})
+        if session_id:
+            preferred_read_tools.append({"tool_name": "get_remediation_session", "arguments": {"session_id": session_id}})
+        if task_id:
+            preferred_read_tools.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
+    elif action_type == "install_runner":
+        suggested_reply_label = "查看 Runner 状态"
+        if asset_id:
+            preferred_read_tools.append({"tool_name": "get_remediation_asset", "arguments": {"asset_id": asset_id}})
+        if task_id:
+            preferred_read_tools.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
+    elif task_id:
+        preferred_read_tools.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
+        preferred_read_tools.append({"tool_name": "get_task_events", "arguments": {"task_id": task_id, "limit": 12}})
+
+    return _normalize_resume_hint(
+        {
+            "kind": kind,
+            "working_context": working_context,
+            "preferred_read_tools": preferred_read_tools,
+            "suggested_reply_label": suggested_reply_label,
+        }
+    )
+
+
+def build_auto_action_task_followup_content(action: dict[str, Any], child_summary: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    action_type = _sanitize_line(str(action.get("action_type") or ""), max_length=64)
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
     status = _normalize_task_status(child_summary.get("status"))
     task_message = sanitize_text(str(child_summary.get("message") or ""), max_length=300) or ""
+    resume_hint = _build_task_followup_resume_hint(action, child_summary)
 
     if action_type == "create_discovery_job":
         cidr = sanitize_text(str(params.get("cidr") or ""), max_length=64, single_line=True) or "目标网段"
@@ -4901,9 +5566,9 @@ def build_auto_action_task_followup_content(action: dict[str, Any], child_summar
             message = f"{cidr} 的扫描任务已完成。"
             if task_message:
                 message = f"{message}{task_message}。"
-            return "task_update", f"{message} 如需继续，我可以帮你分析该网段的资产和漏洞。"
+            return "task_update", f"{message} 如需继续，我可以帮你分析该网段的资产和漏洞。", resume_hint
         detail = task_message or "请查看任务详情或事件日志"
-        return "error", f"{cidr} 的扫描任务未成功完成：{detail}"
+        return "error", f"{cidr} 的扫描任务未成功完成：{detail}", resume_hint
 
     if action_type == "verify_asset_risks":
         asset_id = _sanitize_line(str(params.get("asset_id") or ""), max_length=64) or "目标资产"
@@ -4911,9 +5576,9 @@ def build_auto_action_task_followup_content(action: dict[str, Any], child_summar
             message = f"资产 {asset_id} 的风险验证任务已完成。"
             if task_message:
                 message = f"{message}{task_message}。"
-            return "task_update", f"{message} 如需继续，我可以帮你分析最新验证结果。"
+            return "task_update", f"{message} 如需继续，我可以帮你分析最新验证结果。", resume_hint
         detail = task_message or "请查看验证任务详情"
-        return "error", f"资产 {asset_id} 的风险验证任务未成功完成：{detail}"
+        return "error", f"资产 {asset_id} 的风险验证任务未成功完成：{detail}", resume_hint
 
     if action_type == "install_runner":
         asset_id = _sanitize_line(str(params.get("asset_id") or ""), max_length=64) or "目标资产"
@@ -4921,14 +5586,30 @@ def build_auto_action_task_followup_content(action: dict[str, Any], child_summar
             message = f"资产 {asset_id} 的 Runner 安装任务已完成。"
             if task_message:
                 message = f"{message}{task_message}。"
-            return "task_update", f"{message} 如需继续，我可以帮你检查 Runner 状态和后续问题。"
+            return "task_update", f"{message} 如需继续，我可以帮你检查 Runner 状态和后续问题。", resume_hint
         detail = task_message or "请查看安装任务详情"
-        return "error", f"资产 {asset_id} 的 Runner 安装任务未成功完成：{detail}"
+        return "error", f"资产 {asset_id} 的 Runner 安装任务未成功完成：{detail}", resume_hint
+
+    if action_type == "create_or_resume_remediation_session":
+        asset_id = (
+            _sanitize_line(str(params.get("asset_id") or ""), max_length=64)
+            or _sanitize_line(str(payload.get("asset_id") or ""), max_length=64)
+            or "目标资产"
+        )
+        session_id = _sanitize_line(str(payload.get("session_id") or ""), max_length=64)
+        session_label = f"修复会话 {session_id}" if session_id else "修复会话"
+        if status == TaskExecutionStatus.SUCCESS.value:
+            message = f"资产 {asset_id} 的自动修复任务已完成。"
+            if task_message:
+                message = f"{message}{task_message}。"
+            return "task_update", f"{message} 如需继续，我可以帮你复盘修复结果，或带你进入 {session_label} 查看详情。", resume_hint
+        detail = task_message or "请查看修复任务详情"
+        return "error", f"资产 {asset_id} 的自动修复任务未成功完成：{detail}", resume_hint
 
     detail = task_message or (status if status else "请查看任务详情")
     if status == TaskExecutionStatus.SUCCESS.value:
-        return "task_update", f"关联任务已完成：{detail}"
-    return "error", f"关联任务未成功完成：{detail}"
+        return "task_update", f"关联任务已完成：{detail}", resume_hint
+    return "error", f"关联任务未成功完成：{detail}", resume_hint
 
 
 def sync_agent_task_watch_state(
@@ -5209,6 +5890,7 @@ def _apply_agent_decision(
         if isinstance(session.dialog_state_json, dict):
             session.dialog_state_json["last_agent_question"] = message.content
             db.add(session)
+        _sync_current_goal_state(db, session, latest_summary=message.content)
         _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
@@ -5272,6 +5954,13 @@ def _apply_agent_decision(
                     turn_id=turn_id,
                     message=message,
                 )
+            _sync_current_goal_state(
+                db,
+                session,
+                status_override="blocked",
+                blocked_reason="站内动作链路达到上限，请缩小目标范围后继续",
+                latest_summary=message.content,
+            )
             _emit_agent_state(stream_emitter, session, turn_id=turn_id)
             return
         _set_browser_runtime(
@@ -5351,6 +6040,7 @@ def _apply_agent_decision(
                 ui_actions=normalized_ui_actions,
                 content=rendered_content,
             )
+        _sync_current_goal_state(db, session, latest_summary=message.content)
         _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
@@ -5430,6 +6120,7 @@ def _apply_agent_decision(
                 message=message,
                 pending_plan_json=session.pending_plan_json,
             )
+        _sync_current_goal_state(db, session, latest_summary=message.content)
         _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
@@ -5478,7 +6169,7 @@ def _apply_agent_decision(
             state_delta=state_delta,
         ),
     }
-    _append_or_stream_assistant_message(
+    final_message = _append_or_stream_assistant_message(
         db,
         session=session,
         message_type="text",
@@ -5489,6 +6180,11 @@ def _apply_agent_decision(
         working_context=final_working_context,
         stream_emitter=stream_emitter,
         turn_id=turn_id,
+    )
+    _sync_current_goal_state(
+        db,
+        session,
+        latest_summary=final_message.content if final_message is not None else rendered_content,
     )
     _emit_agent_state(stream_emitter, session, turn_id=turn_id)
 
@@ -5658,6 +6354,24 @@ def post_agent_message(
         },
         watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
     )
+    goal = ensure_goal_for_message(
+        db,
+        user=user,
+        session=session,
+        content=payload.content,
+        page_context=page_context,
+        browser_context=browser_context,
+        working_context=working_context,
+        followup_hint=followup_hint,
+        current_objective=current_objective.get("summary"),
+        objective_kind=str(current_objective.get("objective_kind") or ""),
+    )
+    _sync_current_goal_state(
+        db,
+        session,
+        status_override="active",
+        latest_summary=sanitize_text(payload.content, max_length=280) or goal.title,
+    )
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -5732,6 +6446,13 @@ def post_agent_message(
                 "evidence": [],
             },
             watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+        )
+        _sync_current_goal_state(
+            db,
+            session,
+            status_override="blocked",
+            blocked_reason="用户已取消当前待确认计划",
+            latest_summary="已取消待确认计划",
         )
         db.commit()
         db.refresh(session)
@@ -5814,6 +6535,13 @@ def post_agent_message(
                 "evidence": [],
             },
             watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+        )
+        _sync_current_goal_state(
+            db,
+            session,
+            status_override="blocked",
+            blocked_reason="用户已取消上一轮补问，等待新的目标",
+            latest_summary="已取消上一轮补问",
         )
         db.commit()
         db.refresh(session)
@@ -5972,6 +6700,7 @@ def post_agent_message(
                 },
                 watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
             )
+            _sync_current_goal_state(db, session, latest_summary=preflight_clarification)
             db.commit()
             db.refresh(session)
             _log_message_turn_event(
@@ -6069,6 +6798,13 @@ def post_agent_message(
                     state_delta=state_delta,
                 ),
             },
+        )
+        _sync_current_goal_state(
+            db,
+            session,
+            status_override="blocked",
+            blocked_reason=_humanize_ai_error(exc),
+            latest_summary=message.content,
         )
         db.commit()
         db.refresh(session)
@@ -6221,6 +6957,7 @@ def post_agent_step(
             },
             watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
         )
+        _sync_current_goal_state(db, session, latest_summary="没有待继续的页面动作")
         db.commit()
         db.refresh(session)
         _emit_session_snapshot(stream_emitter, session)
@@ -6265,6 +7002,13 @@ def post_agent_step(
                     state_delta=state_delta,
                 ),
             },
+        )
+        _sync_current_goal_state(
+            db,
+            session,
+            status_override="blocked",
+            blocked_reason="站内动作链路达到上限，请缩小目标范围后继续",
+            latest_summary=message.content,
         )
         db.commit()
         db.refresh(session)
@@ -6358,6 +7102,7 @@ def post_agent_step(
         },
         watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
     )
+    _sync_current_goal_state(db, session, status_override="active", latest_summary=_summarize_ui_results(ui_action_results))
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -6441,6 +7186,13 @@ def post_agent_step(
                     state_delta=state_delta,
                 ),
             },
+        )
+        _sync_current_goal_state(
+            db,
+            session,
+            status_override="blocked",
+            blocked_reason=_humanize_ai_error(exc),
+            latest_summary=message.content,
         )
         db.commit()
         db.refresh(session)
@@ -6704,6 +7456,12 @@ def approve_agent_session(
         message_type="text",
         content=request.note or "已批准当前智能体动作计划",
         payload_json={"approval": True, "task_id": task_run.id},
+    )
+    _sync_current_goal_state(
+        db,
+        session,
+        status_override="active",
+        latest_summary=request.note or "已批准当前智能体动作计划",
     )
     db.commit()
     db.refresh(session)

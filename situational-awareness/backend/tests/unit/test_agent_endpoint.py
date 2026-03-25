@@ -17,6 +17,8 @@ from app.api.v1.endpoints import agent as agent_endpoint
 from app.core.security import create_access_token
 from app.db.base import Base
 from app.db.models.asset import Asset
+from app.db.models.agent_goal import AgentGoal
+from app.db.models.agent_message import AgentMessage
 from app.db.models.agent_session import AgentSession
 from app.db.models.enums import AssetStatus, TaskExecutionStatus, TaskType, UserRole
 from app.db.models.task_run import TaskRun
@@ -187,6 +189,8 @@ def test_get_haor_session_summary_returns_none_when_session_missing(monkeypatch)
         "has_attention": False,
         "attention_kind": "none",
         "session_status": None,
+        "current_goal_id": None,
+        "current_goal_title": None,
         "last_task_id": None,
         "updated_at": None,
     }
@@ -309,6 +313,76 @@ def test_get_haor_session_summary_returns_running_task_attention(monkeypatch) ->
     assert payload["attention_kind"] == "running_task"
     assert payload["last_task_id"] == task_id
     assert payload["session_status"] == "running"
+
+
+def test_post_haor_message_creates_goal_and_exposes_current_goal_fields(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, _ = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+
+    response = client.post(
+        "/api/v1/agent/haor/session/messages",
+        json={
+            "client_message_id": "goal-msg-1",
+            "content": "分析这台资产的风险",
+            "page_context": _page_context(pathname="/assets/asset-1", asset_id="asset-1"),
+            "browser_context": _browser_context(pathname="/assets/asset-1", asset_id="asset-1"),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["current_goal_id"]
+    assert payload["current_goal_title"] == "分析资产 asset-1 的风险"
+
+    summary = client.get("/api/v1/agent/haor/summary")
+    assert summary.status_code == 200
+    assert summary.json()["current_goal_id"] == payload["current_goal_id"]
+    assert summary.json()["current_goal_title"] == payload["current_goal_title"]
+
+    goals = client.get("/api/v1/agent/haor/goals")
+    assert goals.status_code == 200
+    assert len(goals.json()) == 1
+    assert goals.json()[0]["id"] == payload["current_goal_id"]
+    assert goals.json()[0]["title"] == "分析资产 asset-1 的风险"
+
+
+def test_haor_goal_resume_and_cancel_routes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+
+    with SessionLocal() as db:
+        goal = AgentGoal(
+            id=str(uuid4()),
+            user_id=user_id,
+            agent_id="haor",
+            status="blocked",
+            title="验证资产 asset-2 的风险",
+            goal_kind="verify_asset_risks",
+            success_criteria_json={"done_when": ["验证任务完成并自动回传"]},
+            context_json={"current_objective": "验证资产 asset-2 的风险", "objective_kind": "verify_asset_risks"},
+            plan_json={},
+            progress_json={"summary": "等待恢复"},
+        )
+        db.add(goal)
+        db.commit()
+        goal_id = goal.id
+
+    goal_detail = client.get(f"/api/v1/agent/haor/goals/{goal_id}")
+    assert goal_detail.status_code == 200
+    assert goal_detail.json()["status"] == "blocked"
+
+    resume = client.post(f"/api/v1/agent/haor/goals/{goal_id}/resume", json={})
+    assert resume.status_code == 200
+    assert resume.json()["current_goal_id"] == goal_id
+    assert resume.json()["current_goal_title"] == "验证资产 asset-2 的风险"
+
+    cancel = client.post(f"/api/v1/agent/haor/goals/{goal_id}/cancel", json={})
+    assert cancel.status_code == 200
+    assert cancel.json()["status"] == "canceled"
+
+    session = client.get("/api/v1/agent/haor/session")
+    assert session.status_code == 200
+    assert session.json()["current_goal_id"] is None
 
 
 def test_get_haor_session_reconciles_stale_pending_ui_feedback_once(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1008,6 +1082,67 @@ def test_post_haor_message_keeps_recent_focus_after_ai_error(monkeypatch) -> Non
     assert third.status_code == 200
     assert third.json()["messages"][-1]["message_type"] == "text"
     assert third.json()["working_context_json"]["asset_id"] == "asset-1"
+
+
+def test_post_haor_message_short_resume_contract_error_returns_clarifying_instead_of_raw_parse_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "match_registered_playbook", lambda **kwargs: None)
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_build_runtime_provider",
+        lambda **kwargs: SimpleNamespace(
+            provider_name="custom_proxy",
+            resolved_base_url="https://example.test/v1",
+            provider=SimpleNamespace(wire_api="responses", generate=lambda _request: "这不是合法 JSON"),
+        ),
+    )
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_execute_read_tool",
+        lambda db, *, tool_name, arguments: {"asset_id": arguments.get("asset_id"), "items": [], "total": 0},
+    )
+
+    with SessionLocal() as db:
+        session = AgentSession(
+            user_id=user_id,
+            agent_id="haor",
+            status="active",
+            working_context_json={},
+        )
+        db.add(session)
+        db.flush()
+        db.add(
+            AgentMessage(
+                session_id=session.id,
+                role="assistant",
+                message_type="task_update",
+                content="资产 asset-1 的风险验证任务已完成。如需继续，我可以帮你分析最新验证结果。",
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_verify_analysis",
+                        "working_context": {"asset_id": "asset-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "list_asset_risks", "arguments": {"asset_id": "asset-1", "limit": 10}}
+                        ],
+                        "suggested_reply_label": "分析验证结果",
+                    }
+                },
+            )
+        )
+        db.commit()
+
+    response = client.post(
+        "/api/v1/agent/haor/session/messages",
+        json={"content": "继续", "page_context": _page_context(pathname="/")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["working_context_json"]["asset_id"] == "asset-1"
+    assert body["messages"][-1]["message_type"] == "clarifying"
+    assert "资产结果、风险结果，还是任务详情" in body["messages"][-1]["content"]
+    assert "JSON 结构无法解析" not in body["messages"][-1]["content"]
 
 
 def test_post_haor_message_can_cancel_pending_clarification(monkeypatch) -> None:  # type: ignore[no-untyped-def]

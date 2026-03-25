@@ -24,3 +24,4 @@ class User(Base):
     created_credentials = relationship("SSHCredential", back_populates="creator")
     approved_remediation_sessions = relationship("RemediationSession", back_populates="approver")
     agent_sessions = relationship("AgentSession", back_populates="user", cascade="all, delete-orphan")
+    agent_goals = relationship("AgentGoal", back_populates="user", cascade="all, delete-orphan")

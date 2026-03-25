@@ -9,6 +9,7 @@ from app.db.models.enums import TaskExecutionStatus
 
 
 AgentSessionStatus = Literal["active", "waiting_approval", "running", "completed", "failed"]
+AgentGoalStatus = Literal["active", "blocked", "completed", "failed", "canceled"]
 AgentRole = Literal["system", "user", "assistant"]
 AgentMessageType = Literal["text", "clarifying", "plan", "task_update", "action_update", "error"]
 AgentAttentionKind = Literal["none", "waiting_approval", "running_task", "pending_ui_action"]
@@ -214,6 +215,25 @@ class AgentMessageRead(BaseModel):
     proposed_write_actions: list[AgentProposedActionRead] = Field(default_factory=list)
 
 
+class AgentGoalRead(BaseModel):
+    id: str
+    user_id: str
+    agent_id: str
+    status: AgentGoalStatus | str
+    title: str
+    goal_kind: str
+    success_criteria_json: dict[str, Any] = Field(default_factory=dict)
+    context_json: dict[str, Any] = Field(default_factory=dict)
+    plan_json: dict[str, Any] = Field(default_factory=dict)
+    progress_json: dict[str, Any] = Field(default_factory=dict)
+    blocked_reason: str | None = None
+    last_session_id: str | None = None
+    last_task_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+
+
 class AgentSessionRead(BaseModel):
     session_id: str
     agent_id: str
@@ -224,6 +244,8 @@ class AgentSessionRead(BaseModel):
     pending_plan_json: dict[str, Any] = Field(default_factory=dict)
     browser_runtime_json: dict[str, Any] = Field(default_factory=dict)
     agent_state_json: dict[str, Any] = Field(default_factory=dict)
+    current_goal_id: str | None = None
+    current_goal_title: str | None = None
     last_task_id: str | None = None
     messages: list[AgentMessageRead] = Field(default_factory=list)
     created_at: datetime
@@ -234,6 +256,8 @@ class AgentSessionSummaryRead(BaseModel):
     has_attention: bool = False
     attention_kind: AgentAttentionKind = "none"
     session_status: AgentSessionStatus | str | None = None
+    current_goal_id: str | None = None
+    current_goal_title: str | None = None
     last_task_id: str | None = None
     updated_at: datetime | None = None
 

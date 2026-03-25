@@ -92,7 +92,7 @@ class DeviceAlertStreamController {
     }
     try {
       final socket = await webSocketClient.connectAuthenticated(
-        uri: buildDeviceAlertStreamUri(),
+        uri: buildAuthenticatedDeviceAlertStreamUri(token),
         token: token,
       );
       socket.pingInterval = const Duration(seconds: 20);
@@ -146,7 +146,7 @@ class DeviceAlertStreamController {
     }
 
     try {
-      await markDeviceAbnormalRiskSeen(
+      await rememberDeviceAbnormalRiskAlerted(
         riskId: alert.findingId,
         highRiskFindings: alert.highRiskFindings,
       );
@@ -155,17 +155,6 @@ class DeviceAlertStreamController {
     }
 
     await onAlert(alert);
-
-    try {
-      await showDeviceAbnormalSystemNotification(
-        title: alert.title,
-        message: alert.message,
-        route: alert.route,
-        navigateWithGo: alert.navigateWithGo,
-      );
-    } catch (_) {
-      // Foreground overlay is more important than system notification delivery.
-    }
   }
 
   Future<void> _handleSocketClosed() async {

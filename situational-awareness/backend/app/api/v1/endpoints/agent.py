@@ -20,6 +20,7 @@ from app.schemas.agent import (
     AgentApprovalRequest,
     AgentApprovalResponse,
     AgentErrorEvent,
+    AgentGoalRead,
     AgentMessageCreateRequest,
     AgentSessionRead,
     AgentSessionSummaryRead,
@@ -30,12 +31,16 @@ from app.schemas.agent import (
 from app.services.haor_agent_service import (
     AgentServiceError,
     approve_agent_session,
+    cancel_agent_goal,
+    get_agent_goal,
     get_agent_session_summary,
     get_or_create_agent_session,
     interrupt_agent_session,
+    list_agent_goals,
     post_agent_message,
     post_agent_step,
     reset_agent_session,
+    resume_agent_goal,
     stream_agent_approve_turn,
     stream_agent_message_turn,
     stream_agent_step_turn,
@@ -68,6 +73,54 @@ def get_haor_session(
         return get_or_create_agent_session(db, user=user)
     except Exception as exc:
         _raise_agent_http_exception(exc, stage="get_session", user=user)
+
+
+@router.get("/haor/goals", response_model=list[AgentGoalRead])
+def list_haor_goals(
+    limit: int = 12,
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> list[AgentGoalRead]:
+    try:
+        return list_agent_goals(db, user=user, limit=limit)
+    except Exception as exc:
+        _raise_agent_http_exception(exc, stage="list_goals", user=user)
+
+
+@router.get("/haor/goals/{goal_id}", response_model=AgentGoalRead)
+def get_haor_goal(
+    goal_id: str,
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> AgentGoalRead:
+    try:
+        return get_agent_goal(db, user=user, goal_id=goal_id)
+    except Exception as exc:
+        _raise_agent_http_exception(exc, stage="get_goal", user=user)
+
+
+@router.post("/haor/goals/{goal_id}/resume", response_model=AgentSessionRead)
+def resume_haor_goal(
+    goal_id: str,
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> AgentSessionRead:
+    try:
+        return resume_agent_goal(db, user=user, goal_id=goal_id)
+    except Exception as exc:
+        _raise_agent_http_exception(exc, stage="resume_goal", user=user)
+
+
+@router.post("/haor/goals/{goal_id}/cancel", response_model=AgentGoalRead)
+def cancel_haor_goal(
+    goal_id: str,
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> AgentGoalRead:
+    try:
+        return cancel_agent_goal(db, user=user, goal_id=goal_id)
+    except Exception as exc:
+        _raise_agent_http_exception(exc, stage="cancel_goal", user=user)
 
 
 @router.post("/haor/session/reset", response_model=AgentSessionRead)

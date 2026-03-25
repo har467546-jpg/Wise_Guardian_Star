@@ -224,6 +224,28 @@ tools/update_ldplayer.sh --adb-host 192.168.130.1 --adb-port 5037 --device emula
 - `--no-launch`：安装后不自动启动应用
 - `--device <id>`：手工指定设备 ID
 
+## 简化入口
+
+如果你只想传“雷电 IP:端口”和“后端 IP:端口”，可以直接用根目录下的 `Package_apk`：
+
+```bash
+cd /root/Desktop/Project/situational-awareness-mobile
+./Package_apk 192.168.130.1:5555 192.168.130.137:8000
+```
+
+它会自动做这些事：
+
+- 把后端地址补成 `http://<后端IP:端口>/api/v1`
+- 自动执行 `adb connect <雷电IP:端口>`
+- 调用现有 `tools/update_ldplayer.sh` 完成构建、安装和启动
+
+可选参数：
+
+- `--release`：构建并安装 release APK
+- `--skip-build`：跳过构建，直接安装已有 APK
+- `--no-launch`：安装后不自动启动
+- `--adb /path/to/adb`：手工指定 adb 路径
+
 ## 产品说明
 
 - 主题内置 `Light / Dark` 两套 token

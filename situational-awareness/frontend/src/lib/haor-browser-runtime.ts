@@ -307,6 +307,9 @@ function collectSelectedEntities(pageContext: AgentPageContext) {
 
 function inferPageKind(pageContext: AgentPageContext) {
   const pathname = pageContext.pathname || "/";
+  if (pathname === "/") {
+    return "dashboard_overview";
+  }
   if (pathname === "/assets") {
     return "asset_list";
   }
@@ -527,6 +530,58 @@ function collectAssetListSemantics(pageContext: AgentPageContext) {
     active_dialog: {},
     selected_rows: collectSelectedRows(),
     summary: `资产列表页，可直接搜索、筛选并打开资产详情。当前可见 ${secondaryEntities.length} 条资产入口。`,
+  } satisfies AgentSemanticPageContext;
+}
+
+function collectDashboardOverviewSemantics() {
+  const pageKind = "dashboard_overview";
+  const sections = collectGenericSections(pageKind);
+  const actions: AgentBrowserSemanticAction[] = [];
+  const secondaryEntities: AgentBrowserSemanticEntity[] = [];
+  addSectionScrollActions(pageKind, sections, actions);
+
+  [
+    { actionId: "open_discovery", label: "打开扫描发起台", href: "/discovery", keywords: ["扫描", "发起扫描", "发现任务", "CIDR"] },
+    { actionId: "open_assets", label: "打开资产列表", href: "/assets", keywords: ["资产", "资产列表", "热点资产"] },
+    { actionId: "open_tasks", label: "打开任务中心", href: "/tasks", keywords: ["任务", "任务中心", "查看任务"] },
+    { actionId: "open_risks", label: "打开风险列表", href: "/risks", keywords: ["风险", "风险列表", "最新风险"] },
+  ].forEach((item) => {
+    pushUniqueAction(
+      actions,
+      semanticAction(pageKind, item.actionId, item.label, "navigate", null, {
+        href: item.href,
+        description: item.label,
+        keywords: item.keywords,
+      }),
+    );
+  });
+
+  document.querySelectorAll<HTMLElement>(".dashboard-panel-card .console-list-item").forEach((item, index) => {
+    if (!isElementVisible(item)) {
+      return;
+    }
+    const label = truncate(item.textContent, 160);
+    if (!label) {
+      return;
+    }
+    secondaryEntities.push(
+      buildSemanticEntity("dashboard_entry", ensureNodeId(item), label, {
+        source: "page",
+        meta: { section: item.closest("[data-haor-section]")?.getAttribute("data-haor-section") || null, rank: index + 1 },
+      }),
+    );
+  });
+
+  return {
+    page_kind: pageKind,
+    primary_entity: buildSemanticEntity("platform", "dashboard", "桌面态势总览", { source: "route" }),
+    secondary_entities: secondaryEntities.slice(0, MAX_SECONDARY_ENTITIES),
+    visible_sections: sections,
+    semantic_actions: actions.slice(0, MAX_SEMANTIC_ACTIONS),
+    semantic_forms: [],
+    active_dialog: {},
+    selected_rows: collectSelectedRows(),
+    summary: "桌面态势总览页，可查看实时监控、发现队列、最新风险、风险热点资产与任务健康，并跳转到扫描、资产、任务和风险页面。",
   } satisfies AgentSemanticPageContext;
 }
 
@@ -787,6 +842,84 @@ function collectRiskEntrySemantics() {
   } satisfies AgentSemanticPageContext;
 }
 
+function collectDiscoverySemantics() {
+  const pageKind = "discovery";
+  const sections = collectGenericSections(pageKind);
+  const actions: AgentBrowserSemanticAction[] = [];
+  const forms: AgentBrowserSemanticForm[] = [];
+  addSectionScrollActions(pageKind, sections, actions);
+
+  const cidrField = document.querySelector<HTMLInputElement>("input[placeholder='10.10.0.0/24']");
+  const labelField = document.querySelector<HTMLInputElement>("input[placeholder*='季度扫描']");
+  const submitButton = document.querySelector<HTMLElement>(".discovery-submit-button");
+  const taskBadge = document.querySelector<HTMLElement>(".discovery-result-wrap .ant-tag");
+
+  pushUniqueForm(forms, {
+    semantic_form_id: `${pageKind}:launch-form`,
+    label: "扫描发起表单",
+    node_id: cidrField && isElementVisible(cidrField) ? ensureNodeId(cidrField) : undefined,
+    fields: [
+      { name: "cidr", label: "CIDR 目标网段", type: "text", placeholder: "10.10.0.0/24" },
+      { name: "label", label: "任务备注标签", type: "text", placeholder: "例如: 核心业务段季度扫描" },
+    ],
+    submit_action_id: `${pageKind}:submit_discovery`,
+  });
+
+  pushUniqueAction(
+    actions,
+    semanticAction(pageKind, "fill_cidr", "填写 CIDR 目标网段", "input", cidrField, {
+      selector: "input[placeholder='10.10.0.0/24']",
+      description: "填写扫描目标 CIDR",
+      keywords: ["CIDR", "网段", "扫描目标", "输入网段"],
+    }),
+  );
+  pushUniqueAction(
+    actions,
+    semanticAction(pageKind, "fill_label", "填写任务备注标签", "input", labelField, {
+      selector: "input[placeholder*='季度扫描']",
+      description: "填写发现任务备注",
+      keywords: ["备注", "标签", "任务标签"],
+    }),
+  );
+  pushUniqueAction(
+    actions,
+    semanticAction(pageKind, "submit_discovery", "启动扫描流水线", "click", submitButton, {
+      selector: ".discovery-submit-button",
+      description: "提交发现任务",
+      keywords: ["启动流水线", "发起扫描", "提交扫描"],
+    }),
+  );
+  pushUniqueAction(
+    actions,
+    semanticAction(pageKind, "open_task_center", "打开任务中心", "navigate", null, {
+      href: "/tasks",
+      description: "进入任务中心查看扫描进度",
+      keywords: ["任务中心", "扫描进度", "查看任务"],
+    }),
+  );
+
+  const secondaryEntities: AgentBrowserSemanticEntity[] = [];
+  if (taskBadge && isElementVisible(taskBadge)) {
+    secondaryEntities.push(
+      buildSemanticEntity("task", truncate(taskBadge.textContent, 64), `发现任务 ${truncate(taskBadge.textContent, 64)}`, {
+        source: "page",
+      }),
+    );
+  }
+
+  return {
+    page_kind: pageKind,
+    primary_entity: buildSemanticEntity("discovery_pipeline", "launchpad", "扫描发起台", { source: "route" }),
+    secondary_entities: secondaryEntities,
+    visible_sections: sections,
+    semantic_actions: actions.slice(0, MAX_SEMANTIC_ACTIONS),
+    semantic_forms: forms,
+    active_dialog: {},
+    selected_rows: [],
+    summary: "扫描发起台，可填写 CIDR 与备注标签、提交扫描流水线，并在任务中心继续追踪结果。",
+  } satisfies AgentSemanticPageContext;
+}
+
 function collectGenericSemantics(pageContext: AgentPageContext) {
   const pageKind = inferPageKind(pageContext);
   const sections = collectGenericSections(pageKind);
@@ -807,6 +940,8 @@ function collectGenericSemantics(pageContext: AgentPageContext) {
 
 function collectSemanticPageContext(pageContext: AgentPageContext) {
   switch (inferPageKind(pageContext)) {
+    case "dashboard_overview":
+      return collectDashboardOverviewSemantics();
     case "asset_list":
       return collectAssetListSemantics(pageContext);
     case "asset_detail":
@@ -823,6 +958,8 @@ function collectSemanticPageContext(pageContext: AgentPageContext) {
       return collectVulnLibrarySemantics();
     case "risk_entry":
       return collectRiskEntrySemantics();
+    case "discovery":
+      return collectDiscoverySemantics();
     default:
       return collectGenericSemantics(pageContext);
   }

@@ -1,4 +1,5 @@
 from app.db.models.agent_message import AgentMessage
+from app.db.models.agent_goal import AgentGoal
 from app.db.models.agent_session import AgentSession
 from app.db.models.asset import Asset, AssetPort, AssetTag
 from app.db.models.credential import AssetCredentialBinding, SSHCredential
@@ -19,6 +20,7 @@ from app.db.models.vuln_rule_index import VulnRuleIndex
 
 __all__ = [
     "AgentMessage",
+    "AgentGoal",
     "AgentSession",
     "Asset",
     "AssetPort",

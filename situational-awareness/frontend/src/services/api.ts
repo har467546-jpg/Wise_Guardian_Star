@@ -1,5 +1,6 @@
 import { Asset, AssetBatchDeleteResponse, AssetListResponse } from "@/types/asset";
 import {
+  AgentGoal,
   AgentApprovalRequest,
   AgentApprovalResponse,
   AgentMessageCreateRequest,
@@ -730,6 +731,28 @@ export function getHaorSession() {
 
 export function getHaorSessionSummary() {
   return apiFetch<AgentSessionSummary>("/agent/haor/summary", undefined, { preferBackendDetail: true });
+}
+
+export function getHaorGoals(limit = 12) {
+  return apiFetch<AgentGoal[]>(`/agent/haor/goals?limit=${encodeURIComponent(String(limit))}`, undefined, { preferBackendDetail: true });
+}
+
+export function getHaorGoal(goalId: string) {
+  return apiFetch<AgentGoal>(`/agent/haor/goals/${encodeURIComponent(goalId)}`, undefined, { preferBackendDetail: true });
+}
+
+export function resumeHaorGoal(goalId: string) {
+  return apiFetch<AgentSession>(`/agent/haor/goals/${encodeURIComponent(goalId)}/resume`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, { preferBackendDetail: true });
+}
+
+export function cancelHaorGoal(goalId: string) {
+  return apiFetch<AgentGoal>(`/agent/haor/goals/${encodeURIComponent(goalId)}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, { preferBackendDetail: true });
 }
 
 export function buildHaorSessionStreamUrl(token: string) {

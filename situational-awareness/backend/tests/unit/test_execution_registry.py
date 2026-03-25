@@ -60,3 +60,88 @@ def test_queue_discovery_job_rejects_invalid_cidr(monkeypatch) -> None:
         assert str(exc) == "扫描计划中的 CIDR 不合法：999.999.999.999/24"
     else:  # pragma: no cover - defensive assertion
         raise AssertionError("expected RuntimeError for invalid CIDR")
+
+
+def test_create_or_resume_remediation_auto_submits_when_ready(monkeypatch) -> None:
+    monkeypatch.setattr(
+        execution_registry,
+        "create_or_resume_remediation_session",
+        lambda db, asset_id: SimpleNamespace(
+            session_id="session-1",
+            plan=SimpleNamespace(execution_ready=True, blocked_reasons=[]),
+        ),
+    )
+    monkeypatch.setattr(
+        execution_registry,
+        "approve_remediation_session",
+        lambda db, session_id, approved_by: SimpleNamespace(task_id="remediation-task-1"),
+    )
+
+    context = execution_registry.AgentActionExecutorContext(
+        db=SimpleNamespace(),
+        session_user_id="user-1",
+        platform_url="http://localhost:3000",
+        get_manual_credential=lambda *_args, **_kwargs: None,
+    )
+
+    result = execution_registry.execute_registered_action(
+        context,
+        action={
+            "action_type": "create_or_resume_remediation_session",
+            "params": {"asset_id": "asset-1", "submit_if_ready": True},
+        },
+    )
+
+    assert result.status == "queued"
+    assert result.child_task_id == "remediation-task-1"
+    assert result.payload == {
+        "asset_id": "asset-1",
+        "session_id": "session-1",
+        "execution_ready": True,
+        "blocked_reasons": [],
+        "submitted_task_id": "remediation-task-1",
+    }
+    assert "直接提交自动修复任务 remediation-task-1" in result.summary
+
+
+def test_create_or_resume_remediation_returns_blockers_without_submitting(monkeypatch) -> None:
+    monkeypatch.setattr(
+        execution_registry,
+        "create_or_resume_remediation_session",
+        lambda db, asset_id: SimpleNamespace(
+            session_id="session-1",
+            plan=SimpleNamespace(execution_ready=False, blocked_reasons=["当前主机尚未安装 Host Runner"]),
+        ),
+    )
+    monkeypatch.setattr(
+        execution_registry,
+        "approve_remediation_session",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not submit remediation")),
+    )
+
+    context = execution_registry.AgentActionExecutorContext(
+        db=SimpleNamespace(),
+        session_user_id="user-1",
+        platform_url="http://localhost:3000",
+        get_manual_credential=lambda *_args, **_kwargs: None,
+    )
+
+    result = execution_registry.execute_registered_action(
+        context,
+        action={
+            "action_type": "create_or_resume_remediation_session",
+            "params": {"asset_id": "asset-1", "submit_if_ready": True},
+        },
+    )
+
+    assert result.status == "success"
+    assert result.child_task_id is None
+    assert result.payload == {
+        "asset_id": "asset-1",
+        "session_id": "session-1",
+        "execution_ready": False,
+        "blocked_reasons": ["当前主机尚未安装 Host Runner"],
+        "submitted_task_id": None,
+    }
+    assert "当前未自动执行" in result.summary
+    assert "当前主机尚未安装 Host Runner" in result.summary

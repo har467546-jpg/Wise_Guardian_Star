@@ -257,6 +257,7 @@ export default function DashboardBoard() {
         <Col xs={24} lg={11}>
           <Card
             className="panel-card dashboard-panel-card"
+            data-haor-section="平台实时监控"
             title="平台实时监控"
             extra={
               <Space size={10} wrap>
@@ -337,6 +338,7 @@ export default function DashboardBoard() {
         <Col xs={24} lg={13}>
           <Card
             className="panel-card dashboard-panel-card"
+            data-haor-section="发现队列与最新风险"
             title="发现队列与最新风险"
           >
             {overview ? (
@@ -397,7 +399,12 @@ export default function DashboardBoard() {
 
       <Row gutter={[14, 14]} className="dashboard-grid-row">
         <Col xs={24} lg={15}>
-          <Card className="panel-card dashboard-panel-card" title="风险热点资产" extra={<Typography.Text type="secondary">按最高风险和命中数排序</Typography.Text>}>
+          <Card
+            className="panel-card dashboard-panel-card"
+            data-haor-section="风险热点资产"
+            title="风险热点资产"
+            extra={<Typography.Text type="secondary">按最高风险和命中数排序</Typography.Text>}
+          >
             {overview?.risky_assets.length ? (
               <List
                 className="console-list"
@@ -429,7 +436,7 @@ export default function DashboardBoard() {
           </Card>
         </Col>
         <Col xs={24} lg={9}>
-          <Card className="panel-card dashboard-panel-card" title="风险态势与任务波形">
+          <Card className="panel-card dashboard-panel-card" data-haor-section="风险态势与任务波形" title="风险态势与任务波形">
             <Space direction="vertical" size={18} style={{ width: "100%" }}>
               <div className="dashboard-threat-band">
                 <div className="dashboard-threat-column">

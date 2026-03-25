@@ -39,6 +39,7 @@ def run_agent_orchestrate_task(
     session_id: str,
 ) -> str:
     actions: list[dict] = []
+    terminal_followup: dict[str, object] | None = None
     try:
         with tracked_task(task_run_id, celery_task_id=self.request.id, retry_count=self.request.retries):
             ensure_task_not_canceled(task_run_id)
@@ -102,6 +103,17 @@ def run_agent_orchestrate_task(
                         "payload": result.payload or {},
                     }
                     action_results.append(action_result)
+                    if result.child_task_id:
+                        session.last_task_id = result.child_task_id
+                        sync_agent_task_watch_state(
+                            session,
+                            task_id=result.child_task_id,
+                            status=result.status,
+                            message=result.summary,
+                            action=action_result,
+                            watching=True,
+                        )
+                        db.add(session)
                     task_run = get_task_run(db, task_run_id)
                     if task_run is not None:
                         current_result = task_run.result_json if isinstance(task_run.result_json, dict) else {}
@@ -130,10 +142,21 @@ def run_agent_orchestrate_task(
                     )
                     child_summary = wait_for_child_task(result.child_task_id)
                     action_results[-1]["child_task"] = child_summary
-                    if child_summary.get("status") != TaskExecutionStatus.SUCCESS.value:
-                        raise RuntimeError(
-                            str(child_summary.get("message") or child_summary.get("error_json") or "子任务执行失败")
-                        )
+                    followup_action = {**action, "payload": result.payload or {}}
+                    followup_message_type, followup_content, followup_resume_hint = build_auto_action_task_followup_content(
+                        followup_action,
+                        child_summary,
+                    )
+                    terminal_followup = {
+                        "message_type": followup_message_type,
+                        "content": followup_content,
+                        "payload_json": {
+                            "task_id": child_summary.get("task_id") or result.child_task_id,
+                            "action": followup_action,
+                            "child_task": child_summary,
+                            "resume_hint": followup_resume_hint,
+                        },
+                    }
                     with SessionLocal() as db:
                         task_run = get_task_run(db, task_run_id)
                         if task_run is not None:
@@ -142,6 +165,18 @@ def run_agent_orchestrate_task(
                             execution["results"] = action_results
                             current_result["execution"] = execution
                             update_task_run(db, task_run, result_json=current_result)
+                    if child_summary.get("status") != TaskExecutionStatus.SUCCESS.value:
+                        raise RuntimeError(followup_content)
+                elif result.summary:
+                    terminal_followup = {
+                        "message_type": "task_update",
+                        "content": result.summary,
+                        "payload_json": {
+                            "task_id": task_run_id,
+                            "action": {**action, "payload": result.payload or {}},
+                            "result_payload": result.payload or {},
+                        },
+                    }
 
             ensure_task_not_canceled(task_run_id)
             set_task_progress(
@@ -162,16 +197,31 @@ def run_agent_orchestrate_task(
                 current_result["execution"] = execution
                 session = db.get(AgentSession, session_id)
                 if session is not None:
+                    final_message_type = "task_update"
+                    final_message_content = f"已完成本轮 haor 编排，共执行 {len(action_results)} 个动作。"
+                    final_message_payload = {"results": action_results, "task_id": task_run_id}
+                    final_watch_task_id = task_run_id
+                    if len(action_results) == 1 and isinstance(terminal_followup, dict):
+                        followup_payload = terminal_followup.get("payload_json")
+                        final_message_type = str(terminal_followup.get("message_type") or "task_update")
+                        final_message_content = str(terminal_followup.get("content") or final_message_content)
+                        final_message_payload = {
+                            "results": action_results,
+                            "task_id": task_run_id,
+                            "orchestrate_task_id": task_run_id,
+                            **(followup_payload if isinstance(followup_payload, dict) else {}),
+                        }
+                        final_watch_task_id = str(final_message_payload.get("task_id") or task_run_id)
                     session.status = "active"
                     session.pending_plan_json = {}
                     session.dialog_state_json = {}
                     session.browser_runtime_json = {}
-                    session.last_task_id = task_run_id
+                    session.last_task_id = final_watch_task_id
                     sync_agent_task_watch_state(
                         session,
-                        task_id=task_run_id,
+                        task_id=final_watch_task_id,
                         status=TaskExecutionStatus.SUCCESS.value,
-                        message="haor 编排任务完成",
+                        message=final_message_content,
                         action=actions[0] if actions else {},
                         watching=False,
                     )
@@ -179,8 +229,9 @@ def run_agent_orchestrate_task(
                     append_agent_task_message(
                         db,
                         session_id=session_id,
-                        content=f"已完成本轮 haor 编排，共执行 {len(action_results)} 个动作。",
-                        payload_json={"results": action_results, "task_id": task_run_id},
+                        content=final_message_content,
+                        payload_json=final_message_payload,
+                        message_type=final_message_type,
                     )
                 db.commit()
                 set_task_success(task_run_id, "haor 编排任务完成", current_result)
@@ -198,16 +249,31 @@ def run_agent_orchestrate_task(
         with SessionLocal() as db:
             session = db.get(AgentSession, session_id)
             if session is not None:
+                final_message_type = "error"
+                final_message_content = f"本轮 haor 编排失败：{exc}"
+                final_message_payload = {"task_id": task_run_id, "error": str(exc)}
+                final_watch_task_id = task_run_id
+                if isinstance(terminal_followup, dict):
+                    followup_payload = terminal_followup.get("payload_json")
+                    if str(terminal_followup.get("message_type") or "") == "error":
+                        final_message_content = str(terminal_followup.get("content") or final_message_content)
+                        final_message_payload = {
+                            "task_id": task_run_id,
+                            "orchestrate_task_id": task_run_id,
+                            "error": str(exc),
+                            **(followup_payload if isinstance(followup_payload, dict) else {}),
+                        }
+                        final_watch_task_id = str(final_message_payload.get("task_id") or task_run_id)
                 session.status = "active"
                 session.pending_plan_json = {}
                 session.dialog_state_json = {}
                 session.browser_runtime_json = {}
-                session.last_task_id = task_run_id
+                session.last_task_id = final_watch_task_id
                 sync_agent_task_watch_state(
                     session,
-                    task_id=task_run_id,
+                    task_id=final_watch_task_id,
                     status=TaskExecutionStatus.FAILURE.value,
-                    message=str(exc),
+                    message=final_message_content,
                     action=actions[0] if actions else {},
                     watching=False,
                 )
@@ -215,12 +281,16 @@ def run_agent_orchestrate_task(
                 append_agent_task_message(
                     db,
                     session_id=session_id,
-                    content=f"本轮 haor 编排失败：{exc}",
-                    payload_json={"task_id": task_run_id, "error": str(exc)},
-                    message_type="error",
+                    content=final_message_content,
+                    payload_json=final_message_payload,
+                    message_type=final_message_type,
                 )
                 db.commit()
-        if self.request.retries < self.max_retries:
+        should_retry = not (
+            isinstance(terminal_followup, dict)
+            and str(terminal_followup.get("message_type") or "") == "error"
+        )
+        if should_retry and self.request.retries < self.max_retries:
             set_task_retry(task_run_id, self.request.retries + 1, str(exc))
             raise self.retry(exc=exc, countdown=3)
         set_task_failure(task_run_id, self.request.retries, str(exc))
@@ -256,7 +326,7 @@ def run_agent_auto_followup_task(
             return child_task_id
         if has_agent_task_followup_message(session, task_id=child_task_id):
             return child_task_id
-        message_type, content = build_auto_action_task_followup_content(normalized_action, child_summary)
+        message_type, content, resume_hint = build_auto_action_task_followup_content(normalized_action, child_summary)
         append_agent_task_message(
             db,
             session_id=session_id,
@@ -266,6 +336,7 @@ def run_agent_auto_followup_task(
                 "auto_followup": True,
                 "action": normalized_action,
                 "child_task": child_summary,
+                "resume_hint": resume_hint,
             },
             message_type=message_type,
         )

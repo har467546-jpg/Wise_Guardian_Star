@@ -330,6 +330,63 @@ def test_custom_proxy_provider_auto_prefers_responses_then_falls_back_to_chat(mo
     ]
 
 
+def test_custom_proxy_provider_auto_accepts_anthropic_style_chat_payload(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured_urls: list[str] = []
+
+    def _fake_post(url: str, *, headers: dict[str, str], json: dict[str, object], timeout: int):  # type: ignore[no-untyped-def]
+        captured_urls.append(url)
+        request = httpx.Request("POST", url)
+        if url.endswith("/responses"):
+            return httpx.Response(
+                404,
+                request=request,
+                json={"error": {"message": "Responses API is not supported by this relay."}},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "id": "msg_123",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Anthropic 风格输出"}],
+            },
+        )
+
+    monkeypatch.setattr(gateway_module.settings, "LLM_PROVIDER", "custom_proxy")
+    monkeypatch.setattr(gateway_module.settings, "LLM_MODEL", "MiniMax-M2.5")
+    monkeypatch.setattr(gateway_module.settings, "LLM_BASE_URL", "https://relay.example.com/v1")
+    monkeypatch.setattr(gateway_module.settings, "LLM_WIRE_API", "auto")
+    monkeypatch.setattr(gateway_module.settings, "LLM_TIMEOUT_SECONDS", 33)
+    monkeypatch.setattr(gateway_module.settings, "LLM_API_KEY", "relay-token")
+    monkeypatch.setattr(providers_module.httpx, "post", _fake_post)
+
+    summary = LLMGateway().summarize("请生成摘要")
+
+    assert summary == "Anthropic 风格输出"
+    assert captured_urls == [
+        "https://relay.example.com/v1/responses",
+        "https://relay.example.com/v1/chat/completions",
+    ]
+
+
+def test_gateway_surfaces_upstream_error_payload_instead_of_missing_choices(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def _fake_post(url: str, *, headers: dict[str, str], json: dict[str, object], timeout: int):  # type: ignore[no-untyped-def]
+        return _FakeResponse({"error": {"message": "relay returned invalid model mapping"}})
+
+    monkeypatch.setattr(gateway_module.settings, "LLM_PROVIDER", "custom_proxy")
+    monkeypatch.setattr(gateway_module.settings, "LLM_MODEL", "MiniMax-M2.5")
+    monkeypatch.setattr(gateway_module.settings, "LLM_BASE_URL", "https://relay.example.com/v1")
+    monkeypatch.setattr(gateway_module.settings, "LLM_WIRE_API", "chat_completions")
+    monkeypatch.setattr(gateway_module.settings, "LLM_TIMEOUT_SECONDS", 33)
+    monkeypatch.setattr(gateway_module.settings, "LLM_API_KEY", "relay-token")
+    monkeypatch.setattr(providers_module.httpx, "post", _fake_post)
+
+    summary = LLMGateway().summarize("请生成摘要")
+
+    assert "AI 调用失败" in summary
+    assert "relay returned invalid model mapping" in summary
+
+
 def test_openai_chat_completions_merges_multiple_system_messages(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     captured: dict[str, object] = {}
 

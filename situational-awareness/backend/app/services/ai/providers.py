@@ -426,24 +426,97 @@ def _render_ollama_prompt(request: LLMRequest) -> str:
     return "\n\n".join(section for section in sections if section.strip()).strip()
 
 
-def _extract_openai_content(payload: dict[str, Any]) -> str:
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise ValueError("模型返回缺少 choices")
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if isinstance(content, str):
+def _extract_text_parts_from_blocks(
+    blocks: Any,
+    *,
+    allowed_types: set[str] | None = None,
+) -> list[str]:
+    if not isinstance(blocks, list):
+        return []
+    normalized_allowed_types = allowed_types or {"text", "output_text", "input_text"}
+    parts: list[str] = []
+    for item in blocks:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                parts.append(text)
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type and item_type not in normalized_allowed_types:
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+            continue
+        value = item.get("value")
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    return parts
+
+
+def _extract_payload_error_detail(payload: dict[str, Any]) -> str:
+    for key in ("error", "detail", "message"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            for nested_key in ("message", "detail", "error"):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, str) and nested_value.strip():
+                    return nested_value.strip()
+        elif isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _extract_fallback_text_content(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if isinstance(content, str) and content.strip():
         return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = str(item.get("text") or "").strip()
-                if text:
-                    parts.append(text)
+    parts = _extract_text_parts_from_blocks(content)
+    if parts:
+        return "\n".join(parts)
+
+    for key in ("output_text", "completion", "text", "response"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    message = payload.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        parts = _extract_text_parts_from_blocks(content)
         if parts:
             return "\n".join(parts)
-    raise ValueError("模型返回缺少可读取内容")
+        text = message.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+    return ""
+
+
+def _extract_openai_content(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        parts = _extract_text_parts_from_blocks(content, allowed_types={"text"})
+        if parts:
+            return "\n".join(parts)
+
+    fallback_text = _extract_fallback_text_content(payload)
+    if fallback_text:
+        return fallback_text
+
+    error_detail = _extract_payload_error_detail(payload)
+    if error_detail:
+        raise ValueError(f"上游返回错误：{error_detail}")
+
+    raise ValueError("模型返回格式不兼容，缺少可读取内容")
 
 
 def _extract_openai_responses_content(payload: dict[str, Any]) -> str:
@@ -453,6 +526,12 @@ def _extract_openai_responses_content(payload: dict[str, Any]) -> str:
 
     output = payload.get("output")
     if not isinstance(output, list) or not output:
+        fallback_text = _extract_fallback_text_content(payload)
+        if fallback_text:
+            return fallback_text
+        error_detail = _extract_payload_error_detail(payload)
+        if error_detail:
+            raise ValueError(f"上游返回错误：{error_detail}")
         raise ValueError("Responses 返回缺少 output")
 
     parts: list[str] = []
@@ -476,6 +555,12 @@ def _extract_openai_responses_content(payload: dict[str, Any]) -> str:
 
     if parts:
         return "\n".join(parts)
+    fallback_text = _extract_fallback_text_content(payload)
+    if fallback_text:
+        return fallback_text
+    error_detail = _extract_payload_error_detail(payload)
+    if error_detail:
+        raise ValueError(f"上游返回错误：{error_detail}")
     raise ValueError("Responses 返回缺少可读取内容")
 
 
@@ -570,6 +655,7 @@ class OpenAICompatibleProvider(BaseProvider):
         timeout_seconds: int,
         api_key: str = "",
         wire_api: str = "responses",
+        chat_json_mode: bool = False,
         provider_label: str = "OpenAI 兼容接口",
     ) -> None:
         normalized_candidates: list[str] = []
@@ -584,6 +670,7 @@ class OpenAICompatibleProvider(BaseProvider):
         self.timeout_seconds = timeout_seconds
         self.api_key = api_key
         self.wire_api = str(wire_api or "responses").strip().lower() or "responses"
+        self.chat_json_mode = bool(chat_json_mode)
         self.provider_label = provider_label
         self.max_attempts = DEFAULT_TRANSIENT_RETRY_ATTEMPTS
 
@@ -724,15 +811,73 @@ class OpenAICompatibleProvider(BaseProvider):
             raise last_exc
         raise RuntimeError("AI 请求失败")
 
-    def _generate_chat_completions(self, request: LLMRequest) -> str:
-        response = self._post_with_retry(
-            endpoint="/chat/completions",
-            payload={
-                "model": self.model,
-                "messages": _build_openai_chat_messages(request),
-                "temperature": 0.2,
-            },
+    def _should_retry_chat_without_json_mode(self, exc: httpx.HTTPStatusError) -> bool:
+        if exc.response.status_code not in {400, 422}:
+            return False
+
+        message_parts: list[str] = []
+        try:
+            payload = exc.response.json()
+        except Exception:
+            payload = None
+
+        if isinstance(payload, dict):
+            for key in ("error", "detail", "message"):
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    nested_message = value.get("message")
+                    if isinstance(nested_message, str) and nested_message.strip():
+                        message_parts.append(nested_message.strip())
+                elif isinstance(value, str) and value.strip():
+                    message_parts.append(value.strip())
+
+        raw_text = exc.response.text.strip()
+        if raw_text:
+            message_parts.append(raw_text)
+
+        combined_message = " ".join(message_parts).lower()
+        if not combined_message:
+            return True
+
+        retry_markers = (
+            "response_format",
+            "json_object",
+            "json schema",
+            "json_schema",
+            "unsupported parameter",
+            "unrecognized request argument",
+            "extra inputs are not permitted",
+            "unknown field",
         )
+        return any(marker in combined_message for marker in retry_markers)
+
+    def _generate_chat_completions(self, request: LLMRequest) -> str:
+        payload = {
+            "model": self.model,
+            "messages": _build_openai_chat_messages(request),
+            "temperature": 0.2,
+        }
+        if self.chat_json_mode:
+            try:
+                response = self._post_with_retry(
+                    endpoint="/chat/completions",
+                    payload={
+                        **payload,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+            except httpx.HTTPStatusError as exc:
+                if not self._should_retry_chat_without_json_mode(exc):
+                    raise
+                response = self._post_with_retry(
+                    endpoint="/chat/completions",
+                    payload=payload,
+                )
+        else:
+            response = self._post_with_retry(
+                endpoint="/chat/completions",
+                payload=payload,
+            )
         return _extract_openai_content(_parse_json_response(response))
 
     def _stream_chat_completions(self, request: LLMRequest) -> Iterator[str]:
@@ -890,13 +1035,23 @@ class OpenAICompatibleProvider(BaseProvider):
 
 
 class OpenAIProvider(OpenAICompatibleProvider):
-    def __init__(self, *, api_key: str, model: str, timeout_seconds: int, base_url: str = DEFAULT_OPENAI_BASE_URL, wire_api: str = "responses") -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        timeout_seconds: int,
+        base_url: str = DEFAULT_OPENAI_BASE_URL,
+        wire_api: str = "responses",
+        chat_json_mode: bool = False,
+    ) -> None:
         super().__init__(
             api_key=api_key,
             model=model,
             base_url=base_url or DEFAULT_OPENAI_BASE_URL,
             timeout_seconds=timeout_seconds,
             wire_api=wire_api,
+            chat_json_mode=chat_json_mode,
             provider_label="OpenAI",
         )
 
@@ -1090,6 +1245,7 @@ def build_provider(
     wire_api: str = "",
     timeout_seconds: int = 60,
     api_key: str = "",
+    chat_json_mode: bool = False,
     fallback_to_mock: bool = False,
 ) -> ProviderBuildResult:
     normalized_provider = normalize_provider_name(provider_name)
@@ -1136,6 +1292,7 @@ def build_provider(
                 timeout_seconds=normalized_timeout,
                 base_url=resolved_base_url,
                 wire_api=normalized_wire_api,
+                chat_json_mode=chat_json_mode,
             ),
         )
 
@@ -1152,6 +1309,7 @@ def build_provider(
                 base_url_candidates=[resolved_base_url],
                 timeout_seconds=normalized_timeout,
                 wire_api=normalized_wire_api,
+                chat_json_mode=chat_json_mode,
                 provider_label="MiniMax",
             ),
         )
@@ -1177,6 +1335,7 @@ def build_provider(
                 base_url_candidates=normalized_base_url_candidates,
                 timeout_seconds=normalized_timeout,
                 wire_api=normalized_wire_api,
+                chat_json_mode=chat_json_mode,
                 provider_label="自定义中转",
             ),
         )

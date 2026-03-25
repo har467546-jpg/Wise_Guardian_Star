@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import date, datetime, time
+from enum import Enum
 from typing import Any
 
 
@@ -25,6 +27,10 @@ def sanitize_text(
 def sanitize_json_value(value: Any) -> Any:
     if isinstance(value, str):
         return sanitize_text(value) or ""
+    if isinstance(value, Enum):
+        return sanitize_json_value(value.value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
     if isinstance(value, Mapping):
         return {
             sanitize_text(str(key)) or str(key): sanitize_json_value(item)

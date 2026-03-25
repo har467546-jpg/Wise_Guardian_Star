@@ -34,6 +34,20 @@ class AgentActionExecutorContext:
     get_manual_credential: Callable[[Session, str], Any]
 
 
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return False
+
+
 def _queue_discovery_job(context: AgentActionExecutorContext, *, action: dict[str, Any]) -> AgentExecutionResult:
     db = context.db
     params = action.get("params") if isinstance(action.get("params"), dict) else {}
@@ -141,13 +155,44 @@ def _create_or_resume_remediation(context: AgentActionExecutorContext, *, action
     db = context.db
     params = action.get("params") if isinstance(action.get("params"), dict) else {}
     asset_id = sanitize_text(str(params.get("asset_id") or ""), max_length=64, single_line=True) or ""
+    submit_if_ready = _coerce_bool(params.get("submit_if_ready"))
     if not asset_id:
         raise RuntimeError("修复会话计划缺少 asset_id")
     session = create_or_resume_remediation_session(db, asset_id=asset_id)
+    blocked_reasons = list(session.plan.blocked_reasons or [])
+    payload = {
+        "asset_id": asset_id,
+        "session_id": session.session_id,
+        "execution_ready": bool(session.plan.execution_ready),
+        "blocked_reasons": blocked_reasons,
+        "submitted_task_id": None,
+    }
+    if submit_if_ready and session.plan.execution_ready:
+        response = approve_remediation_session(db, session_id=session.session_id, approved_by="haor")
+        payload["submitted_task_id"] = response.task_id
+        return AgentExecutionResult(
+            status="queued",
+            summary=f"已准备修复会话 {session.session_id}，并直接提交自动修复任务 {response.task_id}",
+            child_task_id=response.task_id,
+            payload=payload,
+        )
+
+    if submit_if_ready:
+        blocked_summary = "；".join(blocked_reasons) if blocked_reasons else "当前整机修复计划不可执行"
+        return AgentExecutionResult(
+            status="success",
+            summary=(
+                f"已准备修复会话 {session.session_id}，但当前未自动执行。"
+                f"阻塞原因：{blocked_summary}。"
+                "请先补齐前置条件后再继续自动修复，或进入修复工作台查看详情。"
+            ),
+            payload=payload,
+        )
+
     return AgentExecutionResult(
         status="success",
         summary=f"已准备主机修复会话 {session.session_id}",
-        payload={"asset_id": asset_id, "session_id": session.session_id},
+        payload=payload,
     )
 
 

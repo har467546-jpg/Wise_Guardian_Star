@@ -25,6 +25,12 @@ class AgentSession(Base):
     pending_plan_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     browser_runtime_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     agent_state_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    current_goal_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("agent_goals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     last_task_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("task_runs.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
@@ -34,6 +40,7 @@ class AgentSession(Base):
     )
 
     user = relationship("User", back_populates="agent_sessions")
+    current_goal = relationship("AgentGoal", back_populates="current_sessions", foreign_keys=[current_goal_id])
     last_task = relationship("TaskRun")
     messages = relationship(
         "AgentMessage",
