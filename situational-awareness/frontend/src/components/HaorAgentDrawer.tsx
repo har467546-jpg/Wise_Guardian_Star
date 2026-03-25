@@ -648,9 +648,10 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     () => reconcilePendingUserMessages(pendingUserMessages, session?.messages || []),
     [pendingUserMessages, session?.messages],
   );
+  const sessionPendingUiActions = useMemo(() => toPendingUiActions(session), [session]);
   const pendingUiActions = useMemo(
-    () => (pendingUiRequest?.uiActions?.length ? pendingUiRequest.uiActions : toPendingUiActions(session)),
-    [pendingUiRequest, session],
+    () => (pendingUiRequest?.uiActions?.length ? pendingUiRequest.uiActions : sessionPendingUiActions),
+    [pendingUiRequest, sessionPendingUiActions],
   );
   const pendingUiKey = pendingUiActions.map((item) => item.action_id).join("|");
   const runtimeError = typeof browserRuntime.last_error === "string" ? browserRuntime.last_error : "";
@@ -658,7 +659,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const isRunningSession = normalizeStatus(session?.status) === "running";
   const sessionPhase = normalizeStatus(typeof browserRuntime.phase === "string" ? browserRuntime.phase : "");
   const snapshotAwaitingMessage = sessionPhase === "awaiting_agent_reply";
-  const snapshotUiInProgress = isUiFeedbackPhase(sessionPhase) || pendingUiActions.length > 0;
+  const snapshotUiInProgress = isUiFeedbackPhase(sessionPhase) || sessionPendingUiActions.length > 0;
   const rawRunningSession = isRunningSession && Boolean(session?.last_task_id);
   const linkedTaskLoaded = Boolean(task && session?.last_task_id && task.id === session.last_task_id);
   const confirmedRunningTask = rawRunningSession && linkedTaskLoaded && isActiveTaskStatus(task?.status);
@@ -702,6 +703,34 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   useEffect(() => {
     pendingUiRequestRef.current = pendingUiRequest;
   }, [pendingUiRequest]);
+
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+    if (snapshotAwaitingMessage || snapshotUiInProgress) {
+      return;
+    }
+    pendingUiRequestRef.current = null;
+    setPendingUiRequest(null);
+    resetPendingMessageTurnState();
+    resetPendingUiStepState();
+    setSending(false);
+    setStepping(false);
+    if (normalizeStatus(session.status) !== "waiting_approval") {
+      setApproving(false);
+    }
+    setAssistantPlaceholder((current) => {
+      if (
+        current?.content === "正在继续处理当前请求…"
+        || current?.content === "正在生成…"
+        || current?.content === "正在提交计划并启动任务…"
+      ) {
+        return null;
+      }
+      return current;
+    });
+  }, [session, snapshotAwaitingMessage, snapshotUiInProgress]);
 
   useEffect(() => {
     if (!session?.messages?.length) {

@@ -558,6 +558,83 @@ def test_resolve_working_context_uses_browser_semantic_primary_entity_for_curren
     assert working_context["primary_target"]["task_id"] == "task-1"
 
 
+def test_resolve_working_context_ignores_dashboard_platform_primary_entity() -> None:
+    session = SimpleNamespace(working_context_json={})
+
+    working_context = haor_agent_service._resolve_working_context_for_message(
+        session=session,
+        content="帮我修复这个",
+        page_context={"pathname": "/", "query": {}, "asset_id": None, "finding_id": None, "task_id": None},
+        browser_context={
+            "pathname": "/",
+            "query": {},
+            "semantic_page_context": {
+                "page_kind": "dashboard_overview",
+                "primary_entity": {"kind": "platform", "id": "dashboard", "label": "桌面态势总览"},
+            },
+        },
+    )
+
+    assert working_context == {}
+
+
+def test_resolve_asset_for_read_tool_accepts_ip_reference(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    asset = SimpleNamespace(id="asset-1", ip="192.168.130.138", hostname="host-1")
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(haor_agent_service, "get_asset", lambda db, asset_id: None)
+
+    def _fake_list_assets(db, page, page_size, ip=None, keyword=None, asset_status=None, tag_id=None):  # type: ignore[no-untyped-def]
+        observed["ip"] = ip
+        observed["keyword"] = keyword
+        if ip == "192.168.130.138":
+            return [asset], 1
+        return [], 0
+
+    monkeypatch.setattr(haor_agent_service, "list_assets", _fake_list_assets)
+
+    resolved = haor_agent_service._resolve_asset_for_read_tool(SimpleNamespace(), "192.168.130.138")
+
+    assert resolved is asset
+    assert observed["ip"] == "192.168.130.138"
+
+
+def test_execute_read_tool_list_asset_risks_accepts_host_cidr_reference(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    asset = SimpleNamespace(id="asset-1", ip="192.168.130.138", hostname="host-1")
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(haor_agent_service, "get_asset", lambda db, asset_id: None)
+
+    def _fake_list_assets(db, page, page_size, ip=None, keyword=None, asset_status=None, tag_id=None):  # type: ignore[no-untyped-def]
+        observed["ip"] = ip
+        observed["keyword"] = keyword
+        if ip == "192.168.130.138":
+            return [asset], 1
+        return [], 0
+
+    monkeypatch.setattr(haor_agent_service, "list_assets", _fake_list_assets)
+    monkeypatch.setattr(
+        haor_agent_service,
+        "list_findings_by_asset",
+        lambda db, asset_id: [SimpleNamespace(id="finding-1", status=SimpleNamespace(value="open"), severity=SimpleNamespace(value="high"), title="匿名 FTP", rule_id="ftp.anonymous.enabled", asset_id=asset_id, asset=None, rule=None, created_at=None, updated_at=None)],
+    )
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_serialize_finding_summary",
+        lambda item: {"finding_id": item.id, "asset_id": item.asset_id, "severity": item.severity.value},
+    )
+
+    result = haor_agent_service._execute_read_tool(
+        SimpleNamespace(),
+        tool_name="list_asset_risks",
+        arguments={"asset_id": "192.168.130.138/32", "limit": 10},
+    )
+
+    assert result["asset_id"] == "asset-1"
+    assert result["items"][0]["asset_id"] == "asset-1"
+    assert observed["ip"] == "192.168.130.138"
+
+
 def test_agent_message_request_accepts_legacy_route_context_alias() -> None:
     payload = AgentMessageCreateRequest.model_validate(
         {

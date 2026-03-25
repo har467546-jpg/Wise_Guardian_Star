@@ -1173,7 +1173,7 @@ def _build_working_context_from_semantic_entity(entity: dict[str, Any], *, sourc
         task_id = task_id or entity_id
         if str(meta.get("scope_type") or "").strip().lower() == "asset":
             asset_id = asset_id or (_sanitize_line(str(meta.get("scope_id") or ""), max_length=64) or None)
-    else:
+    elif kind in {"asset", "host", "server", "device"}:
         asset_id = asset_id or entity_id
 
     return _normalize_focus_target(
@@ -4701,6 +4701,41 @@ def _serialize_finding_detail(finding: RiskFinding) -> dict[str, Any]:
     return payload
 
 
+def _resolve_asset_for_read_tool(db: Session, asset_reference: str) -> Asset | None:
+    normalized_reference = _sanitize_line(str(asset_reference or ""), max_length=96)
+    if not normalized_reference:
+        return None
+
+    asset = get_asset(db, normalized_reference)
+    if asset is not None:
+        return asset
+
+    ip_reference: str | None = None
+    try:
+        normalized_cidr = normalize_cidr(normalized_reference)
+    except ValueError:
+        normalized_cidr = None
+    if normalized_cidr and normalized_cidr.endswith("/32"):
+        ip_reference = normalized_cidr.split("/", 1)[0]
+    elif re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", normalized_reference):
+        ip_reference = normalized_reference
+
+    if ip_reference:
+        items, total = list_assets(db=db, page=1, page_size=2, ip=ip_reference)
+        if total == 1 and items:
+            return items[0]
+
+    items, total = list_assets(db=db, page=1, page_size=2, keyword=normalized_reference)
+    if total != 1 or not items:
+        return None
+    candidate = items[0]
+    candidate_ip = str(getattr(candidate, "ip", "") or "").strip()
+    candidate_hostname = str(getattr(candidate, "hostname", "") or "").strip().lower()
+    if candidate_ip == normalized_reference or candidate_hostname == normalized_reference.lower():
+        return candidate
+    return None
+
+
 def _execute_read_tool(db: Session, *, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     limit = max(1, min(int(arguments.get("limit") or 6), 20))
     if tool_name == "list_assets":
@@ -4727,10 +4762,10 @@ def _execute_read_tool(db: Session, *, tool_name: str, arguments: dict[str, Any]
             "total": total,
         }
     if tool_name == "get_asset_detail":
-        asset_id = _sanitize_line(str(arguments.get("asset_id") or ""), max_length=64)
-        if not asset_id:
+        asset_reference = _sanitize_line(str(arguments.get("asset_id") or ""), max_length=96)
+        if not asset_reference:
             raise RuntimeError("get_asset_detail 缺少 asset_id")
-        asset = get_asset(db, asset_id)
+        asset = _resolve_asset_for_read_tool(db, asset_reference)
         if asset is None:
             raise RuntimeError("资产不存在")
         return _serialize_asset(asset)
@@ -4758,18 +4793,21 @@ def _execute_read_tool(db: Session, *, tool_name: str, arguments: dict[str, Any]
             raise RuntimeError("风险不存在")
         return _serialize_finding_detail(finding)
     if tool_name == "list_asset_risks":
-        asset_id = _sanitize_line(str(arguments.get("asset_id") or ""), max_length=64)
-        if not asset_id:
+        asset_reference = _sanitize_line(str(arguments.get("asset_id") or ""), max_length=96)
+        if not asset_reference:
             raise RuntimeError("list_asset_risks 缺少 asset_id")
+        asset = _resolve_asset_for_read_tool(db, asset_reference)
+        if asset is None:
+            raise RuntimeError("资产不存在")
         expected_status = str(arguments.get("status") or "").strip().lower() or None
-        findings = list_findings_by_asset(db, asset_id)
+        findings = list_findings_by_asset(db, asset.id)
         filtered: list[RiskFinding] = []
         for item in findings:
             if expected_status and str(item.status.value if hasattr(item.status, "value") else item.status).lower() != expected_status:
                 continue
             filtered.append(item)
         return {
-            "asset_id": asset_id,
+            "asset_id": asset.id,
             "items": [_serialize_finding_summary(item) for item in filtered[:limit]],
             "total": len(filtered),
         }
@@ -4829,13 +4867,22 @@ def _execute_read_tool(db: Session, *, tool_name: str, arguments: dict[str, Any]
         )
         return result.model_dump(mode="json")
     if tool_name == "get_remediation_asset":
-        asset_id = _sanitize_line(str(arguments.get("asset_id") or ""), max_length=64)
-        if not asset_id:
+        asset_reference = _sanitize_line(str(arguments.get("asset_id") or ""), max_length=96)
+        if not asset_reference:
             raise RuntimeError("get_remediation_asset 缺少 asset_id")
-        return build_remediation_asset_detail(db, asset_id).model_dump(mode="json")
+        asset = _resolve_asset_for_read_tool(db, asset_reference)
+        if asset is None:
+            raise RuntimeError("资产不存在")
+        return build_remediation_asset_detail(db, asset.id).model_dump(mode="json")
     if tool_name == "get_remediation_session":
         session_id = _sanitize_line(str(arguments.get("session_id") or ""), max_length=64)
-        asset_id = _sanitize_line(str(arguments.get("asset_id") or ""), max_length=64)
+        asset_reference = _sanitize_line(str(arguments.get("asset_id") or ""), max_length=96)
+        asset_id = None
+        if asset_reference:
+            asset = _resolve_asset_for_read_tool(db, asset_reference)
+            if asset is None:
+                raise RuntimeError("资产不存在")
+            asset_id = asset.id
         if not session_id and asset_id:
             session_id = db.scalar(
                 select(RemediationSession.id)

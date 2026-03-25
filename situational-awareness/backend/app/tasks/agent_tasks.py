@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import logging
+from copy import deepcopy
+from typing import Any
+
 from celery import Task
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from app.core.celery_app import celery_app
 from app.db.models.agent_session import AgentSession
@@ -26,6 +31,83 @@ from app.tasks.task_runtime import (
     set_task_success,
     tracked_task,
 )
+from app.utils.sanitize import sanitize_text
+
+
+logger = logging.getLogger(__name__)
+
+_NON_RETRYABLE_REMEDIATION_ERRORS = (
+    "审批人信息无效，请刷新页面后重试",
+    "当前整机修复计划不可执行",
+    "当前没有可执行阶段",
+    "仅允许审批当前最早可执行阶段",
+    "修复会话不存在",
+)
+
+
+def _deep_merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = deepcopy(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _load_task_result_json(task_run_id: str) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task_run = get_task_run(db, task_run_id)
+        if task_run is None or not isinstance(task_run.result_json, dict):
+            return {}
+        return deepcopy(task_run.result_json)
+
+
+def _build_orchestrate_progress_result(
+    task_run_id: str,
+    *,
+    runtime_patch: dict[str, Any],
+) -> dict[str, Any]:
+    current_result = _load_task_result_json(task_run_id)
+    execution = current_result.get("execution") if isinstance(current_result.get("execution"), dict) else {}
+    current_result["execution"] = _deep_merge_dict(execution, {"runtime": runtime_patch})
+    return current_result
+
+
+def _humanize_orchestrate_error(exc: Exception) -> str:
+    raw_message = str(exc).strip()
+    if not raw_message:
+        return "haor 编排执行失败，请稍后重试"
+    if isinstance(exc, (IntegrityError, ProgrammingError)):
+        lowered = raw_message.lower()
+        if "remediation_sessions_approved_by_fkey" in raw_message or (
+            "remediation_sessions" in lowered and "approved_by" in lowered
+        ):
+            return "审批人信息无效，请刷新页面后重试"
+        return "haor 编排执行失败，请稍后重试"
+    for message in _NON_RETRYABLE_REMEDIATION_ERRORS:
+        if message in raw_message:
+            return message
+    sanitized = sanitize_text(raw_message, max_length=200, single_line=True) or ""
+    return sanitized or "haor 编排执行失败，请稍后重试"
+
+
+def _should_retry_orchestrate_error(
+    exc: Exception,
+    *,
+    entered_action_execution: bool,
+    terminal_followup: dict[str, object] | None,
+) -> bool:
+    if entered_action_execution:
+        return False
+    if isinstance(terminal_followup, dict) and str(terminal_followup.get("message_type") or "") == "error":
+        return False
+    if isinstance(exc, (IntegrityError, ProgrammingError)):
+        return False
+    humanized = _humanize_orchestrate_error(exc)
+    if humanized in _NON_RETRYABLE_REMEDIATION_ERRORS:
+        return False
+    return True
 
 
 @celery_app.task(
@@ -40,6 +122,7 @@ def run_agent_orchestrate_task(
 ) -> str:
     actions: list[dict] = []
     terminal_followup: dict[str, object] | None = None
+    entered_action_execution = False
     try:
         with tracked_task(task_run_id, celery_task_id=self.request.id, retry_count=self.request.retries):
             ensure_task_not_canceled(task_run_id)
@@ -65,7 +148,14 @@ def run_agent_orchestrate_task(
                 task_run_id,
                 8,
                 "载入 haor 会话与已批准动作计划",
-                {"session_id": session_id},
+                _build_orchestrate_progress_result(
+                    task_run_id,
+                    runtime_patch={
+                        "stage": "prepare",
+                        "session_id": session_id,
+                        "action_count": len(actions),
+                    },
+                ),
                 stage_code="agent_prepare",
                 stage_name="载入计划",
             )
@@ -80,7 +170,16 @@ def run_agent_orchestrate_task(
                     task_run_id,
                     stage_progress,
                     f"执行动作 {index}/{total_actions}: {title}",
-                    {"action_index": index, "action_type": action.get("action_type"), "title": title},
+                    _build_orchestrate_progress_result(
+                        task_run_id,
+                        runtime_patch={
+                            "stage": "execute_action",
+                            "action_index": index,
+                            "total_actions": total_actions,
+                            "action_type": action.get("action_type"),
+                            "title": title,
+                        },
+                    ),
                     stage_code="agent_execute_action",
                     stage_name="执行动作",
                 )
@@ -88,6 +187,7 @@ def run_agent_orchestrate_task(
                     session = db.get(AgentSession, session_id)
                     if session is None:
                         raise RuntimeError("haor 会话不存在")
+                    entered_action_execution = True
                     result = execute_approved_action(
                         db,
                         action=action,
@@ -183,7 +283,13 @@ def run_agent_orchestrate_task(
                 task_run_id,
                 92,
                 "haor 编排计划执行完成，正在写入总结",
-                {"results": action_results},
+                _build_orchestrate_progress_result(
+                    task_run_id,
+                    runtime_patch={
+                        "stage": "finalize",
+                        "completed_actions": len(action_results),
+                    },
+                ),
                 stage_code="agent_finalize",
                 stage_name="结果收尾",
             )
@@ -246,12 +352,22 @@ def run_agent_orchestrate_task(
             db.commit()
         return task_run_id
     except Exception as exc:
+        logger.exception(
+            "haor orchestrate task failed",
+            extra={
+                "task_run_id": task_run_id,
+                "session_id": session_id,
+                "entered_action_execution": entered_action_execution,
+                "action_count": len(actions),
+            },
+        )
+        humanized_error = _humanize_orchestrate_error(exc)
         with SessionLocal() as db:
             session = db.get(AgentSession, session_id)
             if session is not None:
                 final_message_type = "error"
-                final_message_content = f"本轮 haor 编排失败：{exc}"
-                final_message_payload = {"task_id": task_run_id, "error": str(exc)}
+                final_message_content = f"本轮 haor 编排失败：{humanized_error}"
+                final_message_payload = {"task_id": task_run_id, "error": humanized_error}
                 final_watch_task_id = task_run_id
                 if isinstance(terminal_followup, dict):
                     followup_payload = terminal_followup.get("payload_json")
@@ -260,7 +376,7 @@ def run_agent_orchestrate_task(
                         final_message_payload = {
                             "task_id": task_run_id,
                             "orchestrate_task_id": task_run_id,
-                            "error": str(exc),
+                            "error": humanized_error,
                             **(followup_payload if isinstance(followup_payload, dict) else {}),
                         }
                         final_watch_task_id = str(final_message_payload.get("task_id") or task_run_id)
@@ -286,14 +402,15 @@ def run_agent_orchestrate_task(
                     message_type=final_message_type,
                 )
                 db.commit()
-        should_retry = not (
-            isinstance(terminal_followup, dict)
-            and str(terminal_followup.get("message_type") or "") == "error"
+        should_retry = _should_retry_orchestrate_error(
+            exc,
+            entered_action_execution=entered_action_execution,
+            terminal_followup=terminal_followup,
         )
         if should_retry and self.request.retries < self.max_retries:
-            set_task_retry(task_run_id, self.request.retries + 1, str(exc))
+            set_task_retry(task_run_id, self.request.retries + 1, humanized_error)
             raise self.retry(exc=exc, countdown=3)
-        set_task_failure(task_run_id, self.request.retries, str(exc))
+        set_task_failure(task_run_id, self.request.retries, humanized_error)
         raise
     return task_run_id
 

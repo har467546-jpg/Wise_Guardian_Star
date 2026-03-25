@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.asset import Asset
 from app.db.models.enums import TaskExecutionStatus, TaskType
+from app.db.models.user import User
 from app.repositories.discovery_repo import create_job, get_active_job_by_cidr
 from app.repositories.task_repo import create_task_run, get_latest_task_run_for_scope, get_task_run, update_task_run
 from app.services.remediation_session_service import approve_remediation_session, create_or_resume_remediation_session
@@ -46,6 +47,15 @@ def _coerce_bool(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return False
+
+
+def _resolve_approved_by_user_id(context: AgentActionExecutorContext) -> str:
+    approved_by = sanitize_text(str(context.session_user_id or ""), max_length=64, single_line=True) or ""
+    if not approved_by:
+        raise RuntimeError("审批人信息无效，请刷新页面后重试")
+    if context.db.get(User, approved_by) is None:
+        raise RuntimeError("审批人信息无效，请刷新页面后重试")
+    return approved_by
 
 
 def _queue_discovery_job(context: AgentActionExecutorContext, *, action: dict[str, Any]) -> AgentExecutionResult:
@@ -168,7 +178,8 @@ def _create_or_resume_remediation(context: AgentActionExecutorContext, *, action
         "submitted_task_id": None,
     }
     if submit_if_ready and session.plan.execution_ready:
-        response = approve_remediation_session(db, session_id=session.session_id, approved_by="haor")
+        approved_by = _resolve_approved_by_user_id(context)
+        response = approve_remediation_session(db, session_id=session.session_id, approved_by=approved_by)
         payload["submitted_task_id"] = response.task_id
         return AgentExecutionResult(
             status="queued",
@@ -202,7 +213,8 @@ def _approve_remediation(context: AgentActionExecutorContext, *, action: dict[st
     session_id = sanitize_text(str(params.get("session_id") or ""), max_length=64, single_line=True) or ""
     if not session_id:
         raise RuntimeError("修复批准计划缺少 session_id")
-    response = approve_remediation_session(db, session_id=session_id, approved_by="haor")
+    approved_by = _resolve_approved_by_user_id(context)
+    response = approve_remediation_session(db, session_id=session_id, approved_by=approved_by)
     return AgentExecutionResult(
         status="queued",
         summary=f"已批准修复会话 {session_id}",
