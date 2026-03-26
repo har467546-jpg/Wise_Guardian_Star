@@ -93,7 +93,7 @@ services:
       [
         "sh",
         "-lc",
-        "DEPS_HASH=$$(sha256sum package.json package-lock.json | sha256sum | awk '{print $$1}'); if [ ! -f node_modules/.deps-hash ] || [ \"$$(cat node_modules/.deps-hash 2>/dev/null)\" != \"$$DEPS_HASH\" ]; then npm ci --no-audit --fund=false && printf '%s' \"$$DEPS_HASH\" > node_modules/.deps-hash; fi; rm -rf /app/.next/* 2>/dev/null || true; npm run dev",
+        "DEPS_HASH=$$(sha256sum package.json package-lock.json | sha256sum | awk '{print $$1}'); if [ ! -f node_modules/.deps-hash ] || [ \"$$(cat node_modules/.deps-hash 2>/dev/null)\" != \"$$DEPS_HASH\" ]; then npm ci --no-audit --fund=false && printf '%s' \"$$DEPS_HASH\" > node_modules/.deps-hash; fi; rm -rf /app/.next-dev/* /app/.next-dev/.[!.]* /app/.next-dev/..?* 2>/dev/null || true; npm run dev",
       ]
     env_file:
       - ../frontend/.env.example
@@ -109,6 +109,7 @@ services:
       - ../frontend:/app
       - /app/node_modules
       - /app/.next
+      - /app/.next-dev
 
   frontend-prod:
     profiles: ["prod"]

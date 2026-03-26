@@ -29,8 +29,16 @@ const allowedDevOrigins = Array.from(
   ),
 );
 
+const isProductionBuild = process.env.NODE_ENV === "production";
+const distDir = isProductionBuild ? ".next" : ".next-dev";
+const tsconfigPath = isProductionBuild ? "./tsconfig.build.json" : "./tsconfig.json";
+
 const nextConfig = {
   reactStrictMode: true,
+  distDir,
+  typescript: {
+    tsconfigPath,
+  },
   ...(allowedDevOrigins.length ? { allowedDevOrigins } : {}),
   async rewrites() {
     return [

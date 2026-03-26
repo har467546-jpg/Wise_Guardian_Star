@@ -39,6 +39,7 @@ from app.services.haor_agent_service import (
     list_agent_goals,
     post_agent_message,
     post_agent_step,
+    recover_agent_session,
     reset_agent_session,
     resume_agent_goal,
     stream_agent_approve_turn,
@@ -132,6 +133,17 @@ def reset_haor_session(
         return reset_agent_session(db, user=user)
     except Exception as exc:
         _raise_agent_http_exception(exc, stage="reset_session", user=user)
+
+
+@router.post("/haor/session/recover", response_model=AgentSessionRead)
+def recover_haor_session(
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> AgentSessionRead:
+    try:
+        return recover_agent_session(db, user=user)
+    except Exception as exc:
+        _raise_agent_http_exception(exc, stage="recover_session", user=user)
 
 
 @router.post("/haor/session/messages", response_model=AgentSessionRead)
@@ -478,7 +490,7 @@ def _load_ws_session_snapshot(user_id: str) -> dict:
         user = db.get(User, user_id)
         if user is None or not user.is_active:
             return {}
-        return get_or_create_agent_session(db, user=user).model_dump(mode="json")
+        return recover_agent_session(db, user=user).model_dump(mode="json")
 
 
 def _session_snapshot_has_task_followup(session_snapshot: dict | None, *, task_id: str) -> bool:

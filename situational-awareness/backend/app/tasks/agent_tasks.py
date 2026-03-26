@@ -252,9 +252,13 @@ def run_agent_orchestrate_task(
                         "content": followup_content,
                         "payload_json": {
                             "task_id": child_summary.get("task_id") or result.child_task_id,
+                            "terminal_status": child_summary.get("status"),
                             "action": followup_action,
                             "child_task": child_summary,
-                            "resume_hint": followup_resume_hint,
+                            "resume_hint": {
+                                **followup_resume_hint,
+                                "goal_id": getattr(session, "current_goal_id", None),
+                            },
                         },
                     }
                     with SessionLocal() as db:
@@ -441,7 +445,24 @@ def run_agent_auto_followup_task(
         session = db.get(AgentSession, session_id)
         if session is None:
             return child_task_id
-        if has_agent_task_followup_message(session, task_id=child_task_id):
+        normalized_action_type = str(normalized_action.get("action_type") or "").strip() or None
+        child_terminal_status = str(child_summary.get("status") or "").strip() or None
+        if has_agent_task_followup_message(
+            session,
+            task_id=child_task_id,
+            action_type=normalized_action_type,
+            terminal_status=child_terminal_status,
+        ):
+            logger.info(
+                "haor auto followup deduped",
+                extra={
+                    "agent_session_id": session_id,
+                    "agent_result": "followup_deduped",
+                    "child_task_id": child_task_id,
+                    "action_type": normalized_action_type,
+                    "terminal_status": child_terminal_status,
+                },
+            )
             return child_task_id
         message_type, content, resume_hint = build_auto_action_task_followup_content(normalized_action, child_summary)
         append_agent_task_message(
@@ -450,10 +471,14 @@ def run_agent_auto_followup_task(
             content=content,
             payload_json={
                 "task_id": child_task_id,
+                "terminal_status": child_terminal_status,
                 "auto_followup": True,
                 "action": normalized_action,
                 "child_task": child_summary,
-                "resume_hint": resume_hint,
+                "resume_hint": {
+                    **resume_hint,
+                    "goal_id": getattr(session, "current_goal_id", None),
+                },
             },
             message_type=message_type,
         )

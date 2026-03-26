@@ -30,6 +30,99 @@ class AgentPlaybookDecision:
     stop_reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AgentSkillDefinition:
+    skill_id: str
+    title: str
+    entry_intents: list[str] = field(default_factory=list)
+    required_context: list[str] = field(default_factory=list)
+    read_chain: list[str] = field(default_factory=list)
+    write_chain: list[str] = field(default_factory=list)
+    success_criteria: list[str] = field(default_factory=list)
+    blockers: list[str] = field(default_factory=list)
+    resume_strategy: str | None = None
+    default_next_step: str | None = None
+
+
+SKILL_REGISTRY: dict[str, AgentSkillDefinition] = {
+    PLAYBOOK_SCAN_AND_ANALYZE_CIDR: AgentSkillDefinition(
+        skill_id=PLAYBOOK_SCAN_AND_ANALYZE_CIDR,
+        title="扫描并分析网段",
+        entry_intents=["扫描", "分析网段", "查看网段漏洞"],
+        required_context=["cidr"],
+        write_chain=["create_discovery_job"],
+        success_criteria=["扫描任务完成", "返回网段资产与风险结论"],
+        resume_strategy="resume_hint_or_goal",
+        default_next_step="分析扫描结果",
+    ),
+    PLAYBOOK_ANALYZE_ASSET_RISKS: AgentSkillDefinition(
+        skill_id=PLAYBOOK_ANALYZE_ASSET_RISKS,
+        title="分析资产风险",
+        entry_intents=["分析资产", "查看风险", "资产详情"],
+        required_context=["asset_id"],
+        read_chain=["get_asset_detail", "list_asset_risks"],
+        success_criteria=["读取资产详情", "给出风险分析结论"],
+        resume_strategy="goal_context",
+        default_next_step="继续查看风险明细或后续动作",
+    ),
+    PLAYBOOK_VERIFY_ASSET_RISKS: AgentSkillDefinition(
+        skill_id=PLAYBOOK_VERIFY_ASSET_RISKS,
+        title="验证资产风险",
+        entry_intents=["验证风险", "复核风险"],
+        required_context=["asset_id"],
+        write_chain=["verify_asset_risks"],
+        success_criteria=["验证任务完成", "验证结果回传到会话"],
+        resume_strategy="watch_task",
+        default_next_step="分析验证结果",
+    ),
+    PLAYBOOK_INSTALL_RUNNER: AgentSkillDefinition(
+        skill_id=PLAYBOOK_INSTALL_RUNNER,
+        title="安装 Host Runner",
+        entry_intents=["安装 runner", "重装 runner"],
+        required_context=["asset_id"],
+        write_chain=["install_runner"],
+        success_criteria=["安装任务完成", "Runner 状态回传到会话"],
+        blockers=["缺少平台地址", "缺少管理员凭据", "资产不存在"],
+        resume_strategy="watch_task",
+        default_next_step="查看 Runner 状态",
+    ),
+    PLAYBOOK_START_REMEDIATION_SESSION: AgentSkillDefinition(
+        skill_id=PLAYBOOK_START_REMEDIATION_SESSION,
+        title="准备自动修复",
+        entry_intents=["修复", "整改", "修补"],
+        required_context=["asset_id"],
+        read_chain=["get_remediation_asset", "get_remediation_session"],
+        write_chain=["create_or_resume_remediation_session"],
+        success_criteria=["修复会话就绪", "满足条件时已提交自动修复"],
+        blockers=["缺少 Host Runner", "缺少管理员授权", "当前没有可执行阶段"],
+        resume_strategy="resume_hint_or_goal",
+        default_next_step="复盘修复结果或补齐阻塞条件",
+    ),
+    "resume_task_detail": AgentSkillDefinition(
+        skill_id="resume_task_detail",
+        title="继续查看任务详情",
+        entry_intents=["继续", "查看任务", "任务详情"],
+        required_context=["task_id"],
+        read_chain=["get_task_detail", "get_task_events"],
+        success_criteria=["定位最近任务", "展示任务详情与事件"],
+        resume_strategy="resume_hint",
+        default_next_step="查看任务详情",
+    ),
+}
+
+
+def get_skill_definition(skill_id: str | None) -> AgentSkillDefinition | None:
+    normalized = sanitize_text(skill_id, max_length=128, single_line=True) or ""
+    if not normalized:
+        return None
+    return SKILL_REGISTRY.get(normalized)
+
+
+def get_skill_title(skill_id: str | None) -> str | None:
+    definition = get_skill_definition(skill_id)
+    return definition.title if definition is not None else None
+
+
 def _normalize_text(value: str | None, *, max_length: int = 400) -> str:
     return sanitize_text(value, max_length=max_length) or ""
 

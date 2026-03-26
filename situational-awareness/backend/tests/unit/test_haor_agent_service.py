@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import httpx
 from types import SimpleNamespace
 
+from app.db.models.agent_goal import AgentGoal
 from app.db.models.enums import TaskExecutionStatus, TaskType
 from app.schemas.agent import AgentMessageCreateRequest
 from app.services import haor_agent_service
@@ -17,6 +18,25 @@ class _FakeUnitDB:
             value.created_at = datetime.now(UTC)
 
     def flush(self) -> None:
+        return None
+
+
+class _FakeRecoverDB:
+    def __init__(self) -> None:
+        self.committed = False
+        self.refreshed: list[object] = []
+        self.added: list[object] = []
+
+    def add(self, value) -> None:
+        self.added.append(value)
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def refresh(self, value) -> None:
+        self.refreshed.append(value)
+
+    def get(self, _model, _value):
         return None
 
 
@@ -412,6 +432,87 @@ def test_build_runtime_provider_prefers_runtime_env_values_over_cached_settings(
     assert result.provider.timeout_seconds == 42
     assert result.provider.api_key == "sk-runtime-new"
     assert result.provider.wire_api == "auto"
+
+
+def test_build_runtime_snapshot_keeps_input_enabled_while_watching_task() -> None:
+    goal = AgentGoal(
+        id="goal-1",
+        user_id="user-1",
+        agent_id="haor",
+        status="active",
+        title="验证资产风险",
+        goal_kind="verify_asset_risks",
+    )
+    session = SimpleNamespace(
+        status="running",
+        browser_runtime_json={"phase": "running", "objective_kind": "inspect"},
+        agent_state_json={"watch": {"watching": True, "primary_task_id": "task-1"}},
+        pending_plan_json={},
+        last_task_id="task-1",
+        current_goal=goal,
+    )
+
+    snapshot = haor_agent_service._build_runtime_snapshot(session)
+
+    assert snapshot.phase == "watching_task"
+    assert snapshot.input_state == "enabled"
+    assert snapshot.input_block_reason == "none"
+    assert snapshot.watch_task_id == "task-1"
+    assert snapshot.can_interrupt is True
+    assert snapshot.active_skill_title == "验证资产风险"
+
+
+def test_serialize_agent_session_summary_uses_runtime_watch_task_id_for_attention() -> None:
+    session = SimpleNamespace(
+        status="running",
+        browser_runtime_json={"phase": "running"},
+        agent_state_json={"watch": {"watching": True, "primary_task_id": "task-2"}},
+        pending_plan_json={},
+        last_task_id=None,
+        current_goal=None,
+        updated_at=datetime.now(UTC),
+    )
+
+    summary = haor_agent_service.serialize_agent_session_summary(session)
+
+    assert summary.attention_kind == "running_task"
+    assert summary.runtime_phase == "watching_task"
+    assert summary.input_state == "enabled"
+    assert summary.last_task_id == "task-2"
+
+
+def test_recover_agent_session_repairs_stale_wait_and_unlocks_input(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    now = datetime.now(UTC)
+    session = SimpleNamespace(
+        id="session-1",
+        agent_id="haor",
+        status="active",
+        route_context_json={},
+        working_context_json={"asset_id": "asset-1"},
+        dialog_state_json={},
+        pending_plan_json={},
+        browser_runtime_json={"phase": "awaiting_agent_reply", "last_user_intent": "继续"},
+        agent_state_json={},
+        current_goal=None,
+        current_goal_id=None,
+        last_task_id=None,
+        messages=[],
+        created_at=now,
+        updated_at=now,
+    )
+    db = _FakeRecoverDB()
+
+    monkeypatch.setattr(haor_agent_service, "_load_recent_session", lambda _db, user_id: session)
+
+    result = haor_agent_service.recover_agent_session(db, user=SimpleNamespace(id="user-1"))
+
+    assert db.committed is True
+    assert db.refreshed == [session]
+    assert session.browser_runtime_json["phase"] == "idle"
+    assert session.browser_runtime_json["current_message_request_id"] is None
+    assert result.status == "active"
+    assert result.runtime_snapshot.phase == "idle"
+    assert result.runtime_snapshot.input_state == "enabled"
 
 
 def test_normalize_assistant_reply_content_deduplicates_repeated_sentences_and_blocks() -> None:

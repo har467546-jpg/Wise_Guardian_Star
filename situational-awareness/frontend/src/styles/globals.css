@@ -4478,7 +4478,82 @@ a {
 }
 
 .haor-chat-feed {
-  background: transparent;
+  background: #ffffff;
+}
+
+.haor-chat-task-banner {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border: 1px solid rgba(173, 199, 227, 0.22);
+  border-radius: 22px;
+  background: #ffffff;
+  box-shadow: 0 16px 34px rgba(49, 84, 121, 0.08);
+}
+
+.haor-chat-task-banner-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.haor-chat-task-banner-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.haor-chat-task-banner-copy strong {
+  color: var(--text-primary);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.haor-chat-task-banner-copy span {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.haor-chat-task-banner-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.haor-chat-task-banner-details {
+  border-top: 1px solid rgba(173, 199, 227, 0.18);
+  padding-top: 12px;
+}
+
+.haor-chat-task-banner-details summary {
+  cursor: pointer;
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.haor-chat-task-banner-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.haor-chat-task-banner-body {
+  margin: 12px 0 0;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(246, 250, 255, 0.9);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-ui);
 }
 
 .haor-chat-avatar-assistant {
@@ -4521,6 +4596,17 @@ a {
 
 .haor-chat-bubble-error {
   background: rgba(255, 241, 241, 0.98);
+}
+
+@media (max-width: 768px) {
+  .haor-chat-task-banner-main {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .haor-chat-task-banner-actions {
+    justify-content: flex-start;
+  }
 }
 
 .haor-chat-bubble-body {

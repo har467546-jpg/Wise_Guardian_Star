@@ -10,7 +10,7 @@ from app.db.models.agent_goal import AgentGoal
 from app.db.models.agent_session import AgentSession
 from app.db.models.user import User
 from app.schemas.agent import AgentGoalRead
-from app.services.agent_playbook_service import infer_goal_profile
+from app.services.agent_playbook_service import get_skill_title, infer_goal_profile
 from app.utils.sanitize import sanitize_json_value, sanitize_text
 
 GOAL_ACTIVE_STATUSES = {"active", "blocked"}
@@ -324,6 +324,28 @@ def sync_goal_from_session(
         or goal.title,
         max_length=280,
     ) or goal.title
+    active_skill_id = (
+        sanitize_text(goal.goal_kind, max_length=128, single_line=True)
+        if sanitize_text(goal.goal_kind, max_length=128, single_line=True) not in {None, "", "general"}
+        else None
+    )
+    watch_task_id = sanitize_text(
+        str(watch.get("primary_task_id") or session.last_task_id or goal.last_task_id or ""),
+        max_length=64,
+        single_line=True,
+    ) or None
+    blockers: list[dict[str, Any]] = []
+    if derived_blocked_reason:
+        blockers.append(
+            {
+                "blocker_code": "goal_blocked",
+                "blocker_message": derived_blocked_reason,
+                "recommended_next_step": sanitize_text(
+                    str(explanation.get("next_step") or execution.get("waiting_for") or ""),
+                    max_length=240,
+                ) or None,
+            }
+        )
 
     goal.status = derived_status
     goal.blocked_reason = derived_blocked_reason
@@ -348,12 +370,15 @@ def sync_goal_from_session(
     goal.progress_json = {
         "summary": summary,
         "stage": sanitize_text(str(execution.get("stage") or ""), max_length=64, single_line=True) or "active",
-        "step_kind": sanitize_text(str(execution.get("step_kind") or ""), max_length=64, single_line=True) or None,
-        "step_label": sanitize_text(str(execution.get("step_label") or ""), max_length=180) or None,
+        "blockers": blockers,
+        "last_result": sanitize_text(
+            str(watch.get("last_task_message") or explanation.get("decision_summary") or latest_summary or ""),
+            max_length=280,
+        ) or None,
         "next_step": sanitize_text(str(explanation.get("next_step") or execution.get("waiting_for") or ""), max_length=280) or None,
-        "waiting_for": sanitize_text(str(execution.get("waiting_for") or ""), max_length=280) or None,
-        "watch": sanitize_json_value(watch),
-        "focus": sanitize_json_value(focus),
+        "active_skill_id": active_skill_id,
+        "active_skill_title": get_skill_title(active_skill_id),
+        "watch_task_id": watch_task_id,
         "updated_at": _now().isoformat(),
     }
     goal.updated_at = _now()

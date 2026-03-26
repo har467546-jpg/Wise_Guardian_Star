@@ -775,6 +775,13 @@ export function resetHaorSession() {
   }, { preferBackendDetail: true });
 }
 
+export function recoverHaorSession() {
+  return apiFetch<AgentSession>("/agent/haor/session/recover", {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, { preferBackendDetail: true });
+}
+
 export function postHaorMessage(payload: AgentMessageCreateRequest) {
   return apiFetch<AgentSession>("/agent/haor/session/messages", {
     method: "POST",

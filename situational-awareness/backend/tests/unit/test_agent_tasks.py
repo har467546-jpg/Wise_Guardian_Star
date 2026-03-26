@@ -63,7 +63,7 @@ def _tracked_task_context(*_args, **_kwargs):
 
 
 def test_run_agent_auto_followup_task_appends_completion_message(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    session = SimpleNamespace(id="session-1", messages=[])
+    session = SimpleNamespace(id="session-1", current_goal_id="goal-1", messages=[])
     db = _FakeDB(session)
     captured: dict[str, object] = {}
 
@@ -106,13 +106,23 @@ def test_run_agent_auto_followup_task_appends_completion_message(monkeypatch) ->
     assert payload_json["auto_followup"] is True
     assert payload_json["task_id"] == "task-child-1"
     assert payload_json["resume_hint"]["kind"] == "post_scan_analysis"
+    assert payload_json["resume_hint"]["goal_id"] == "goal-1"
     assert payload_json["resume_hint"]["preferred_read_tools"][0]["tool_name"] == "list_assets"
 
 
 def test_run_agent_auto_followup_task_skips_duplicate_followup_messages(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     session = SimpleNamespace(
         id="session-1",
-        messages=[SimpleNamespace(payload_json={"task_id": "task-child-1", "auto_followup": True})],
+        messages=[
+            SimpleNamespace(
+                payload_json={
+                    "task_id": "task-child-1",
+                    "terminal_status": "success",
+                    "auto_followup": True,
+                    "action": {"action_type": "create_discovery_job"},
+                }
+            )
+        ],
     )
     db = _FakeDB(session)
 

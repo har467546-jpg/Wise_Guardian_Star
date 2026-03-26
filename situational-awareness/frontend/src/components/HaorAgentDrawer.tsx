@@ -11,13 +11,13 @@ import {
   approveHaorSession,
   buildHaorSessionStreamUrl,
   getHaorGoal,
-  getHaorSession,
   getHaorSessionSummary,
   getTask,
   getTaskEvents,
   interruptHaorSession,
   postHaorMessage,
   postHaorStep,
+  recoverHaorSession,
   resetHaorSession,
 } from "@/services/api";
 import type {
@@ -30,6 +30,7 @@ import type {
   AgentPageContext,
   AgentPlanPendingEvent,
   AgentProposedAction,
+  AgentRuntimeSnapshot,
   AgentSession,
   AgentSessionSummary,
   AgentState,
@@ -97,6 +98,25 @@ type PendingUiStepState = {
   timerId: number | null;
 };
 
+type GoalProgressBlocker =
+  | string
+  | {
+      blocker_code?: string;
+      blocker_message?: string;
+      recommended_next_step?: string;
+    };
+
+type GoalProgressSummary = {
+  summary?: string;
+  stage?: string;
+  blockers?: GoalProgressBlocker[];
+  last_result?: string;
+  next_step?: string;
+  active_skill_id?: string;
+  active_skill_title?: string;
+  watch_task_id?: string;
+};
+
 const MESSAGE_TURN_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_FAIL_OPEN_TEXT = "上次页面动作未收到继续结果，已结束等待。你可以继续提问、重试，或新开会话。";
@@ -105,10 +125,28 @@ const EMPTY_HAOR_SUMMARY: AgentSessionSummary = {
   has_attention: false,
   attention_kind: "none",
   session_status: null,
+  runtime_phase: "idle",
+  input_state: "enabled",
+  input_block_reason: "none",
   current_goal_id: null,
   current_goal_title: null,
+  active_skill_title: null,
   last_task_id: null,
   updated_at: null,
+};
+
+const EMPTY_RUNTIME_SNAPSHOT: AgentRuntimeSnapshot = {
+  phase: "idle",
+  input_state: "enabled",
+  input_block_reason: "none",
+  current_turn_id: null,
+  watch_task_id: null,
+  active_skill_id: null,
+  active_skill_title: null,
+  blocker_summary: null,
+  recoverable_error: null,
+  can_interrupt: false,
+  can_resume: false,
 };
 
 type ChatBubbleProps = {
@@ -248,17 +286,35 @@ function deriveSessionSummary(session: AgentSession | null): AgentSessionSummary
     attentionKind = "waiting_approval";
   } else if (toPendingUiActions(session).length > 0) {
     attentionKind = "pending_ui_action";
-  } else if (sessionStatus === "running" && session.last_task_id) {
+  } else if (sessionStatus === "running" && (session.runtime_snapshot?.watch_task_id || session.last_task_id)) {
     attentionKind = "running_task";
   }
   return {
     has_attention: attentionKind !== "none",
     attention_kind: attentionKind,
     session_status: session.status,
+    runtime_phase: session.runtime_snapshot?.phase || "idle",
+    input_state: session.runtime_snapshot?.input_state || "enabled",
+    input_block_reason: session.runtime_snapshot?.input_block_reason || "none",
     current_goal_id: session.current_goal_id,
     current_goal_title: session.current_goal_title,
+    active_skill_title: session.runtime_snapshot?.active_skill_title || null,
     last_task_id: session.last_task_id,
     updated_at: session.updated_at,
+  };
+}
+
+function toRuntimeSnapshot(session: AgentSession | null): AgentRuntimeSnapshot {
+  if (!session?.runtime_snapshot || typeof session.runtime_snapshot !== "object") {
+    return EMPTY_RUNTIME_SNAPSHOT;
+  }
+  return {
+    ...EMPTY_RUNTIME_SNAPSHOT,
+    ...session.runtime_snapshot,
+    recoverable_error:
+      session.runtime_snapshot.recoverable_error && typeof session.runtime_snapshot.recoverable_error === "object"
+        ? session.runtime_snapshot.recoverable_error
+        : null,
   };
 }
 
@@ -366,6 +422,23 @@ function isTerminalTaskStatus(status: string | null | undefined) {
 function isActiveTaskStatus(status: string | null | undefined) {
   const normalized = normalizeStatus(status);
   return normalized === "pending" || normalized === "running" || normalized === "retry";
+}
+
+function toGoalProgress(goal: AgentGoal | null): GoalProgressSummary {
+  if (!goal?.progress_json || typeof goal.progress_json !== "object") {
+    return {};
+  }
+  return goal.progress_json as GoalProgressSummary;
+}
+
+function goalBlockerText(blocker: GoalProgressBlocker | undefined): string {
+  if (!blocker) {
+    return "";
+  }
+  if (typeof blocker === "string") {
+    return blocker;
+  }
+  return typeof blocker.blocker_message === "string" ? blocker.blocker_message : "";
 }
 
 function messageBadgeText(message: AgentMessage): string | null {
@@ -639,6 +712,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const [sessionInitialized, setSessionInitialized] = useState(false);
 
   const pageContext = useMemo(() => buildPageContext(pathname, searchParams), [pathname, searchParams]);
+  const runtimeSnapshot = useMemo(() => toRuntimeSnapshot(session), [session]);
   const browserRuntime = useMemo(() => toBrowserRuntime(session), [session]);
   const agentState = useMemo(() => toAgentState(session), [session]);
   const sessionSummary = useMemo(() => deriveSessionSummary(session), [session]);
@@ -654,27 +728,53 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     [pendingUiRequest, sessionPendingUiActions],
   );
   const pendingUiKey = pendingUiActions.map((item) => item.action_id).join("|");
-  const runtimeError = typeof browserRuntime.last_error === "string" ? browserRuntime.last_error : "";
   const mockMode = isMockSession(session);
   const isRunningSession = normalizeStatus(session?.status) === "running";
-  const sessionPhase = normalizeStatus(typeof browserRuntime.phase === "string" ? browserRuntime.phase : "");
+  const sessionPhase = normalizeStatus(runtimeSnapshot.phase);
   const snapshotAwaitingMessage = sessionPhase === "awaiting_agent_reply";
-  const snapshotUiInProgress = isUiFeedbackPhase(sessionPhase) || sessionPendingUiActions.length > 0;
-  const rawRunningSession = isRunningSession && Boolean(session?.last_task_id);
-  const linkedTaskLoaded = Boolean(task && session?.last_task_id && task.id === session.last_task_id);
+  const snapshotUiInProgress = sessionPhase === "awaiting_ui_feedback" || sessionPhase === "resolving_ui_feedback" || sessionPendingUiActions.length > 0;
+  const runtimeInputLocked = normalizeStatus(runtimeSnapshot.input_state) === "locked";
+  const currentWatchTaskId = runtimeSnapshot.watch_task_id || session?.last_task_id || null;
+  const rawRunningSession = isRunningSession && Boolean(currentWatchTaskId);
+  const linkedTaskLoaded = Boolean(task && currentWatchTaskId && task.id === currentWatchTaskId);
   const confirmedRunningTask = rawRunningSession && linkedTaskLoaded && isActiveTaskStatus(task?.status);
   const runningStateResolving = rawRunningSession && !confirmedRunningTask;
-  const showInterrupt = rawRunningSession;
+  const showInterrupt = runtimeSnapshot.can_interrupt;
   const hasAttention = open ? (session ? sessionSummary.has_attention : summary.has_attention) : summary.has_attention;
-  const composerLocked = snapshotAwaitingMessage || snapshotUiInProgress || sending || stepping || approving || interrupting || resetting;
-  const sendDisabled = composerLocked || confirmedRunningTask;
+  const composerLocked = runtimeInputLocked || sending || stepping || approving || interrupting || resetting;
+  const sendDisabled = composerLocked;
   const resetDisabled = resetting || interrupting;
   const approvalActionLabel = remediationAutoSubmitPlan ? "确认并自动修复" : "确认执行";
   const approvalBlockedText = remediationAutoSubmitPlan ? "当前账号不是管理员，不能确认自动修复。" : "当前账号不是管理员，不能确认执行。";
   const currentGoalTitle = currentGoal?.title || session?.current_goal_title || summary.current_goal_title || "当前未绑定目标";
-  const sidebarStatusText = session?.current_goal_id
-    ? goalStatusLabel(currentGoal?.status || "active")
-    : statusLabel(session?.status);
+  const agentStatePanel = useMemo(() => buildAgentStatePanel(agentState, task), [agentState, task]);
+  const currentGoalProgress = useMemo(() => toGoalProgress(currentGoal), [currentGoal]);
+  const currentGoalBlockers = useMemo(
+    () => (Array.isArray(currentGoalProgress.blockers) ? currentGoalProgress.blockers : []),
+    [currentGoalProgress],
+  );
+  const sidebarStageText = firstNonEmptyString([
+    typeof currentGoalProgress.stage === "string" ? currentGoalProgress.stage : "",
+    agentStatePanel.stage,
+    runtimeSnapshot.active_skill_title || "",
+    "空闲",
+  ]);
+  const sidebarBlockerText = firstNonEmptyString([
+    runtimeSnapshot.blocker_summary,
+    goalBlockerText(currentGoalBlockers[0]),
+    runtimeSnapshot.recoverable_error?.message || "",
+    "当前无阻塞",
+  ]);
+  const sidebarNextStepText = firstNonEmptyString([
+    typeof currentGoalProgress.next_step === "string" ? currentGoalProgress.next_step : "",
+    agentStatePanel.next,
+    "等待新的输入",
+  ]);
+  const sidebarRecentTaskText = firstNonEmptyString([
+    currentWatchTaskId ? `任务 ${currentWatchTaskId}` : "",
+    task?.id ? `任务 ${task.id}` : "",
+    "当前无任务跟踪",
+  ]);
   const sidebarUpdatedText = currentGoal?.updated_at
     ? formatDateTime(currentGoal.updated_at)
     : session?.updated_at
@@ -708,7 +808,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     if (!session) {
       return;
     }
-    if (snapshotAwaitingMessage || snapshotUiInProgress) {
+    if (runtimeInputLocked) {
       return;
     }
     pendingUiRequestRef.current = null;
@@ -730,7 +830,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       }
       return current;
     });
-  }, [session, snapshotAwaitingMessage, snapshotUiInProgress]);
+  }, [session, runtimeInputLocked]);
 
   useEffect(() => {
     if (!session?.messages?.length) {
@@ -753,14 +853,21 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
 
   const pendingPlanDetails = useMemo(() => buildPendingPlanDetails(proposedActions), [proposedActions]);
   const liveTaskDigest = useMemo(() => (task ? buildTaskDigest(task, taskEvents) : ""), [task, taskEvents]);
-  const agentStatePanel = useMemo(() => buildAgentStatePanel(agentState, task), [agentState, task]);
 
   const headerStatus = useMemo(() => {
-    const waitingApproval = normalizeStatus(session?.status) === "waiting_approval";
-    if (errorText || runtimeError || streamError) {
+    const waitingApproval = sessionPhase === "waiting_approval" || normalizeStatus(session?.status) === "waiting_approval";
+    if (errorText || streamError) {
       return {
-        text: errorText || runtimeError || streamError,
+        text: errorText || streamError,
         tone: "error" as const,
+      };
+    }
+    if (runtimeSnapshot.recoverable_error?.message) {
+      return {
+        text: runtimeSnapshot.recoverable_error.retryable
+          ? `${runtimeSnapshot.recoverable_error.message}。你可以直接恢复会话，或继续输入新的问题。`
+          : runtimeSnapshot.recoverable_error.message,
+        tone: runtimeSnapshot.recoverable_error.retryable ? "warning" as const : "error" as const,
       };
     }
     if (connectionState === "connecting") {
@@ -783,13 +890,13 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     }
     if (confirmedRunningTask) {
       return {
-        text: "当前正在执行已批准的编排任务，如需继续输入请先中断。",
+        text: "当前正在跟踪最近任务。你可以继续追问结果；如果要切换新的高风险操作，请先中断当前任务。",
         tone: "warning" as const,
       };
     }
     if (runningStateResolving) {
       return {
-        text: "正在校验最近任务状态。你可以稍候等待同步，或直接中断当前任务。",
+        text: "正在校验最近任务状态。同步期间仍可继续追问，或直接恢复会话。",
         tone: "warning" as const,
       };
     }
@@ -817,8 +924,8 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     };
   }, [
     errorText,
-    runtimeError,
     streamError,
+    runtimeSnapshot.recoverable_error,
     connectionState,
     snapshotAwaitingMessage,
     snapshotUiInProgress,
@@ -826,21 +933,30 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     sending,
     confirmedRunningTask,
     runningStateResolving,
+    sessionPhase,
     session?.status,
     isAdmin,
     remediationAutoSubmitPlan,
     mockMode,
   ]);
 
-  const composerHint = confirmedRunningTask
-    ? "当前任务执行中，输入已锁定"
-    : snapshotAwaitingMessage || sending
-      ? "haor 正在生成回复…"
-      : snapshotUiInProgress || stepping
-        ? "haor 正在继续处理当前请求…"
-        : runningStateResolving
-          ? "正在校验最近任务状态；可继续输入，或先中断当前任务"
-          : "Shift+Enter 换行，Enter 发送";
+  const composerHint = runtimeInputLocked
+    ? (
+        snapshotAwaitingMessage || sending
+          ? "haor 正在生成回复…"
+          : snapshotUiInProgress || stepping
+            ? "haor 正在继续处理当前请求…"
+            : sessionPhase === "waiting_approval"
+              ? "当前计划等待确认，输入暂时锁定"
+              : sessionPhase === "recovering"
+                ? "正在恢复会话状态…"
+                : "当前输入暂时锁定"
+      )
+    : confirmedRunningTask
+      ? "当前正在跟踪任务；可以继续追问结果或下一步"
+      : runningStateResolving
+        ? "正在校验最近任务状态；可继续输入，或先恢复会话"
+        : "Shift+Enter 换行，Enter 发送";
 
   const clearPendingMessageTurnTimer = () => {
     const current = pendingMessageTurnRef.current;
@@ -1116,7 +1232,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     if (!event.task_id) {
       return;
     }
-    const sessionTaskId = sessionRef.current?.last_task_id || null;
+    const sessionTaskId = sessionRef.current?.runtime_snapshot?.watch_task_id || sessionRef.current?.last_task_id || null;
     if (sessionTaskId && sessionTaskId !== event.task_id) {
       return;
     }
@@ -1159,11 +1275,14 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
         setLoading(false);
         setErrorText(null);
         setStreamError(null);
-        if (event.session.last_task_id) {
-          void loadTask(event.session.last_task_id, true);
-        } else {
-          setTask(null);
-          setTaskEvents([]);
+        {
+          const watchTaskId = event.session.runtime_snapshot?.watch_task_id || event.session.last_task_id;
+          if (watchTaskId) {
+            void loadTask(watchTaskId, true);
+          } else {
+            setTask(null);
+            setTaskEvents([]);
+          }
         }
         if (!toPendingUiActions(event.session).length) {
           pendingUiRequestRef.current = null;
@@ -1325,8 +1444,9 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
           : null,
       );
     }
-    if (result.last_task_id) {
-      void loadTask(result.last_task_id, true);
+    const watchTaskId = result.runtime_snapshot?.watch_task_id || result.last_task_id;
+    if (watchTaskId) {
+      void loadTask(watchTaskId, true);
     }
     setErrorText(null);
     setStreamError(null);
@@ -1366,7 +1486,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       if (!silent) {
         setLoading(true);
       }
-      const result = await getHaorSession();
+      const result = await recoverHaorSession();
       syncPendingMessageTurnFromSession(result);
       syncPendingUiStepFromSession(result);
       setSession(result);
@@ -1375,8 +1495,9 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       } else {
         setCurrentGoal(null);
       }
-      if (result.last_task_id) {
-        void loadTask(result.last_task_id, true);
+      const watchTaskId = result.runtime_snapshot?.watch_task_id || result.last_task_id;
+      if (watchTaskId) {
+        void loadTask(watchTaskId, true);
       } else {
         setTask(null);
         setTaskEvents([]);
@@ -1397,10 +1518,11 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   };
 
   useEffect(() => {
-    if (open && !sessionInitialized) {
-      void loadSession();
+    if (!open) {
+      return;
     }
-  }, [open, sessionInitialized]);
+    void loadSession(sessionInitialized);
+  }, [open]);
 
   useEffect(() => {
     if (!open || !sessionInitialized) {
@@ -1591,17 +1713,17 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     if (!open) {
       return undefined;
     }
-    if (!session?.last_task_id) {
+    if (!currentWatchTaskId) {
       return undefined;
     }
     const timer = window.setInterval(() => {
-      void loadTask(session.last_task_id as string, true);
-      if (normalizeStatus(session.status) === "running") {
+      void loadTask(currentWatchTaskId, true);
+      if (normalizeStatus(session?.status) === "running") {
         void loadSession(true);
       }
     }, 4000);
     return () => window.clearInterval(timer);
-  }, [open, session?.last_task_id, session?.status, connectionState]);
+  }, [open, currentWatchTaskId, session?.status, connectionState]);
 
   useEffect(() => {
     if (!open) {
@@ -1673,8 +1795,9 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
             }
           : null,
       );
-      if (result.last_task_id) {
-        void loadTask(result.last_task_id, true);
+      const watchTaskId = result.runtime_snapshot?.watch_task_id || result.last_task_id;
+      if (watchTaskId) {
+        void loadTask(watchTaskId, true);
       }
       setErrorText(null);
       setStreamError(null);
@@ -1931,6 +2054,38 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     }
   };
 
+  const handleRecover = async () => {
+    try {
+      setLoading(true);
+      resetPendingMessageTurnState();
+      resetPendingUiStepState();
+      const result = await recoverHaorSession();
+      setSession(result);
+      if (result.current_goal_id) {
+        await loadCurrentGoal(result.current_goal_id, true);
+      } else {
+        setCurrentGoal(null);
+      }
+      const watchTaskId = result.runtime_snapshot?.watch_task_id || result.last_task_id;
+      if (watchTaskId) {
+        await loadTask(watchTaskId, true);
+      } else {
+        setTask(null);
+        setTaskEvents([]);
+      }
+      setErrorText(null);
+      setStreamError(null);
+      setSummary(deriveSessionSummary(result));
+      message.success("会话状态已恢复");
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "haor 会话恢复失败";
+      setErrorText(text);
+      message.error(text);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleInterrupt = async () => {
     try {
       setInterrupting(true);
@@ -1938,8 +2093,9 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       resetPendingUiStepState();
       const result = await interruptHaorSession();
       setSession(result);
-      if (result.last_task_id) {
-        await loadTask(result.last_task_id, true);
+      const watchTaskId = result.runtime_snapshot?.watch_task_id || result.last_task_id;
+      if (watchTaskId) {
+        await loadTask(watchTaskId, true);
       } else {
         setTask(null);
         setTaskEvents([]);
@@ -2039,16 +2195,20 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                       <strong className="haor-chat-state-value">{currentGoalTitle}</strong>
                     </div>
                     <div className="haor-chat-state-card">
-                      <span className="haor-chat-state-label">当前状态</span>
-                      <strong className="haor-chat-state-value">{sidebarStatusText}</strong>
+                      <span className="haor-chat-state-label">当前阶段</span>
+                      <strong className="haor-chat-state-value">{sidebarStageText}</strong>
                     </div>
                     <div className="haor-chat-state-card">
-                      <span className="haor-chat-state-label">当前阶段</span>
-                      <strong className="haor-chat-state-value">{agentStatePanel.stage}</strong>
+                      <span className="haor-chat-state-label">当前阻塞</span>
+                      <strong className="haor-chat-state-value">{sidebarBlockerText}</strong>
                     </div>
                     <div className="haor-chat-state-card">
                       <span className="haor-chat-state-label">下一步</span>
-                      <strong className="haor-chat-state-value">{agentStatePanel.next}</strong>
+                      <strong className="haor-chat-state-value">{sidebarNextStepText}</strong>
+                    </div>
+                    <div className="haor-chat-state-card">
+                      <span className="haor-chat-state-label">最近任务</span>
+                      <strong className="haor-chat-state-value">{sidebarRecentTaskText}</strong>
                     </div>
                     <div className="haor-chat-sidebar-note">
                       最近更新 {sidebarUpdatedText}
@@ -2065,17 +2225,25 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                   </div>
 
                   <div className="haor-chat-header-actions">
-                    {showInterrupt ? (
-                      <Button
-                        danger
-                        size="small"
-                        className="haor-chat-header-button haor-chat-header-button-danger"
-                        onClick={() => void handleInterrupt()}
-                        loading={interrupting}
-                      >
-                        中断任务
-                      </Button>
-                    ) : null}
+                    <Button
+                      size="small"
+                      className="haor-chat-header-button"
+                      onClick={() => void handleRecover()}
+                      loading={loading && !!session}
+                      disabled={loading && !session}
+                    >
+                      恢复会话
+                    </Button>
+                    <Button
+                      danger
+                      size="small"
+                      className="haor-chat-header-button haor-chat-header-button-danger"
+                      onClick={() => void handleInterrupt()}
+                      loading={interrupting}
+                      disabled={!showInterrupt}
+                    >
+                      中断任务
+                    </Button>
                     <Button
                       size="small"
                       className="haor-chat-header-button haor-chat-header-button-primary"
@@ -2104,6 +2272,31 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                       <strong>开始聊天</strong>
                       <span>直接像聊天一样提问，或告诉 haor 你想在站内执行什么操作。</span>
                     </div>
+                  ) : null}
+
+                  {task ? (
+                    <section className="haor-chat-task-banner" aria-label="当前任务跟踪">
+                      <div className="haor-chat-task-banner-main">
+                        <div className="haor-chat-task-banner-copy">
+                          <strong>{getTaskTypeLabel(task.task_type)} · {statusLabel(task.status)}</strong>
+                          <span>{task.id}</span>
+                        </div>
+                        <div className="haor-chat-task-banner-actions">
+                          {showInterrupt && task.id === currentWatchTaskId ? (
+                            <Button danger size="small" onClick={() => void handleInterrupt()} loading={interrupting}>
+                              中断任务
+                            </Button>
+                          ) : null}
+                          <Button size="small" onClick={() => router.push(`/tasks/${task.id}`)}>
+                            打开任务页
+                          </Button>
+                        </div>
+                      </div>
+                      <details className="haor-chat-task-banner-details">
+                        <summary>查看任务摘要</summary>
+                        <pre className="haor-chat-task-banner-body">{liveTaskDigest}</pre>
+                      </details>
+                    </section>
                   ) : null}
 
                   {session?.messages?.map((item) => {
@@ -2206,28 +2399,6 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                     />
                   ) : null}
 
-                  {task && !isTerminalTaskStatus(task.status) ? (
-                    <ChatBubble
-                      actions={
-                        <>
-                          {showInterrupt && task.id === session?.last_task_id ? (
-                            <Button danger size="small" onClick={() => void handleInterrupt()} loading={interrupting}>
-                              中断任务
-                            </Button>
-                          ) : null}
-                          <Button size="small" onClick={() => router.push(`/tasks/${task.id}`)}>
-                            打开任务页
-                          </Button>
-                        </>
-                      }
-                      badge="任务"
-                      content={liveTaskDigest}
-                      role="assistant"
-                      sender="haor"
-                      time={formatChatTime(task.updated_at)}
-                      tone="task"
-                    />
-                  ) : null}
                 </div>
 
                 <footer className="haor-chat-composer">

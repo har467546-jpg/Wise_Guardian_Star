@@ -106,6 +106,35 @@ export type AgentGoal = {
   completed_at: string | null;
 };
 
+export type AgentRecoverableError = {
+  code: string;
+  message: string;
+  retryable: boolean;
+};
+
+export type AgentRuntimeSnapshot = {
+  phase:
+    | "idle"
+    | "awaiting_agent_reply"
+    | "awaiting_ui_feedback"
+    | "resolving_ui_feedback"
+    | "waiting_approval"
+    | "watching_task"
+    | "recovering"
+    | "failed"
+    | string;
+  input_state: "enabled" | "locked" | string;
+  input_block_reason: "none" | "awaiting_reply" | "pending_ui" | "waiting_approval" | "recovering" | "resetting" | string;
+  current_turn_id: string | null;
+  watch_task_id: string | null;
+  active_skill_id: string | null;
+  active_skill_title: string | null;
+  blocker_summary: string | null;
+  recoverable_error: AgentRecoverableError | null;
+  can_interrupt: boolean;
+  can_resume: boolean;
+};
+
 export type AgentSession = {
   session_id: string;
   agent_id: string;
@@ -116,6 +145,7 @@ export type AgentSession = {
   pending_plan_json: Record<string, unknown>;
   browser_runtime_json: Record<string, unknown>;
   agent_state_json: AgentState | Record<string, unknown>;
+  runtime_snapshot: AgentRuntimeSnapshot;
   current_goal_id: string | null;
   current_goal_title: string | null;
   last_task_id: string | null;
@@ -130,8 +160,12 @@ export type AgentSessionSummary = {
   has_attention: boolean;
   attention_kind: AgentAttentionKind;
   session_status: AgentSession["status"] | null;
+  runtime_phase: AgentRuntimeSnapshot["phase"];
+  input_state: AgentRuntimeSnapshot["input_state"];
+  input_block_reason: AgentRuntimeSnapshot["input_block_reason"];
   current_goal_id: string | null;
   current_goal_title: string | null;
+  active_skill_title: string | null;
   last_task_id: string | null;
   updated_at: string | null;
 };

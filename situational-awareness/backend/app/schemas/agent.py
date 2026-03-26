@@ -13,6 +13,18 @@ AgentGoalStatus = Literal["active", "blocked", "completed", "failed", "canceled"
 AgentRole = Literal["system", "user", "assistant"]
 AgentMessageType = Literal["text", "clarifying", "plan", "task_update", "action_update", "error"]
 AgentAttentionKind = Literal["none", "waiting_approval", "running_task", "pending_ui_action"]
+AgentRuntimePhase = Literal[
+    "idle",
+    "awaiting_agent_reply",
+    "awaiting_ui_feedback",
+    "resolving_ui_feedback",
+    "waiting_approval",
+    "watching_task",
+    "recovering",
+    "failed",
+]
+AgentInputState = Literal["enabled", "locked"]
+AgentInputBlockReason = Literal["none", "awaiting_reply", "pending_ui", "waiting_approval", "recovering", "resetting"]
 AgentWriteActionType = Literal[
     "create_discovery_job",
     "verify_asset_risks",
@@ -234,6 +246,26 @@ class AgentGoalRead(BaseModel):
     completed_at: datetime | None = None
 
 
+class AgentRecoverableErrorRead(BaseModel):
+    code: str
+    message: str
+    retryable: bool = True
+
+
+class AgentRuntimeSnapshotRead(BaseModel):
+    phase: AgentRuntimePhase | str = "idle"
+    input_state: AgentInputState | str = "enabled"
+    input_block_reason: AgentInputBlockReason | str = "none"
+    current_turn_id: str | None = None
+    watch_task_id: str | None = None
+    active_skill_id: str | None = None
+    active_skill_title: str | None = None
+    blocker_summary: str | None = None
+    recoverable_error: AgentRecoverableErrorRead | None = None
+    can_interrupt: bool = False
+    can_resume: bool = False
+
+
 class AgentSessionRead(BaseModel):
     session_id: str
     agent_id: str
@@ -244,6 +276,7 @@ class AgentSessionRead(BaseModel):
     pending_plan_json: dict[str, Any] = Field(default_factory=dict)
     browser_runtime_json: dict[str, Any] = Field(default_factory=dict)
     agent_state_json: dict[str, Any] = Field(default_factory=dict)
+    runtime_snapshot: AgentRuntimeSnapshotRead = Field(default_factory=AgentRuntimeSnapshotRead)
     current_goal_id: str | None = None
     current_goal_title: str | None = None
     last_task_id: str | None = None
@@ -256,8 +289,12 @@ class AgentSessionSummaryRead(BaseModel):
     has_attention: bool = False
     attention_kind: AgentAttentionKind = "none"
     session_status: AgentSessionStatus | str | None = None
+    runtime_phase: AgentRuntimePhase | str = "idle"
+    input_state: AgentInputState | str = "enabled"
+    input_block_reason: AgentInputBlockReason | str = "none"
     current_goal_id: str | None = None
     current_goal_title: str | None = None
+    active_skill_title: str | None = None
     last_task_id: str | None = None
     updated_at: datetime | None = None
 
