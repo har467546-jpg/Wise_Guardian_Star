@@ -116,6 +116,40 @@ def message_requests_goal_resume(content: str) -> bool:
     return any(marker in normalized for marker in ("继续上次", "继续那个", "恢复目标", "恢复上次", "继续之前"))
 
 
+def _message_requests_credential_unblock(content: str) -> bool:
+    normalized = sanitize_text(content, max_length=240) or ""
+    lowered = normalized.lower()
+    return (
+        "继续" in normalized
+        or "恢复" in normalized
+        or "凭据" in normalized
+        or "私钥" in normalized
+        or "sudo 密码" in normalized
+        or "管理员授权" in normalized
+        or ("ssh" in lowered and any(marker in normalized for marker in ("配置", "设置", "密码", "私钥", "凭据", "授权")))
+    )
+
+
+def _goal_blocked_by_credential(goal: AgentGoal | None) -> bool:
+    if goal is None:
+        return False
+    blocked_reason = sanitize_text(goal.blocked_reason, max_length=240) or ""
+    if any(marker in blocked_reason for marker in ("SSH", "管理员授权", "管理员权限验证")):
+        return True
+    progress_json = goal.progress_json if isinstance(goal.progress_json, dict) else {}
+    blockers = progress_json.get("blockers") if isinstance(progress_json.get("blockers"), list) else []
+    for item in blockers:
+        if not isinstance(item, dict):
+            continue
+        blocker_code = sanitize_text(str(item.get("blocker_code") or ""), max_length=64, single_line=True) or ""
+        blocker_message = sanitize_text(str(item.get("blocker_message") or ""), max_length=240) or ""
+        if blocker_code in {"missing_ssh_credential", "authorization_unconfirmed", "authorization_not_verified", "insufficient_privilege"}:
+            return True
+        if any(marker in blocker_message for marker in ("SSH", "管理员授权", "管理员权限验证")):
+            return True
+    return False
+
+
 def create_agent_goal(
     db: Session,
     *,
@@ -215,6 +249,25 @@ def ensure_goal_for_message(
             existing_goal = resumable
             attach_goal_to_session(session, resumable)
 
+    if (
+        existing_goal is not None
+        and _normalize_goal_status(existing_goal.status) not in GOAL_TERMINAL_STATUSES
+        and _goal_blocked_by_credential(existing_goal)
+        and _message_requests_credential_unblock(content)
+    ):
+        existing_goal.status = "active"
+        existing_goal.updated_at = _now()
+        existing_goal.last_session_id = session.id
+        existing_goal.context_json = _goal_context_payload(
+            page_context=page_context,
+            browser_context=browser_context,
+            working_context=working_context,
+            current_objective=current_objective,
+            objective_kind=objective_kind,
+        )
+        attach_goal_to_session(session, existing_goal)
+        return existing_goal
+
     if existing_goal is not None and reply_kind != "new_topic" and _normalize_goal_status(existing_goal.status) not in GOAL_TERMINAL_STATUSES:
         existing_goal.status = "active"
         existing_goal.blocked_reason = None
@@ -270,7 +323,7 @@ def derive_goal_status_from_session(
         return "failed", sanitize_text(blocked_reason or explanation.get("decision_summary"), max_length=500) or waiting_for
     if session_status == "completed" or stage == "completed":
         return "completed", None
-    if session_status == "waiting_approval" or stage in {"waiting_approval", "waiting_user_input"}:
+    if session_status == "waiting_approval" or stage in {"waiting_approval", "waiting_user_input", "awaiting_secure_input", "blocked"}:
         return "blocked", sanitize_text(blocked_reason or waiting_for, max_length=500) or None
     if bool(watch.get("watching")) or session_status == "running" or stage in {
         "planning",
@@ -284,6 +337,54 @@ def derive_goal_status_from_session(
     return "active", None
 
 
+def _normalize_goal_progress_blockers(
+    blockers: list[dict[str, Any]] | None,
+    *,
+    fallback_next_step: str | None,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str, str]] = set()
+    for item in blockers or []:
+        if not isinstance(item, dict):
+            continue
+        blocker_code = sanitize_text(
+            str(item.get("blocker_code") or item.get("code") or ""),
+            max_length=64,
+            single_line=True,
+        ) or "goal_blocked"
+        blocker_message = sanitize_text(
+            str(item.get("blocker_message") or item.get("message") or ""),
+            max_length=500,
+        ) or ""
+        if not blocker_message:
+            continue
+        normalized_item = {
+            "blocker_code": blocker_code,
+            "blocker_message": blocker_message,
+            "recommended_next_step": sanitize_text(
+                str(item.get("recommended_next_step") or fallback_next_step or ""),
+                max_length=240,
+            ) or None,
+            "scope": sanitize_text(str(item.get("scope") or ""), max_length=64, single_line=True) or None,
+            "blocking": sanitize_text(str(item.get("blocking") or ""), max_length=32, single_line=True) or None,
+            "stage_code": sanitize_text(str(item.get("stage_code") or ""), max_length=64, single_line=True) or None,
+            "step_id": sanitize_text(str(item.get("step_id") or ""), max_length=64, single_line=True) or None,
+        }
+        signature = (
+            normalized_item["blocker_code"] or "",
+            normalized_item["blocker_message"] or "",
+            normalized_item["scope"] or "",
+            normalized_item["blocking"] or "",
+            normalized_item["stage_code"] or "",
+            normalized_item["step_id"] or "",
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        normalized.append(normalized_item)
+    return normalized
+
+
 def sync_goal_from_session(
     goal: AgentGoal,
     session: AgentSession,
@@ -291,6 +392,7 @@ def sync_goal_from_session(
     status_override: str | None = None,
     blocked_reason: str | None = None,
     latest_summary: str | None = None,
+    goal_blockers: list[dict[str, Any]] | None = None,
 ) -> AgentGoal:
     agent_state = session.agent_state_json if isinstance(session.agent_state_json, dict) else {}
     focus = agent_state.get("focus") if isinstance(agent_state.get("focus"), dict) else {}
@@ -334,18 +436,27 @@ def sync_goal_from_session(
         max_length=64,
         single_line=True,
     ) or None
-    blockers: list[dict[str, Any]] = []
-    if derived_blocked_reason:
-        blockers.append(
+    fallback_next_step = sanitize_text(
+        str(explanation.get("next_step") or execution.get("waiting_for") or ""),
+        max_length=240,
+    ) or None
+    existing_progress = goal.progress_json if isinstance(goal.progress_json, dict) else {}
+    existing_blockers = existing_progress.get("blockers") if isinstance(existing_progress.get("blockers"), list) else []
+    blockers = _normalize_goal_progress_blockers(goal_blockers, fallback_next_step=fallback_next_step)
+    if not blockers and derived_status == "blocked":
+        blockers = _normalize_goal_progress_blockers(existing_blockers, fallback_next_step=fallback_next_step)
+    if not blockers and derived_blocked_reason:
+        blockers = [
             {
                 "blocker_code": "goal_blocked",
                 "blocker_message": derived_blocked_reason,
-                "recommended_next_step": sanitize_text(
-                    str(explanation.get("next_step") or execution.get("waiting_for") or ""),
-                    max_length=240,
-                ) or None,
+                "recommended_next_step": fallback_next_step,
+                "scope": None,
+                "blocking": None,
+                "stage_code": None,
+                "step_id": None,
             }
-        )
+        ]
 
     goal.status = derived_status
     goal.blocked_reason = derived_blocked_reason

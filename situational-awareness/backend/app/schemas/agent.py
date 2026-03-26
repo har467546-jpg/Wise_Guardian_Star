@@ -17,6 +17,7 @@ AgentRuntimePhase = Literal[
     "idle",
     "awaiting_agent_reply",
     "awaiting_ui_feedback",
+    "awaiting_secure_input",
     "resolving_ui_feedback",
     "waiting_approval",
     "watching_task",
@@ -24,13 +25,22 @@ AgentRuntimePhase = Literal[
     "failed",
 ]
 AgentInputState = Literal["enabled", "locked"]
-AgentInputBlockReason = Literal["none", "awaiting_reply", "pending_ui", "waiting_approval", "recovering", "resetting"]
+AgentInputBlockReason = Literal[
+    "none",
+    "awaiting_reply",
+    "pending_ui",
+    "pending_sensitive_input",
+    "waiting_approval",
+    "recovering",
+    "resetting",
+]
 AgentWriteActionType = Literal[
     "create_discovery_job",
     "verify_asset_risks",
     "install_runner",
     "create_or_resume_remediation_session",
     "approve_remediation_session",
+    "configure_ssh_credential",
 ]
 AgentUIActionType = Literal[
     "navigate",

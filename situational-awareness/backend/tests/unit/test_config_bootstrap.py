@@ -96,3 +96,34 @@ def test_migrate_legacy_llm_api_key_storage_promotes_plaintext(monkeypatch, tmp_
     content = runtime_env.read_text(encoding="utf-8")
     assert "LLM_API_KEY=sk-legacy-secret" in content
     assert "LLM_API_KEY_ENCRYPTED=" not in content
+
+
+def test_read_runtime_env_value_prefers_process_env_over_runtime_file(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    runtime_env = tmp_path / ".env.runtime"
+    example_env = tmp_path / ".env.example"
+    runtime_env.write_text(
+        "\n".join(
+            [
+                "SECRET_KEY=test-secret",
+                "LLM_PROVIDER=mock",
+                "LLM_MODEL=gpt-4o-mini",
+                "LLM_BASE_URL=",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    example_env.write_text(runtime_env.read_text(encoding="utf-8"), encoding="utf-8")
+
+    monkeypatch.setattr(config, "RUNTIME_ENV_PATH", runtime_env)
+    monkeypatch.setattr(config, "EXAMPLE_ENV_PATH", example_env)
+    monkeypatch.setenv("LLM_PROVIDER", "custom_proxy")
+    monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
+    monkeypatch.setenv("LLM_BASE_URL", "https://gmncode.cn/v1")
+
+    snapshot = config.read_runtime_env_snapshot()
+
+    assert snapshot["LLM_PROVIDER"] == "custom_proxy"
+    assert snapshot["LLM_MODEL"] == "gpt-5.4"
+    assert snapshot["LLM_BASE_URL"] == "https://gmncode.cn/v1"
+    assert config.read_runtime_env_value("LLM_PROVIDER", "mock") == "custom_proxy"

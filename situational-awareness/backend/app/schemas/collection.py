@@ -108,6 +108,28 @@ class AssetCredentialVerifyResponse(BaseModel):
     detail_json: dict
 
 
+class AssetCredentialBatchUpsertRequest(AssetCredentialUpsertRequest):
+    asset_ids: list[str] = Field(min_length=1)
+    mode: Literal["same_credential_batch"] = "same_credential_batch"
+    verify_after_save: bool = True
+
+
+class AssetCredentialBatchResult(BaseModel):
+    asset_id: str
+    saved: bool
+    verified: bool
+    effective_privilege: str | None = None
+    error_summary: str | None = None
+
+
+class AssetCredentialBatchResponse(BaseModel):
+    mode: Literal["same_credential_batch"] = "same_credential_batch"
+    total_count: int
+    success_count: int
+    failure_count: int
+    results: list[AssetCredentialBatchResult] = Field(default_factory=list)
+
+
 class CollectLatestResponse(BaseModel):
     asset_id: str
     status: str

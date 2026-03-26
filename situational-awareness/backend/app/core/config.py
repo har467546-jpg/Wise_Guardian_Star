@@ -1,3 +1,4 @@
+import os
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -173,15 +174,31 @@ def consume_runtime_bootstrap_marker() -> bool:
     return True
 
 
-def read_runtime_env_snapshot() -> dict[str, str]:
-    runtime_env = _ensure_runtime_env_file()
+def _parse_env_file(path: Path) -> dict[str, str]:
     snapshot: dict[str, str] = {}
-    for raw_line in runtime_env.read_text(encoding="utf-8").splitlines():
+    if not path.exists():
+        return snapshot
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#") or "=" not in raw_line:
             continue
         key, value = raw_line.split("=", 1)
         snapshot[key.strip()] = value.strip()
+    return snapshot
+
+
+def read_runtime_env_snapshot() -> dict[str, str]:
+    runtime_env = _ensure_runtime_env_file()
+    snapshot = _parse_env_file(runtime_env)
+    if not snapshot:
+        snapshot = _parse_env_file(EXAMPLE_ENV_PATH)
+
+    override_keys = set(snapshot)
+    override_keys.update(_parse_env_file(EXAMPLE_ENV_PATH))
+    for key in override_keys:
+        env_value = os.getenv(key)
+        if env_value is not None:
+            snapshot[key] = env_value.strip()
     return snapshot
 
 
@@ -252,6 +269,11 @@ class Settings(BaseSettings):
     RISK_ACTIVE_VERIFY_READ_TIMEOUT_SECONDS: int = 3
     RISK_ACTIVE_VERIFY_MAX_CONCURRENCY: int = 4
     RUNNER_PUBLIC_BASE_URL: str = ""
+    VULN_INTEL_SYNC_TIMEOUT_SECONDS: int = 20
+    VULN_INTEL_STALE_AFTER_HOURS: int = 36
+    VULN_INTEL_NVD_URL: str = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    VULN_INTEL_KEV_URL: str = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+    VULN_INTEL_EPSS_URL: str = "https://api.first.org/data/v1/epss"
     RUNNER_POLL_INTERVAL_SECONDS: int = 10
     RUNNER_OFFLINE_GRACE_SECONDS: int = 45
     REMEDIATION_AUTO_REVERIFY_ENABLED: bool = True

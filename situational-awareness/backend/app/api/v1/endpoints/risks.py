@@ -16,14 +16,25 @@ from app.repositories.task_repo import create_task_run, update_task_run
 from app.schemas.risk import (
     RiskBatchVerifyRequest,
     RiskBatchVerifyResponse,
+    RiskFindingAssignRequest,
     RiskFindingListResponse,
     RiskFindingMobileRead,
     RiskFindingPageResponse,
     RiskFindingRead,
+    RiskFindingWaiverCreateRequest,
     RiskRemediationTemplateRead,
     RiskVerifyRequest,
+    FindingGovernanceRead,
+    FindingWaiverRead,
 )
 from app.schemas.task import TaskRunResponse
+from app.services.finding_governance_service import (
+    assign_finding_owner,
+    create_finding_waiver,
+    ensure_governance_for_findings,
+    recalculate_finding_priority,
+    resolve_waiver_status,
+)
 from app.tasks.verify_tasks import run_risk_verify_task
 
 router = APIRouter()
@@ -32,24 +43,69 @@ RULES_PATH = Path(__file__).resolve().parents[3] / "rules" / "risk_rules.yaml"
 RULE_STORE = RuleStore(RULES_PATH)
 
 
-def _serialize_mobile_risk_finding(finding: RiskFinding) -> RiskFindingMobileRead:
+def _current_rules() -> list[RuleDefinition]:
+    return RULE_STORE.loader.maybe_reload().rules
+
+
+def _serialize_risk_finding_payload(finding: RiskFinding) -> dict[str, object]:
     asset = finding.asset
-    return RiskFindingMobileRead.model_validate(
-        {
-            "id": finding.id,
-            "asset_id": finding.asset_id,
-            "asset_ip": str(asset.ip) if asset is not None else "",
-            "asset_hostname": asset.hostname if asset is not None else None,
-            "asset_port_id": finding.asset_port_id,
-            "severity": finding.severity,
-            "status": finding.status,
-            "title": finding.title,
-            "description": finding.description,
-            "evidence_json": finding.evidence_json or {},
-            "detected_at": finding.detected_at,
-            "resolved_at": finding.resolved_at,
-        }
-    )
+    governance = finding.governance
+    return {
+        "id": finding.id,
+        "asset_id": finding.asset_id,
+        "asset_ip": str(asset.ip) if asset is not None else "",
+        "asset_hostname": asset.hostname if asset is not None else None,
+        "asset_port_id": finding.asset_port_id,
+        "severity": finding.severity,
+        "status": finding.status,
+        "title": finding.title,
+        "description": finding.description,
+        "evidence_json": finding.evidence_json or {},
+        "detected_at": finding.detected_at,
+        "resolved_at": finding.resolved_at,
+        "priority_score": governance.priority_score if governance is not None else None,
+        "priority_tier": governance.priority_tier if governance is not None else None,
+        "priority_reason": governance.priority_reason_json if governance is not None else None,
+        "owner_id": governance.owner_id if governance is not None else None,
+        "sla_due_at": governance.sla_due_at if governance is not None else None,
+        "waiver_status": resolve_waiver_status(finding),
+        "governance": (
+            {
+                "finding_id": governance.finding_id,
+                "priority_score": governance.priority_score,
+                "priority_tier": governance.priority_tier,
+                "priority_reason": governance.priority_reason_json,
+                "owner_id": governance.owner_id,
+                "sla_due_at": governance.sla_due_at,
+                "status": governance.status,
+                "updated_at": governance.updated_at,
+            }
+            if governance is not None
+            else None
+        ),
+        "waivers": [
+            {
+                "id": waiver.id,
+                "finding_id": waiver.finding_id,
+                "waiver_type": waiver.waiver_type,
+                "reason": waiver.reason,
+                "expires_at": waiver.expires_at,
+                "approved_by": waiver.approved_by,
+                "status": waiver.status,
+                "created_at": waiver.created_at,
+                "updated_at": waiver.updated_at,
+            }
+            for waiver in finding.waivers
+        ],
+    }
+
+
+def _serialize_mobile_risk_finding(finding: RiskFinding) -> RiskFindingMobileRead:
+    return RiskFindingMobileRead.model_validate(_serialize_risk_finding_payload(finding))
+
+
+def _serialize_risk_finding(finding: RiskFinding) -> RiskFindingRead:
+    return RiskFindingRead.model_validate(_serialize_risk_finding_payload(finding))
 
 
 @router.get("", response_model=RiskFindingPageResponse)
@@ -70,6 +126,9 @@ def get_risk_list(
         severity=severity,
         keyword=keyword,
     )
+    if items:
+        ensure_governance_for_findings(db, items, rules=_current_rules())
+        db.commit()
     return RiskFindingPageResponse(
         items=[_serialize_mobile_risk_finding(item) for item in items],
         meta=PageMeta(total=total, page=page, page_size=page_size),
@@ -85,6 +144,8 @@ def get_risk_detail(
     finding = get_finding(db, finding_id)
     if finding is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="风险发现不存在")
+    ensure_governance_for_findings(db, [finding], rules=_current_rules())
+    db.commit()
     return _serialize_mobile_risk_finding(finding)
 
 
@@ -95,7 +156,101 @@ def get_asset_risks(
     _: User = Depends(get_current_user),
 ) -> RiskFindingListResponse:
     findings = list_findings_by_asset(db=db, asset_id=asset_id)
-    return RiskFindingListResponse(items=[RiskFindingRead.model_validate(item) for item in findings])
+    if findings:
+        ensure_governance_for_findings(db, findings, rules=_current_rules())
+        db.commit()
+    return RiskFindingListResponse(items=[_serialize_risk_finding(item) for item in findings])
+
+
+@router.post("/{finding_id}/assign", response_model=FindingGovernanceRead)
+def assign_risk_finding(
+    finding_id: str,
+    payload: RiskFindingAssignRequest,
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> FindingGovernanceRead:
+    try:
+        governance = assign_finding_owner(
+            db,
+            finding_id,
+            actor=user,
+            owner_id=payload.owner_id,
+            rules=_current_rules(),
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return FindingGovernanceRead.model_validate(
+        {
+            "finding_id": governance.finding_id,
+            "priority_score": governance.priority_score,
+            "priority_tier": governance.priority_tier,
+            "priority_reason": governance.priority_reason_json,
+            "owner_id": governance.owner_id,
+            "sla_due_at": governance.sla_due_at,
+            "status": governance.status,
+            "updated_at": governance.updated_at,
+        }
+    )
+
+
+@router.post("/{finding_id}/waivers", response_model=FindingWaiverRead)
+def create_risk_finding_waiver(
+    finding_id: str,
+    payload: RiskFindingWaiverCreateRequest,
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> FindingWaiverRead:
+    try:
+        waiver = create_finding_waiver(
+            db,
+            finding_id,
+            actor=user,
+            waiver_type=payload.waiver_type,
+            reason=payload.reason,
+            expires_at=payload.expires_at,
+            rules=_current_rules(),
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return FindingWaiverRead.model_validate(
+        {
+            "id": waiver.id,
+            "finding_id": waiver.finding_id,
+            "waiver_type": waiver.waiver_type,
+            "reason": waiver.reason,
+            "expires_at": waiver.expires_at,
+            "approved_by": waiver.approved_by,
+            "status": waiver.status,
+            "created_at": waiver.created_at,
+            "updated_at": waiver.updated_at,
+        }
+    )
+
+
+@router.post("/{finding_id}/recalculate-priority", response_model=FindingGovernanceRead)
+def recalculate_risk_finding_priority(
+    finding_id: str,
+    db: Session = Depends(get_db_session),
+    _: User = Depends(get_current_user),
+) -> FindingGovernanceRead:
+    try:
+        governance = recalculate_finding_priority(db, finding_id, rules=_current_rules())
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return FindingGovernanceRead.model_validate(
+        {
+            "finding_id": governance.finding_id,
+            "priority_score": governance.priority_score,
+            "priority_tier": governance.priority_tier,
+            "priority_reason": governance.priority_reason_json,
+            "owner_id": governance.owner_id,
+            "sla_due_at": governance.sla_due_at,
+            "status": governance.status,
+            "updated_at": governance.updated_at,
+        }
+    )
 
 
 @router.post("/assets/batch/verify", response_model=RiskBatchVerifyResponse, status_code=status.HTTP_202_ACCEPTED)

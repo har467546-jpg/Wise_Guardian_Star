@@ -1,4 +1,5 @@
 from celery import Celery
+from celery.schedules import crontab
 
 from app.core.config import settings
 
@@ -21,6 +22,7 @@ celery_app.conf.update(
         "app.tasks.runner_tasks",
         "app.tasks.agent_tasks",
         "app.tasks.verify_tasks",
+        "app.tasks.vuln_intel_tasks",
     ],
 )
 
@@ -34,4 +36,12 @@ celery_app.conf.task_routes = {
     "app.tasks.runner_tasks.*": {"queue": "collection"},
     "app.tasks.agent_tasks.*": {"queue": "collection"},
     "app.tasks.verify_tasks.*": {"queue": "risk"},
+    "app.tasks.vuln_intel_tasks.*": {"queue": "risk"},
+}
+
+celery_app.conf.beat_schedule = {
+    "daily-vuln-intel-sync": {
+        "task": "app.tasks.vuln_intel_tasks.sync_vuln_intel",
+        "schedule": crontab(hour=3, minute=0),
+    }
 }

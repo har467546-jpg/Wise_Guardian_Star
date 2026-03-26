@@ -25,6 +25,7 @@ from app.db.models.enums import CredentialAuthType, TaskType
 from app.db.models.risk_finding import RiskFinding
 from app.repositories.task_repo import create_task_run, update_task_run
 from app.schemas.remediation import RemediationExecuteStepInput
+from app.services.remediation_evidence_service import build_remediation_evidence
 from app.tasks.task_runtime import append_current_task_event, ensure_task_not_canceled
 from app.tasks.verify_tasks import run_risk_verify_task
 
@@ -104,11 +105,17 @@ class AsyncSSHRemediationExecutor:
                         break
                 if result.get("backup_paths"):
                     backup_map[result["step_id"]] = result.get("backup_paths", [])
+            failed_count = sum(1 for item in step_results if item.get("status") == "failed")
+            blocked_count = sum(1 for item in step_results if item.get("status") == "blocked")
+            skipped_count = sum(1 for item in step_results if item.get("status") == "skipped")
             return {
                 "execution_boundary": "template_generated",
                 "step_results": step_results,
                 "success_count": success_count,
                 "executed_count": executed_count,
+                "failed_count": failed_count,
+                "blocked_count": blocked_count,
+                "skipped_count": skipped_count,
                 "backup_map": backup_map,
             }
 
@@ -327,6 +334,7 @@ def run_remediation_execution(
     finding: RiskFinding,
     plan: dict[str, Any],
     submitted_steps: list[dict[str, Any]],
+    execution_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     asset = db.get(Asset, finding.asset_id)
     if asset is None:
@@ -340,6 +348,19 @@ def run_remediation_execution(
         effective_privilege=str(credential.last_effective_privilege or "").strip().lower(),
         task_run_id=task_run_id,
     )
+    execution_mode = str((execution_options or {}).get("execution_mode") or "apply").strip().lower() or "apply"
+    change_ticket = str((execution_options or {}).get("change_ticket") or "").strip() or None
+    maintenance_window_id = str((execution_options or {}).get("maintenance_window_id") or "").strip() or None
+    selected_step_ids = {
+        str(item.get("step_id") or "").strip()
+        for item in submitted_steps
+        if isinstance(item, dict) and str(item.get("step_id") or "").strip()
+    }
+    selected_steps = [
+        dict(step)
+        for step in (plan.get("steps") or [])
+        if isinstance(step, dict) and (not selected_step_ids or str(step.get("step_id") or "").strip() in selected_step_ids)
+    ]
     executor = AsyncSSHRemediationExecutor()
     authorization = asyncio.run(executor.verify_authorization(context))
     context.effective_privilege = str(authorization.get("effective_privilege") or context.effective_privilege).strip().lower()
@@ -373,6 +394,31 @@ def run_remediation_execution(
             message="修复后已自动触发风险复测",
             payload_json=reverify,
         )
+    if int(execution.get("failed_count") or 0) > 0:
+        overall_status = "apply_failed"
+        final_message = f"共有 {execution.get('failed_count')} 个修复步骤执行失败"
+    elif reverify.get("reverify_triggered"):
+        overall_status = "applied_pending_reverify"
+        final_message = "修复命令已执行，自动复测已触发，等待复测结论"
+    else:
+        overall_status = "applied"
+        final_message = "修复命令已执行完成"
+    execution["execution_mode"] = execution_mode
+    execution["change_ticket"] = change_ticket
+    execution["maintenance_window_id"] = maintenance_window_id
+    execution["overall_status"] = overall_status
+    execution["final_message"] = final_message
+    evidence = build_remediation_evidence(
+        task_id=task_run_id,
+        plan=plan,
+        selected_steps=selected_steps,
+        execution_mode=execution_mode,
+        execution_boundary=str(execution.get("execution_boundary") or "").strip() or None,
+        step_results=list(execution.get("step_results") or []),
+        reverify=reverify,
+        change_ticket=change_ticket,
+        maintenance_window_id=maintenance_window_id,
+    )
     return {
         "context": {
             "asset_id": asset.id,
@@ -385,6 +431,58 @@ def run_remediation_execution(
         "execution": execution,
         "backups": execution.get("backup_map") or {},
         "reverify": reverify,
+        "evidence": evidence,
+    }
+
+
+def build_remediation_preview_result(
+    *,
+    task_run_id: str,
+    context: dict[str, Any],
+    plan: dict[str, Any],
+    selected_steps: list[dict[str, Any]],
+    change_ticket: str | None = None,
+    maintenance_window_id: str | None = None,
+    stage_code: str | None = None,
+    stage_name: str | None = None,
+) -> dict[str, Any]:
+    execution = {
+        "execution_boundary": "dry_run_preview",
+        "execution_mode": "dry_run",
+        "submitted_steps": [{"step_id": str(item.get("step_id") or "").strip()} for item in selected_steps if str(item.get("step_id") or "").strip()],
+        "success_count": 0,
+        "executed_count": 0,
+        "failed_count": 0,
+        "blocked_count": 0,
+        "skipped_count": 0,
+        "overall_status": "preview_ready",
+        "final_message": "修复预演已生成，尚未执行任何主机变更",
+        "change_ticket": change_ticket,
+        "maintenance_window_id": maintenance_window_id,
+        "stage_code": stage_code,
+        "stage_name": stage_name,
+    }
+    reverify = {"reverify_triggered": False, "reverify_task_id": None, "reverify_status": None}
+    evidence = build_remediation_evidence(
+        task_id=task_run_id,
+        plan=plan,
+        selected_steps=selected_steps,
+        execution_mode="dry_run",
+        execution_boundary="dry_run_preview",
+        step_results=[],
+        reverify=reverify,
+        change_ticket=change_ticket,
+        maintenance_window_id=maintenance_window_id,
+        stage_code=stage_code,
+        stage_name=stage_name,
+    )
+    return {
+        "context": dict(context),
+        "plan": plan,
+        "execution": execution,
+        "backups": {},
+        "reverify": reverify,
+        "evidence": evidence,
     }
 
 

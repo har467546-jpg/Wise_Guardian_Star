@@ -4,6 +4,8 @@ from app.db.models.agent_session import AgentSession
 from app.db.models.asset import Asset, AssetPort, AssetTag
 from app.db.models.credential import AssetCredentialBinding, SSHCredential
 from app.db.models.discovery_job import DiscoveryJob
+from app.db.models.finding_governance import FindingGovernance
+from app.db.models.finding_waiver import FindingWaiver
 from app.db.models.host_runner import HostRunner
 from app.db.models.platform_log_entry import PlatformLogEntry
 from app.db.models.report import AIReport
@@ -16,7 +18,9 @@ from app.db.models.tag import Tag
 from app.db.models.task_event import TaskEvent
 from app.db.models.task_run import TaskRun
 from app.db.models.user import User
+from app.db.models.vuln_cve_intel import VulnCveIntel
 from app.db.models.vuln_rule_index import VulnRuleIndex
+from app.db.models.vuln_rule_governance import VulnRuleGovernance
 
 __all__ = [
     "AgentMessage",
@@ -28,6 +32,8 @@ __all__ = [
     "AssetCredentialBinding",
     "SSHCredential",
     "DiscoveryJob",
+    "FindingGovernance",
+    "FindingWaiver",
     "HostRunner",
     "PlatformLogEntry",
     "AIReport",
@@ -40,5 +46,7 @@ __all__ = [
     "TaskEvent",
     "TaskRun",
     "User",
+    "VulnCveIntel",
     "VulnRuleIndex",
+    "VulnRuleGovernance",
 ]

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Enum, Index, String
+from sqlalchemy import Boolean, DateTime, Enum, Float, Index, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -28,6 +28,12 @@ class VulnRuleIndex(Base):
     active_detector: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     active_trigger: Mapped[str | None] = mapped_column(String(32), nullable=True)
     cve_ids: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    cve_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_cvss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_epss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    kev_flag: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    exploit_maturity: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    intel_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     tags: Mapped[list[str]] = mapped_column(JSONB, default=list)
     yaml_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     yaml_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

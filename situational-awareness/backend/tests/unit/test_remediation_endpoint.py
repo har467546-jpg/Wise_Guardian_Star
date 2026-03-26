@@ -1057,7 +1057,7 @@ def test_runner_install_endpoint_prefers_public_base_url(monkeypatch, tmp_path) 
         assert runner.platform_url == "http://192.168.10.131:3000"
 
 
-def test_remediation_execute_endpoint_queues_task(monkeypatch, tmp_path) -> None:
+def test_remediation_execute_endpoint_queues_task_in_apply_mode(monkeypatch, tmp_path) -> None:
     client = _build_client(tmp_path)
     _, finding_id = _create_asset_context()
 
@@ -1070,16 +1070,76 @@ def test_remediation_execute_endpoint_queues_task(monkeypatch, tmp_path) -> None
 
     response = client.post(
         f"/api/v1/remediation/findings/{finding_id}/execute",
-        json={"steps": []},
+        json={"steps": [], "execution_mode": "apply"},
     )
 
     assert response.status_code == 202
     body = response.json()
+    assert body["execution_mode"] == "apply"
     assert body["stream_url"].endswith(f"/api/v1/remediation/tasks/{body['task_id']}/stream")
     with SessionLocal() as db:
         task = db.get(TaskRun, body["task_id"])
         assert task is not None
         assert task.task_type == TaskType.REMEDIATION_EXECUTE
+
+
+def test_remediation_execute_endpoint_defaults_to_dry_run_and_exposes_evidence(tmp_path) -> None:
+    client = _build_client(tmp_path)
+    _, finding_id = _create_asset_context()
+
+    response = client.post(
+        f"/api/v1/remediation/findings/{finding_id}/execute",
+        json={"steps": []},
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["execution_mode"] == "dry_run"
+
+    task_response = client.get(f"/api/v1/remediation/tasks/{body['task_id']}")
+    assert task_response.status_code == 200
+    assert task_response.json()["status"] == "success"
+    assert task_response.json()["execution_mode"] == "dry_run"
+
+    evidence_response = client.get(f"/api/v1/remediation/tasks/{body['task_id']}/evidence")
+    assert evidence_response.status_code == 200
+    evidence_body = evidence_response.json()
+    assert evidence_body["execution_mode"] == "dry_run"
+    assert evidence_body["item_count"] >= 1
+
+
+def test_remediation_session_approve_supports_dry_run_preview(tmp_path) -> None:
+    client = _build_client(tmp_path)
+    asset_id, _ = _create_asset_context()
+    with SessionLocal() as db:
+        db.add(
+            HostRunner(
+                asset_id=asset_id,
+                status="online",
+                install_status="installed",
+                last_seen_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+
+    created = client.post(f"/api/v1/remediation/assets/{asset_id}/sessions", json={})
+    assert created.status_code == 200
+    session_id = created.json()["session_id"]
+
+    response = client.post(
+        f"/api/v1/remediation/sessions/{session_id}/approve",
+        json={"execution_mode": "dry_run"},
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["execution_mode"] == "dry_run"
+    session_response = client.get(f"/api/v1/remediation/sessions/{session_id}")
+    assert session_response.status_code == 200
+    assert session_response.json()["last_task_id"] == body["task_id"]
+    task_response = client.get(f"/api/v1/remediation/tasks/{body['task_id']}")
+    assert task_response.status_code == 200
+    assert task_response.json()["execution_mode"] == "dry_run"
 
 
 def test_remediation_execute_endpoint_rejects_sudo_self_lock_step(tmp_path) -> None:

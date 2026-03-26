@@ -18,10 +18,39 @@ class RiskFindingRead(ORMModel):
     evidence_json: dict
     detected_at: datetime
     resolved_at: datetime | None
+    priority_score: int | None = None
+    priority_tier: str | None = None
+    priority_reason: dict[str, Any] | None = None
+    owner_id: str | None = None
+    sla_due_at: datetime | None = None
+    waiver_status: str = "none"
 
 
 class RiskFindingListResponse(BaseModel):
     items: list[RiskFindingRead]
+
+
+class FindingGovernanceRead(BaseModel):
+    finding_id: str
+    priority_score: int
+    priority_tier: str
+    priority_reason: dict[str, Any]
+    owner_id: str | None = None
+    sla_due_at: datetime | None = None
+    status: str
+    updated_at: datetime
+
+
+class FindingWaiverRead(BaseModel):
+    id: str
+    finding_id: str
+    waiver_type: Literal["false_positive", "accepted_risk", "temporary_exception"]
+    reason: str
+    expires_at: datetime | None = None
+    approved_by: str | None = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class RiskFindingMobileRead(BaseModel):
@@ -37,6 +66,14 @@ class RiskFindingMobileRead(BaseModel):
     evidence_json: dict
     detected_at: datetime
     resolved_at: datetime | None
+    priority_score: int | None = None
+    priority_tier: str | None = None
+    priority_reason: dict[str, Any] | None = None
+    owner_id: str | None = None
+    sla_due_at: datetime | None = None
+    waiver_status: str = "none"
+    governance: FindingGovernanceRead | None = None
+    waivers: list[FindingWaiverRead] = Field(default_factory=list)
 
 
 class RiskFindingPageResponse(BaseModel):
@@ -55,6 +92,16 @@ class RiskBatchVerifyRequest(BaseModel):
 class RiskBatchVerifyResponse(BaseModel):
     queued: int
     task_ids: list[str]
+
+
+class RiskFindingAssignRequest(BaseModel):
+    owner_id: str | None = None
+
+
+class RiskFindingWaiverCreateRequest(BaseModel):
+    waiver_type: Literal["false_positive", "accepted_risk", "temporary_exception"]
+    reason: str = Field(min_length=1, max_length=1000)
+    expires_at: datetime | None = None
 
 
 class RiskRemediationActionRead(BaseModel):

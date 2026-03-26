@@ -139,12 +139,19 @@ SUPPORTED_WRITE_ACTIONS = {
     "install_runner",
     "create_or_resume_remediation_session",
     "approve_remediation_session",
+    "configure_ssh_credential",
 }
 AGENT_EXECUTION_SERVICE = AgentExecutionService(supported_action_types=SUPPORTED_WRITE_ACTIONS)
 AUTO_EXECUTE_ACTIONS = {
     "create_discovery_job",
     "verify_asset_risks",
     "install_runner",
+}
+SSH_CREDENTIAL_BLOCKER_CODES = {
+    "missing_ssh_credential",
+    "authorization_unconfirmed",
+    "authorization_not_verified",
+    "insufficient_privilege",
 }
 ACTION_POLICY_REGISTRY: dict[str, dict[str, Any]] = {
     "create_discovery_job": {
@@ -181,6 +188,13 @@ ACTION_POLICY_REGISTRY: dict[str, dict[str, Any]] = {
         "needs_confirmation": True,
         "auto_execute_allowed": False,
         "task_followup_strategy": "watch_task",
+    },
+    "configure_ssh_credential": {
+        "required_slots": ["asset_id|asset_ids"],
+        "risk_level": "sensitive_input",
+        "needs_confirmation": False,
+        "auto_execute_allowed": False,
+        "task_followup_strategy": "secure_input",
     },
 }
 SUPPORTED_UI_ACTIONS = {
@@ -449,6 +463,7 @@ def _sync_current_goal_state(
     status_override: str | None = None,
     blocked_reason: str | None = None,
     latest_summary: str | None = None,
+    goal_blockers: list[dict[str, Any]] | None = None,
 ) -> AgentGoal | None:
     goal = _session_goal(session)
     if goal is None and getattr(session, "current_goal_id", None):
@@ -463,6 +478,7 @@ def _sync_current_goal_state(
         status_override=status_override,
         blocked_reason=blocked_reason,
         latest_summary=latest_summary,
+        goal_blockers=goal_blockers,
     )
     db.add(goal)
     db.add(session)
@@ -844,12 +860,74 @@ def _normalize_ui_action_results(results: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _normalize_pending_secure_input(payload: dict[str, Any] | None) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    asset_ids: list[str] = []
+    seen_asset_ids: set[str] = set()
+    if raw.get("asset_id"):
+        normalized_asset_id = _sanitize_line(str(raw.get("asset_id") or ""), max_length=64)
+        if normalized_asset_id:
+            asset_ids.append(normalized_asset_id)
+            seen_asset_ids.add(normalized_asset_id)
+    raw_asset_ids = raw.get("asset_ids") if isinstance(raw.get("asset_ids"), list) else []
+    for item in raw_asset_ids[:20]:
+        normalized_asset_id = _sanitize_line(str(item or ""), max_length=64)
+        if not normalized_asset_id or normalized_asset_id in seen_asset_ids:
+            continue
+        seen_asset_ids.add(normalized_asset_id)
+        asset_ids.append(normalized_asset_id)
+
+    if not asset_ids:
+        return {}
+
+    raw_labels = raw.get("asset_labels") if isinstance(raw.get("asset_labels"), list) else []
+    asset_labels: list[str] = []
+    for index, asset_id in enumerate(asset_ids):
+        label = sanitize_text(str(raw_labels[index] or ""), max_length=160) if index < len(raw_labels) else None
+        asset_labels.append(label or f"资产 {asset_id}")
+
+    auth_type = _sanitize_line(str(raw.get("auth_type") or ""), max_length=16)
+    if auth_type not in {"password", "key"}:
+        auth_type = None
+    mode = _sanitize_line(str(raw.get("mode") or ""), max_length=32)
+    if mode not in {"single_asset", "batch_choice", "same_credential_batch", "per_asset_guided"}:
+        mode = "single_asset" if len(asset_ids) == 1 else "batch_choice"
+
+    resume_action = raw.get("resume_action") if isinstance(raw.get("resume_action"), dict) else {}
+    normalized_resume_action = {}
+    resume_action_type = _sanitize_line(str(resume_action.get("action_type") or ""), max_length=64)
+    if resume_action_type in SUPPORTED_WRITE_ACTIONS and resume_action_type != "configure_ssh_credential":
+        normalized_resume_action = {
+            "action_type": resume_action_type,
+            "title": sanitize_text(str(resume_action.get("title") or resume_action_type), max_length=120) or resume_action_type,
+            "reason": sanitize_text(str(resume_action.get("reason") or ""), max_length=240) or "",
+            "params": sanitize_json_value(resume_action.get("params") if isinstance(resume_action.get("params"), dict) else {}),
+        }
+
+    return {
+        "kind": "ssh_credential",
+        "mode": mode,
+        "asset_ids": asset_ids,
+        "asset_labels": asset_labels,
+        "auth_type": auth_type,
+        "username": sanitize_text(str(raw.get("username") or ""), max_length=128, single_line=True) or None,
+        "resume_goal_id": _sanitize_line(str(raw.get("resume_goal_id") or ""), max_length=64) or None,
+        "resume_action": normalized_resume_action,
+        "auto_verify": False if raw.get("auto_verify") is False else True,
+        "auto_resume": False if raw.get("auto_resume") is False else True,
+        "blocker_summary": sanitize_text(str(raw.get("blocker_summary") or ""), max_length=240) or None,
+    }
+
+
 def _normalize_browser_runtime(browser_runtime: dict[str, Any] | None) -> dict[str, Any]:
     payload = browser_runtime if isinstance(browser_runtime, dict) else {}
     pending_ui_actions = payload.get("pending_ui_actions") if isinstance(payload.get("pending_ui_actions"), list) else []
     completed_ui_actions = payload.get("completed_ui_actions") if isinstance(payload.get("completed_ui_actions"), list) else []
     auto_executed_actions = payload.get("auto_executed_actions") if isinstance(payload.get("auto_executed_actions"), list) else []
     last_ui_results = payload.get("last_ui_results") if isinstance(payload.get("last_ui_results"), list) else []
+    pending_secure_input = _normalize_pending_secure_input(
+        payload.get("pending_secure_input") if isinstance(payload.get("pending_secure_input"), dict) else {}
+    )
     normalized_pending_actions = []
     for item in pending_ui_actions[:MAX_UI_ACTION_BATCH]:
         normalized_action = _normalize_ui_action(item if isinstance(item, dict) else {})
@@ -865,6 +943,7 @@ def _normalize_browser_runtime(browser_runtime: dict[str, Any] | None) -> dict[s
         "pending_ui_actions": normalized_pending_actions,
         "completed_ui_actions": _normalize_ui_action_results(completed_ui_actions),
         "last_ui_results": _normalize_ui_action_results(last_ui_results),
+        "pending_secure_input": pending_secure_input,
         "auto_executed_actions": sanitize_json_value(auto_executed_actions) if auto_executed_actions else [],
         "last_browser_context": _normalize_browser_context(
             payload.get("last_browser_context") if isinstance(payload.get("last_browser_context"), dict) else {}
@@ -1418,11 +1497,16 @@ def _normalize_agent_state(payload: dict[str, Any] | None, *, last_task_id: str 
     ][:6]
     if primary_task_id and primary_task_id not in related_task_ids:
         related_task_ids = [primary_task_id, *related_task_ids][:6]
+    raw_watching = watch.get("watching")
+    if isinstance(raw_watching, bool):
+        normalized_watching = raw_watching
+    else:
+        normalized_watching = normalized_execution["stage"] == "watching_task" and bool(primary_task_id)
     normalized_watch = {
         "primary_task_id": primary_task_id,
         "related_task_ids": related_task_ids,
         "status": _sanitize_line(str(watch.get("status") or ""), max_length=32) or None,
-        "watching": bool(watch.get("watching")) or bool(primary_task_id),
+        "watching": normalized_watching,
         "last_task_message": sanitize_text(str(watch.get("last_task_message") or ""), max_length=280) or None,
     }
 
@@ -1973,10 +2057,16 @@ def _action_type_to_skill_id(action_type: str | None) -> str | None:
         "install_runner": "install_runner",
         "create_or_resume_remediation_session": "start_remediation_session",
         "approve_remediation_session": "start_remediation_session",
+        "configure_ssh_credential": "configure_ssh_credential",
     }.get(normalized)
 
 
 def _derive_active_skill_id(session: AgentSession) -> str | None:
+    runtime = _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {})
+    pending_secure_input = runtime.get("pending_secure_input") if isinstance(runtime.get("pending_secure_input"), dict) else {}
+    if pending_secure_input:
+        return "configure_ssh_credential"
+
     current_goal = _session_goal(session)
     if current_goal is not None:
         goal_kind = _sanitize_line(str(current_goal.goal_kind or ""), max_length=128)
@@ -1996,7 +2086,6 @@ def _derive_active_skill_id(session: AgentSession) -> str | None:
         if skill_id:
             return skill_id
 
-    runtime = _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {})
     objective_kind = _sanitize_line(str(runtime.get("objective_kind") or ""), max_length=64)
     if objective_kind in {"navigate", "inspect"} and _sanitize_line(str(session.last_task_id or ""), max_length=64):
         return "resume_task_detail"
@@ -2026,6 +2115,14 @@ def _runtime_watch_task_id(session: AgentSession) -> str | None:
 
 
 def _runtime_blocker_summary(session: AgentSession, *, phase: str, recoverable_error: AgentRecoverableErrorRead | None) -> str | None:
+    runtime = _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {})
+    pending_secure_input = runtime.get("pending_secure_input") if isinstance(runtime.get("pending_secure_input"), dict) else {}
+    if phase == "awaiting_secure_input" and pending_secure_input:
+        return sanitize_text(
+            str(pending_secure_input.get("blocker_summary") or "等待在安全弹层中填写 SSH 敏感信息"),
+            max_length=280,
+        ) or "等待在安全弹层中填写 SSH 敏感信息"
+
     current_goal = _session_goal(session)
     if current_goal is not None:
         blocked_reason = sanitize_text(str(current_goal.blocked_reason or ""), max_length=280) or None
@@ -2089,6 +2186,7 @@ def _build_recoverable_error(session: AgentSession) -> AgentRecoverableErrorRead
 def _build_runtime_snapshot(session: AgentSession) -> AgentRuntimeSnapshotRead:
     runtime = _normalize_browser_runtime(session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {})
     raw_phase = _sanitize_line(str(runtime.get("phase") or ""), max_length=64)
+    pending_secure_input = runtime.get("pending_secure_input") if isinstance(runtime.get("pending_secure_input"), dict) else {}
     public_status = _sanitize_line(str(session.status or ""), max_length=32) or "active"
     agent_state = session.agent_state_json if isinstance(session.agent_state_json, dict) else {}
     watch = agent_state.get("watch") if isinstance(agent_state.get("watch"), dict) else {}
@@ -2099,6 +2197,8 @@ def _build_runtime_snapshot(session: AgentSession) -> AgentRuntimeSnapshotRead:
         phase = "waiting_approval"
     elif raw_phase == "awaiting_agent_reply":
         phase = "awaiting_agent_reply"
+    elif raw_phase == "awaiting_secure_input" or pending_secure_input:
+        phase = "awaiting_secure_input"
     elif raw_phase == "awaiting_ui_feedback":
         phase = "awaiting_ui_feedback"
     elif raw_phase == "resolving_ui_feedback":
@@ -2112,6 +2212,7 @@ def _build_runtime_snapshot(session: AgentSession) -> AgentRuntimeSnapshotRead:
 
     input_block_reason = {
         "awaiting_agent_reply": "awaiting_reply",
+        "awaiting_secure_input": "pending_sensitive_input",
         "awaiting_ui_feedback": "pending_ui",
         "resolving_ui_feedback": "pending_ui",
         "waiting_approval": "waiting_approval",
@@ -2187,9 +2288,12 @@ def _session_attention_kind(session: AgentSession | None) -> AgentAttentionKind:
     browser_runtime = _normalize_browser_runtime(
         session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
     )
+    pending_secure_input = browser_runtime.get("pending_secure_input")
     pending_ui_actions = browser_runtime.get("pending_ui_actions")
     if status == "waiting_approval":
         return "waiting_approval"
+    if isinstance(pending_secure_input, dict) and pending_secure_input:
+        return "pending_ui_action"
     if isinstance(pending_ui_actions, list) and pending_ui_actions:
         return "pending_ui_action"
     if status == "running" and _runtime_watch_task_id(session):
@@ -2648,7 +2752,7 @@ def _append_or_stream_assistant_message(
         AgentAssistantMessageStartEvent(turn_id=turn_id, message_type=message_type).model_dump(mode="json"),
     )
     final_content = fallback_content
-    if fallback_content and _runtime_provider_mode() != "mock":
+    if fallback_content and _runtime_provider_mode() != "mock" and _haor_reply_rewrite_enabled():
         reply_request = _build_reply_stream_request(
             user_content=user_content,
             message_type=message_type,
@@ -2942,7 +3046,31 @@ def _repair_inconsistent_runtime_state(
         changed = True
     elif phase in {"awaiting_ui_feedback", "resolving_ui_feedback"}:
         pending_ui_actions = browser_runtime.get("pending_ui_actions") if isinstance(browser_runtime.get("pending_ui_actions"), list) else []
-        if not pending_ui_actions:
+        runtime_watch_task_id = _runtime_watch_task_id(session)
+        terminal_followup_written = bool(
+            runtime_watch_task_id
+            and has_agent_task_followup_message(
+                session,
+                task_id=runtime_watch_task_id,
+            )
+        )
+        if not pending_ui_actions or terminal_followup_written:
+            _clear_browser_runtime(
+                session,
+                browser_context=browser_context,
+                last_user_intent=str(browser_runtime.get("last_user_intent") or "") or None,
+                current_objective=str(browser_runtime.get("current_objective") or "") or None,
+                objective_kind=str(browser_runtime.get("objective_kind") or "") or None,
+                auto_executed_actions=browser_runtime.get("auto_executed_actions")
+                if isinstance(browser_runtime.get("auto_executed_actions"), list)
+                else [],
+                last_error=last_error,
+            )
+            session.status = "active"
+            changed = True
+    elif phase == "awaiting_secure_input":
+        pending_secure_input = browser_runtime.get("pending_secure_input") if isinstance(browser_runtime.get("pending_secure_input"), dict) else {}
+        if not pending_secure_input:
             _clear_browser_runtime(
                 session,
                 browser_context=browser_context,
@@ -3272,6 +3400,31 @@ def append_agent_task_message(
     if session is None:
         return
     normalized_payload = payload_json if isinstance(payload_json, dict) else {}
+    current_browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    current_phase = _sanitize_line(str(current_browser_runtime.get("phase") or ""), max_length=64)
+    if current_phase in {"awaiting_ui_feedback", "resolving_ui_feedback", "recovering"}:
+        browser_context = _normalize_browser_context(
+            current_browser_runtime.get("last_browser_context")
+            if isinstance(current_browser_runtime.get("last_browser_context"), dict)
+            else session.route_context_json if isinstance(session.route_context_json, dict) else {}
+        )
+        _clear_browser_runtime(
+            session,
+            browser_context=browser_context,
+            last_user_intent=sanitize_text(str(current_browser_runtime.get("last_user_intent") or ""), max_length=240) or None,
+            current_objective=sanitize_text(str(current_browser_runtime.get("current_objective") or ""), max_length=240) or None,
+            objective_kind=_sanitize_line(str(current_browser_runtime.get("objective_kind") or ""), max_length=32) or None,
+            auto_executed_actions=current_browser_runtime.get("auto_executed_actions")
+            if isinstance(current_browser_runtime.get("auto_executed_actions"), list)
+            else [],
+            last_error=sanitize_text(str(current_browser_runtime.get("last_error") or ""), max_length=240) or None,
+            last_message_request_id=_normalize_client_message_id(current_browser_runtime.get("last_message_request_id")),
+            last_message_ack_at=_parse_runtime_timestamp(current_browser_runtime.get("last_message_ack_at")),
+            last_step_request_id=_normalize_step_request_id(current_browser_runtime.get("last_step_request_id")),
+            last_step_ack_at=_parse_runtime_timestamp(current_browser_runtime.get("last_step_ack_at")),
+        )
     child_task = normalized_payload.get("child_task") if isinstance(normalized_payload.get("child_task"), dict) else {}
     task_id = _sanitize_line(
         str(normalized_payload.get("task_id") or child_task.get("task_id") or session.last_task_id or ""),
@@ -4250,6 +4403,11 @@ def _runtime_provider_mode() -> str:
     return read_runtime_env_value("LLM_PROVIDER", str(settings.LLM_PROVIDER or "mock")).strip().lower() or "mock"
 
 
+def _haor_reply_rewrite_enabled() -> bool:
+    raw = read_runtime_env_value("HAOR_REPLY_REWRITE_ENABLED", "false")
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _build_runtime_provider(
     *,
     wire_api_override: str | None = None,
@@ -4636,6 +4794,11 @@ def _build_model_context_payload(
             "description": "批准修复会话并触发 Host Runner 修复任务",
             "required_params": {"session_id": "修复会话 ID"},
         },
+        {
+            "action_type": "configure_ssh_credential",
+            "description": "打开 SSH 凭据安全输入引导，不直接在聊天中收集密码或私钥",
+            "required_params": {"asset_id": "单资产 ID，或与 asset_ids 二选一", "asset_ids": "批量资产 ID 列表"},
+        },
     ]
     browser_action_whitelist = [
         {"action_type": "navigate", "description": "站内路由跳转到已知 href 或 pathname"},
@@ -4694,6 +4857,7 @@ def _build_model_response_contract() -> dict[str, Any]:
             "current_browser_context 会提供当前页面可见 DOM 节点与动作，只有在 semantic_page_context 不足时才回退到 dom_snapshot",
             "如果当前回合目标还未完成，不要把中间状态误当成最终答复",
             "auto_execute_actions 仅允许 create_discovery_job、verify_asset_risks、install_runner，且只能用于明确的执行意图",
+            "configure_ssh_credential 只能用于触发安全输入引导，敏感字段绝不能出现在 reply_markdown、dialog_state、ui_actions 或 payload 里",
             "只有在明确形成计划时才填写 proposed_write_actions",
             "允许在一条消息里形成跨多个对象的聚合计划，但每个动作都必须带清晰参数",
             "如果 allow_auto_execute_actions=false，则 auto_execute_actions 必须为空",
@@ -5337,6 +5501,7 @@ def _run_agent_loop(
         page_context=page_context,
         browser_context=browser_context,
         working_context=working_context,
+        current_goal=_session_goal(session),
     )
     objective = _build_current_objective(
         str(browser_runtime.get("current_objective") or "") or current_content,
@@ -5652,6 +5817,7 @@ def _set_browser_runtime(
     planned_steps: list[dict[str, Any]] | None = None,
     step_cursor: int | None = None,
     pending_ui_actions: list[dict[str, Any]] | None = None,
+    pending_secure_input: dict[str, Any] | None = None,
     completed_ui_actions: list[dict[str, Any]] | None = None,
     last_ui_results: list[dict[str, Any]] | None = None,
     auto_executed_actions: list[dict[str, Any]] | None = None,
@@ -5677,6 +5843,7 @@ def _set_browser_runtime(
             "planned_steps": planned_steps if planned_steps is not None else current.get("planned_steps"),
             "step_cursor": current.get("step_cursor") if step_cursor is None else step_cursor,
             "pending_ui_actions": pending_ui_actions if pending_ui_actions is not None else current.get("pending_ui_actions"),
+            "pending_secure_input": pending_secure_input if pending_secure_input is not None else current.get("pending_secure_input"),
             "completed_ui_actions": completed_ui_actions if completed_ui_actions is not None else current.get("completed_ui_actions"),
             "last_ui_results": last_ui_results if last_ui_results is not None else current.get("last_ui_results"),
             "auto_executed_actions": auto_executed_actions if auto_executed_actions is not None else current.get("auto_executed_actions"),
@@ -5736,6 +5903,7 @@ def _clear_browser_runtime(
             "planned_steps": [],
             "step_cursor": 0,
             "pending_ui_actions": [],
+            "pending_secure_input": {},
             "completed_ui_actions": [],
             "last_ui_results": [],
             "auto_executed_actions": auto_executed_actions or [],
@@ -6125,6 +6293,42 @@ def enqueue_auto_action_followup_task(*, session_id: str, child_task_id: str, ac
         )
 
 
+def _extract_secure_input_action(actions: list[dict[str, Any]]) -> dict[str, Any]:
+    for item in actions:
+        if isinstance(item, dict) and _sanitize_line(str(item.get("action_type") or ""), max_length=64) == "configure_ssh_credential":
+            return item
+    return {}
+
+
+def _build_pending_secure_input_from_action(
+    action: dict[str, Any],
+    *,
+    current_browser_runtime: dict[str, Any],
+) -> dict[str, Any]:
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    current_pending = (
+        current_browser_runtime.get("pending_secure_input")
+        if isinstance(current_browser_runtime.get("pending_secure_input"), dict)
+        else {}
+    )
+    return _normalize_pending_secure_input(
+        {
+            "kind": "ssh_credential",
+            "mode": params.get("mode") or current_pending.get("mode"),
+            "asset_id": params.get("asset_id"),
+            "asset_ids": params.get("asset_ids"),
+            "asset_labels": params.get("asset_labels"),
+            "auth_type": params.get("auth_type") or current_pending.get("auth_type"),
+            "username": params.get("username") or current_pending.get("username"),
+            "resume_goal_id": params.get("resume_goal_id") or current_pending.get("resume_goal_id"),
+            "resume_action": params.get("resume_action") if isinstance(params.get("resume_action"), dict) else current_pending.get("resume_action"),
+            "auto_verify": params.get("auto_verify") if params.get("auto_verify") is not None else current_pending.get("auto_verify"),
+            "auto_resume": params.get("auto_resume") if params.get("auto_resume") is not None else current_pending.get("auto_resume"),
+            "blocker_summary": params.get("blocker_summary") or current_pending.get("blocker_summary"),
+        }
+    )
+
+
 def _apply_agent_decision(
     db: Session,
     *,
@@ -6162,12 +6366,13 @@ def _apply_agent_decision(
         allowed_types=AUTO_EXECUTE_ACTIONS,
     )
     auto_execute_results: list[dict[str, Any]] = []
+    secure_input_action = _extract_secure_input_action(proposed_actions)
     allow_auto_execute = _user_can_auto_execute(user) and _message_allows_auto_execution(
         user_content,
         dialog_state=dialog_state,
         followup_hint=followup_hint,
     )
-    needs_confirmation = bool(decision.needs_confirmation and proposed_actions)
+    needs_confirmation = bool(decision.needs_confirmation and proposed_actions and not secure_input_action)
 
     if auto_execute_actions:
         if allow_auto_execute:
@@ -6197,15 +6402,16 @@ def _apply_agent_decision(
                 f"{decision.reply_markdown}\n\n已识别到可自动执行的低风险动作，但当前意图还不够明确；我已改为待确认计划。"
             ).strip()
             proposed_actions = [*auto_execute_actions, *proposed_actions]
+            secure_input_action = _extract_secure_input_action(proposed_actions)
             auto_execute_actions = []
-            needs_confirmation = bool(proposed_actions)
+            needs_confirmation = bool(proposed_actions and not secure_input_action)
         else:
             decision.reply_markdown = (
                 f"{decision.reply_markdown}\n\n当前账号不是管理员，不能自动执行低风险平台动作。"
             ).strip()
             auto_execute_actions = []
 
-    if not _normalize_role(user.role) == "admin" and proposed_actions:
+    if not _normalize_role(user.role) == "admin" and proposed_actions and not secure_input_action:
         decision.reply_markdown = (
             f"{decision.reply_markdown}\n\n当前账号为分析员，不能提交执行计划；如需落地请由管理员在相同上下文下确认。"
         ).strip()
@@ -6319,6 +6525,87 @@ def _apply_agent_decision(
             session.dialog_state_json["last_agent_question"] = message.content
             db.add(session)
         _sync_current_goal_state(db, session, latest_summary=message.content)
+        _emit_agent_state(stream_emitter, session, turn_id=turn_id)
+        return
+
+    if secure_input_action:
+        pending_secure_input = _build_pending_secure_input_from_action(
+            secure_input_action,
+            current_browser_runtime=current_browser_runtime,
+        )
+        _preserve_or_reset_pending_plan(
+            session,
+            existing_pending_plan=existing_pending_plan,
+            preserve_existing=False,
+        )
+        _clear_dialog_state(session)
+        _set_browser_runtime(
+            session,
+            phase="awaiting_secure_input",
+            browser_context=browser_context,
+            last_user_intent=user_content,
+            current_objective=decision.objective or current_objective.get("summary"),
+            objective_kind="configure_ssh_credential",
+            planned_steps=[
+                {
+                    "kind": "secure_input",
+                    "label": secure_input_action.get("title"),
+                    "asset_ids": pending_secure_input.get("asset_ids"),
+                }
+            ],
+            step_cursor=max(0, int(current_browser_runtime.get("step_cursor") or 0)),
+            pending_ui_actions=[],
+            pending_secure_input=pending_secure_input,
+            completed_ui_actions=[],
+            last_ui_results=[],
+            auto_executed_actions=auto_execute_results,
+            step_count=max(1, int(current_browser_runtime.get("step_count") or 0)),
+            clear_message_pending=message_request_id is not None,
+            last_message_request_id=message_request_id,
+            last_message_ack_at=message_request_ack_at,
+        )
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=resolved_focus,
+            execution={
+                "stage": "awaiting_secure_input",
+                "step_kind": "secure_input",
+                "step_label": "等待安全弹层提交 SSH 凭据",
+                "waiting_for": "请在专用弹层中填写密码、私钥或 sudo 密码",
+                "missing_slots": [],
+                "pending_ui_actions": [],
+            },
+            explanation={
+                "reason": planned_step.reason,
+                "decision_summary": decision_summary,
+                "expected_outcome": "通过安全弹层保存并验证 SSH 管理员凭据",
+                "next_step": "等待用户在安全弹层提交敏感信息",
+                "evidence": planned_step.evidence,
+            },
+            watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
+        )
+        assistant_payload = {
+            **base_assistant_payload,
+            "pending_secure_input": pending_secure_input,
+            **_build_message_state_metadata(
+                decision_summary=decision_summary,
+                evidence=planned_step.evidence,
+                state_delta=state_delta,
+            ),
+        }
+        message = _append_or_stream_assistant_message(
+            db,
+            session=session,
+            message_type="action_update",
+            content=rendered_content,
+            payload_json=assistant_payload,
+            user_content=user_content,
+            tool_traces=tool_traces,
+            working_context=final_working_context,
+            stream_emitter=stream_emitter,
+            turn_id=turn_id,
+        )
+        _sync_current_goal_state(db, session, status_override="blocked", blocked_reason="等待在安全弹层中完成 SSH 凭据配置", latest_summary=message.content)
         _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
@@ -7361,6 +7648,826 @@ def post_agent_message(
     return serialize_agent_session(session)
 
 
+def _normalize_result_payload_blockers(result_payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    payload = result_payload if isinstance(result_payload, dict) else {}
+    blockers: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str, str]] = set()
+
+    def _infer_blocker_code_from_message(message: str) -> str:
+        lowered_message = message.lower()
+        if ("ssh" in lowered_message and any(marker in message for marker in ("凭据", "私钥", "密码", "授权"))) or "未配置 ssh" in lowered_message:
+            return "missing_ssh_credential"
+        if "管理员授权" in message:
+            return "authorization_unconfirmed"
+        if "管理员权限验证" in message:
+            return "authorization_not_verified"
+        if "未验证到管理员权限" in message or "root/sudo" in lowered_message or "sudo 凭据" in message:
+            return "insufficient_privilege"
+        if "尚未安装" in message:
+            return "runner_not_installed"
+        if "正在安装中" in message:
+            return "runner_installing"
+        if "当前离线" in message:
+            return "runner_offline"
+        if "未解析到" in message:
+            return "missing_target"
+        if "白名单" in message:
+            return "action_not_allowed"
+        if "snapshot" in lowered_message or "深度检查结果" in message:
+            return "missing_snapshot"
+        return "unknown_blocker"
+
+    raw_blockers = payload.get("blockers") if isinstance(payload.get("blockers"), list) else []
+    for item in raw_blockers:
+        if not isinstance(item, dict):
+            continue
+        raw_message = sanitize_text(str(item.get("message") or item.get("blocker_message") or ""), max_length=280) or ""
+        raw_code = _sanitize_line(str(item.get("code") or item.get("blocker_code") or ""), max_length=64) or ""
+        normalized_code = raw_code
+        if not normalized_code or normalized_code == "unknown_blocker":
+            normalized_code = _infer_blocker_code_from_message(raw_message)
+        blocker = {
+            "code": normalized_code,
+            "message": raw_message,
+            "scope": _sanitize_line(str(item.get("scope") or ""), max_length=64) or None,
+            "blocking": _sanitize_line(str(item.get("blocking") or ""), max_length=32) or None,
+            "stage_code": _sanitize_line(str(item.get("stage_code") or ""), max_length=64) or None,
+            "step_id": _sanitize_line(str(item.get("step_id") or ""), max_length=64) or None,
+        }
+        if not blocker["message"]:
+            continue
+        signature = (
+            blocker["code"] or "",
+            blocker["message"] or "",
+            blocker["scope"] or "",
+            blocker["blocking"] or "",
+            blocker["stage_code"] or "",
+            blocker["step_id"] or "",
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        blockers.append(blocker)
+    if blockers:
+        return blockers
+
+    blocked_reasons = payload.get("blocked_reasons") if isinstance(payload.get("blocked_reasons"), list) else []
+    for raw_reason in blocked_reasons:
+        message = sanitize_text(str(raw_reason or ""), max_length=280) or ""
+        if not message:
+            continue
+        code = _infer_blocker_code_from_message(message)
+        signature = (code, message, "", "", "", "")
+        if signature in seen:
+            continue
+        seen.add(signature)
+        blockers.append(
+            {
+                "code": code,
+                "message": message,
+                "scope": None,
+                "blocking": None,
+                "stage_code": None,
+                "step_id": None,
+            }
+        )
+    return blockers
+
+
+def _has_ssh_credential_blockers(blockers: list[dict[str, Any]]) -> bool:
+    for item in blockers:
+        if not isinstance(item, dict):
+            continue
+        code = _sanitize_line(str(item.get("code") or item.get("blocker_code") or ""), max_length=64)
+        if code in SSH_CREDENTIAL_BLOCKER_CODES:
+            return True
+    return False
+
+
+def _format_blocker_summary(blockers: list[dict[str, Any]], *, max_items: int = 3) -> str:
+    messages: list[str] = []
+    for item in blockers:
+        if not isinstance(item, dict):
+            continue
+        message = sanitize_text(str(item.get("message") or item.get("blocker_message") or ""), max_length=280) or ""
+        if message and message not in messages:
+            messages.append(message)
+        if len(messages) >= max_items:
+            break
+    return "；".join(messages)
+
+
+def _remediation_resume_action_from_payload(result_payload: dict[str, Any], *, asset_id: str) -> dict[str, Any]:
+    session_id = _sanitize_line(str(result_payload.get("session_id") or ""), max_length=64) or None
+    title = f"为资产 {asset_id} 继续准备修复会话"
+    if session_id:
+        title = f"继续修复会话 {session_id}"
+    return {
+        "action_type": "create_or_resume_remediation_session",
+        "title": title,
+        "reason": "SSH 凭据验证成功后，继续原自动修复目标。",
+        "params": {"asset_id": asset_id, "submit_if_ready": True},
+    }
+
+
+def transition_session_to_remediation_secure_input(
+    db: Session,
+    *,
+    session_id: str,
+    task_id: str,
+    action: dict[str, Any],
+    result_payload: dict[str, Any],
+    content: str | None = None,
+) -> None:
+    session = db.get(AgentSession, session_id)
+    if session is None:
+        return
+    blocker_items = _normalize_result_payload_blockers(result_payload)
+    blocker_summary = _format_blocker_summary(blocker_items, max_items=4)
+    remaining_blockers = [
+        item
+        for item in blocker_items
+        if _sanitize_line(str(item.get("code") or ""), max_length=64) not in SSH_CREDENTIAL_BLOCKER_CODES
+    ]
+    asset_id = _sanitize_line(
+        str(
+            result_payload.get("asset_id")
+            or (action.get("params") if isinstance(action.get("params"), dict) else {}).get("asset_id")
+            or ""
+        ),
+        max_length=64,
+    ) or ""
+    if not asset_id:
+        return
+    current_browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    browser_context = _normalize_browser_context(
+        current_browser_runtime.get("last_browser_context")
+        if isinstance(current_browser_runtime.get("last_browser_context"), dict)
+        else session.route_context_json if isinstance(session.route_context_json, dict) else {}
+    )
+    browser_context["asset_id"] = browser_context.get("asset_id") or asset_id
+    page_context = _page_context_from_browser_context(browser_context)
+    browser_target = _build_working_context_from_page_context(page_context, source="secure_input_resume")
+    if _has_object_target(browser_target):
+        session.working_context_json = _merge_soft_focus_context(
+            session.working_context_json if isinstance(session.working_context_json, dict) else {},
+            browser_target,
+        )
+    resume_action = _remediation_resume_action_from_payload(result_payload, asset_id=asset_id)
+    pending_secure_input = _normalize_pending_secure_input(
+        {
+            "kind": "ssh_credential",
+            "mode": "single_asset",
+            "asset_id": asset_id,
+            "asset_ids": [asset_id],
+            "asset_labels": [f"资产 {asset_id}"],
+            "resume_goal_id": _sanitize_line(str(getattr(session, "current_goal_id", None) or ""), max_length=64) or None,
+            "resume_action": resume_action,
+            "auto_verify": True,
+            "auto_resume": True,
+            "blocker_summary": blocker_summary or "当前自动修复仍缺少 SSH 管理员凭据",
+        }
+    )
+    content_text = sanitize_text(content, max_length=4000) or (
+        f"当前自动修复先被 SSH 凭据阻塞，我已为资产 {asset_id} 打开 SSH 凭据安全配置弹层。"
+        "保存并验证 SSH 后，我会自动续接当前修复目标。"
+    )
+    if remaining_blockers:
+        extra_summary = _format_blocker_summary(remaining_blockers, max_items=3)
+        if extra_summary:
+            content_text = (
+                f"{content_text}\n\n"
+                f"即使 SSH 已补齐，后续仍可能继续受这些条件影响：{extra_summary}。"
+            )
+    session.status = "active"
+    session.pending_plan_json = {}
+    _clear_dialog_state(session)
+    _set_browser_runtime(
+        session,
+        phase="awaiting_secure_input",
+        browser_context=browser_context,
+        last_user_intent=sanitize_text(str(current_browser_runtime.get("last_user_intent") or ""), max_length=240) or "自动修复",
+        current_objective=sanitize_text(str(current_browser_runtime.get("current_objective") or ""), max_length=240) or f"为资产 {asset_id} 配置 SSH 凭据",
+        objective_kind="configure_ssh_credential",
+        planned_steps=[
+            {
+                "kind": "secure_input",
+                "label": "配置 SSH 管理员凭据",
+                "asset_ids": pending_secure_input.get("asset_ids"),
+            }
+        ],
+        step_cursor=0,
+        pending_ui_actions=[],
+        pending_secure_input=pending_secure_input,
+        completed_ui_actions=[],
+        last_ui_results=[],
+        auto_executed_actions=[],
+        step_count=1,
+        last_message_request_id=_normalize_client_message_id(current_browser_runtime.get("last_message_request_id")),
+        last_message_ack_at=_parse_runtime_timestamp(current_browser_runtime.get("last_message_ack_at")),
+    )
+    session.last_task_id = task_id
+    state_delta = _apply_agent_state_patch(
+        session,
+        focus=_resolve_agent_focus(
+            page_context=page_context,
+            browser_context=browser_context,
+            working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
+            fallback_watch_task_id=task_id,
+        ),
+        execution={
+            "stage": "awaiting_secure_input",
+            "step_kind": "secure_input",
+            "step_label": "等待 SSH 凭据安全输入",
+            "waiting_for": "请先在安全弹层中填写 SSH 密码、私钥或 sudo 密码",
+            "missing_slots": [],
+            "pending_ui_actions": [],
+        },
+        explanation={
+            "reason": "当前自动修复先被 SSH 凭据阻塞，需先完成安全输入与管理员权限验证",
+            "decision_summary": content_text,
+            "expected_outcome": "通过安全弹层保存并验证 SSH 管理员凭据",
+            "next_step": "保存并验证 SSH 后自动续接修复；若仍缺 Runner 或其他条件，会继续明确提示",
+            "evidence": blocker_items[:4],
+        },
+        watch={
+            "primary_task_id": task_id,
+            "related_task_ids": [task_id] if task_id else [],
+            "status": TaskExecutionStatus.SUCCESS.value,
+            "watching": False,
+            "last_task_message": content_text,
+        },
+    )
+    message = _append_message(
+        db,
+        session=session,
+        role="assistant",
+        message_type="action_update",
+        content=content_text,
+        payload_json={
+            "task_id": task_id,
+            "action": sanitize_json_value(action),
+            "result_payload": sanitize_json_value(result_payload),
+            "pending_secure_input": pending_secure_input,
+            **_build_message_state_metadata(
+                decision_summary=content_text,
+                evidence=blocker_items[:4],
+                state_delta=state_delta,
+            ),
+        },
+    )
+    _sync_current_goal_state(
+        db,
+        session,
+        status_override="blocked",
+        blocked_reason="等待在安全弹层中完成 SSH 凭据配置",
+        latest_summary=message.content,
+        goal_blockers=blocker_items,
+    )
+
+
+def append_blocked_action_result_message(
+    db: Session,
+    *,
+    session_id: str,
+    task_id: str,
+    action: dict[str, Any],
+    result_payload: dict[str, Any],
+    content: str,
+    blocked_reason: str | None = None,
+) -> None:
+    session = db.get(AgentSession, session_id)
+    if session is None:
+        return
+    blocker_items = _normalize_result_payload_blockers(result_payload)
+    current_browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    browser_context = _normalize_browser_context(
+        current_browser_runtime.get("last_browser_context")
+        if isinstance(current_browser_runtime.get("last_browser_context"), dict)
+        else session.route_context_json if isinstance(session.route_context_json, dict) else {}
+    )
+    session.status = "active"
+    session.pending_plan_json = {}
+    _clear_dialog_state(session)
+    _clear_browser_runtime(
+        session,
+        browser_context=browser_context,
+        last_user_intent=sanitize_text(str(current_browser_runtime.get("last_user_intent") or ""), max_length=240) or None,
+        current_objective=sanitize_text(str(current_browser_runtime.get("current_objective") or ""), max_length=240) or None,
+        objective_kind=sanitize_text(str(current_browser_runtime.get("objective_kind") or ""), max_length=64, single_line=True) or None,
+        auto_executed_actions=[],
+        last_message_request_id=_normalize_client_message_id(current_browser_runtime.get("last_message_request_id")),
+        last_message_ack_at=_parse_runtime_timestamp(current_browser_runtime.get("last_message_ack_at")),
+        last_step_request_id=_normalize_step_request_id(current_browser_runtime.get("last_step_request_id")),
+        last_step_ack_at=_parse_runtime_timestamp(current_browser_runtime.get("last_step_ack_at")),
+    )
+    session.last_task_id = task_id
+    blocked_summary = sanitize_text(blocked_reason, max_length=500) or _format_blocker_summary(blocker_items, max_items=4) or sanitize_text(content, max_length=500) or "当前目标存在阻塞"
+    state_delta = _apply_agent_state_patch(
+        session,
+        focus=_resolve_agent_focus(
+            browser_context=browser_context,
+            working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
+            fallback_watch_task_id=task_id,
+        ),
+        execution={
+            "stage": "blocked",
+            "step_kind": _sanitize_line(str(action.get("action_type") or "action"), max_length=64) or "action",
+            "step_label": "当前目标受阻，等待补齐前置条件",
+            "waiting_for": "请先补齐阻塞条件后继续",
+            "missing_slots": [],
+            "pending_ui_actions": [],
+        },
+        explanation={
+            "reason": "当前动作已执行到阻塞判断，但前置条件尚未闭合",
+            "decision_summary": sanitize_text(content, max_length=280) or blocked_summary,
+            "expected_outcome": "明确当前阻塞并等待补齐条件",
+            "next_step": "补齐阻塞条件后再继续自动修复，或进入修复工作台查看详情",
+            "evidence": blocker_items[:4],
+        },
+        watch={
+            "primary_task_id": task_id,
+            "related_task_ids": [task_id] if task_id else [],
+            "status": TaskExecutionStatus.SUCCESS.value,
+            "watching": False,
+            "last_task_message": sanitize_text(content, max_length=280) or blocked_summary,
+        },
+    )
+    message = _append_message(
+        db,
+        session=session,
+        role="assistant",
+        message_type="action_update",
+        content=sanitize_text(content, max_length=4000) or blocked_summary,
+        payload_json={
+            "task_id": task_id,
+            "action": sanitize_json_value(action),
+            "result_payload": sanitize_json_value(result_payload),
+            **_build_message_state_metadata(
+                decision_summary=sanitize_text(content, max_length=280) or blocked_summary,
+                evidence=blocker_items[:4],
+                state_delta=state_delta,
+            ),
+        },
+    )
+    _sync_current_goal_state(
+        db,
+        session,
+        status_override="blocked",
+        blocked_reason=blocked_summary,
+        latest_summary=message.content,
+        goal_blockers=blocker_items,
+    )
+
+
+def _secure_input_result_details(ui_action_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for item in ui_action_results:
+        if not isinstance(item, dict):
+            continue
+        detail_json = item.get("detail_json") if isinstance(item.get("detail_json"), dict) else {}
+        kind = _sanitize_line(str(detail_json.get("kind") or ""), max_length=64)
+        if kind in {"ssh_credential_single", "ssh_credential_batch", "ssh_credential_cancel"}:
+            details.append(sanitize_json_value(detail_json))
+    return details
+
+
+def _expand_secure_resume_actions(pending_secure_input: dict[str, Any], *, success_asset_ids: list[str]) -> list[dict[str, Any]]:
+    resume_action = pending_secure_input.get("resume_action") if isinstance(pending_secure_input.get("resume_action"), dict) else {}
+    action_type = _sanitize_line(str(resume_action.get("action_type") or ""), max_length=64)
+    if action_type not in SUPPORTED_WRITE_ACTIONS or action_type == "configure_ssh_credential":
+        return []
+    params = resume_action.get("params") if isinstance(resume_action.get("params"), dict) else {}
+    if not success_asset_ids:
+        return []
+    if action_type not in {"verify_asset_risks", "install_runner", "create_or_resume_remediation_session"}:
+        return [
+            {
+                "action_type": action_type,
+                "title": sanitize_text(str(resume_action.get("title") or action_type), max_length=120) or action_type,
+                "reason": sanitize_text(str(resume_action.get("reason") or ""), max_length=240) or "",
+                "params": sanitize_json_value(params),
+            }
+        ]
+
+    actions: list[dict[str, Any]] = []
+    for asset_id in success_asset_ids:
+        cloned_params = sanitize_json_value({**params, "asset_id": asset_id})
+        actions.append(
+            {
+                "action_type": action_type,
+                "title": sanitize_text(str(resume_action.get("title") or action_type), max_length=120) or action_type,
+                "reason": sanitize_text(str(resume_action.get("reason") or ""), max_length=240) or "",
+                "params": cloned_params,
+            }
+        )
+    return actions
+
+
+def _build_secure_input_resume_hint(
+    pending_secure_input: dict[str, Any],
+    *,
+    success_asset_ids: list[str],
+    child_task_ids: list[str],
+) -> dict[str, Any]:
+    if child_task_ids:
+        return _normalize_resume_hint(
+            {
+                "kind": "task_detail",
+                "working_context": {
+                    "task_id": child_task_ids[0],
+                    "source": "secure_input_resume",
+                },
+                "preferred_read_tools": [{"tool_name": "get_task_detail", "arguments": {"task_id": child_task_ids[0]}}],
+                "suggested_reply_label": "查看任务详情",
+            }
+        )
+
+    if success_asset_ids:
+        return _normalize_resume_hint(
+            {
+                "kind": "post_verify_analysis",
+                "working_context": {
+                    "asset_id": success_asset_ids[0],
+                    "source": "secure_input_resume",
+                },
+                "suggested_reply_label": "继续当前目标",
+            }
+        )
+    return {}
+
+
+def _collect_blocked_resume_results(
+    resume_results: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+    blocked_results: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    seen_blockers: set[tuple[str, str, str, str, str, str]] = set()
+
+    for item in resume_results:
+        if not isinstance(item, dict):
+            continue
+        if _sanitize_line(str(item.get("action_type") or ""), max_length=64) != "create_or_resume_remediation_session":
+            continue
+        if _sanitize_line(str(item.get("child_task_id") or ""), max_length=64):
+            continue
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        if payload.get("execution_ready") is not False:
+            continue
+        normalized_blockers = _normalize_result_payload_blockers(payload)
+        blocked_results.append(
+            {
+                "asset_id": _sanitize_line(
+                    str(
+                        payload.get("asset_id")
+                        or (item.get("params") if isinstance(item.get("params"), dict) else {}).get("asset_id")
+                        or ""
+                    ),
+                    max_length=64,
+                )
+                or None,
+                "summary": sanitize_text(str(item.get("summary") or ""), max_length=280) or None,
+                "blockers": normalized_blockers,
+            }
+        )
+        for blocker in normalized_blockers:
+            signature = (
+                _sanitize_line(str(blocker.get("code") or ""), max_length=64) or "",
+                sanitize_text(str(blocker.get("message") or ""), max_length=280) or "",
+                _sanitize_line(str(blocker.get("scope") or ""), max_length=64) or "",
+                _sanitize_line(str(blocker.get("blocking") or ""), max_length=32) or "",
+                _sanitize_line(str(blocker.get("stage_code") or ""), max_length=64) or "",
+                _sanitize_line(str(blocker.get("step_id") or ""), max_length=64) or "",
+            )
+            if signature in seen_blockers:
+                continue
+            seen_blockers.add(signature)
+            blockers.append(blocker)
+
+    blocker_summary = _format_blocker_summary(blockers, max_items=4) or None
+    return blocked_results, blockers, blocker_summary
+
+
+def _handle_secure_input_step(
+    db: Session,
+    *,
+    session: AgentSession,
+    user: User,
+    browser_context: dict[str, Any],
+    current_browser_runtime: dict[str, Any],
+    ui_action_results: list[dict[str, Any]],
+    platform_url: str,
+    step_request_id: str | None = None,
+    stream_emitter: _AgentStreamEmitter | None = None,
+    turn_id: str | None = None,
+) -> AgentSessionRead | None:
+    pending_secure_input = (
+        current_browser_runtime.get("pending_secure_input")
+        if isinstance(current_browser_runtime.get("pending_secure_input"), dict)
+        else {}
+    )
+    if not pending_secure_input:
+        return None
+
+    detail_items = _secure_input_result_details(ui_action_results)
+    if not detail_items:
+        return None
+
+    accepted_at = _now()
+    details = detail_items[0]
+    kind = _sanitize_line(str(details.get("kind") or ""), max_length=64)
+    last_user_intent = sanitize_text(str(current_browser_runtime.get("last_user_intent") or ""), max_length=240) or "配置 SSH 凭据"
+    browser_target = _build_working_context_from_page_context(_page_context_from_browser_context(browser_context), source="secure_input")
+    if _has_object_target(browser_target):
+        session.working_context_json = _merge_soft_focus_context(
+            session.working_context_json if isinstance(session.working_context_json, dict) else {},
+            browser_target,
+        )
+
+    if kind == "ssh_credential_cancel":
+        _clear_browser_runtime(
+            session,
+            browser_context=browser_context,
+            last_user_intent=last_user_intent,
+            current_objective=sanitize_text(str(current_browser_runtime.get("current_objective") or ""), max_length=240) or None,
+            objective_kind=sanitize_text(str(current_browser_runtime.get("objective_kind") or ""), max_length=64, single_line=True) or None,
+            auto_executed_actions=current_browser_runtime.get("auto_executed_actions")
+            if isinstance(current_browser_runtime.get("auto_executed_actions"), list)
+            else [],
+            last_step_request_id=step_request_id,
+            last_step_ack_at=accepted_at,
+        )
+        session.status = "active"
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                browser_context=browser_context,
+                working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
+                fallback_watch_task_id=_session_last_task_id(session),
+            ),
+            execution={"stage": "completed", "step_kind": "secure_input", "step_label": "已取消 SSH 凭据配置", "waiting_for": None, "missing_slots": [], "pending_ui_actions": []},
+            explanation={
+                "reason": "用户取消了 SSH 凭据安全输入流程",
+                "decision_summary": "已取消 SSH 凭据配置",
+                "expected_outcome": "解除输入锁定并返回聊天上下文",
+                "next_step": "等待新的输入",
+                "evidence": [],
+            },
+            watch={"primary_task_id": _session_last_task_id(session), "watching": bool(_session_last_task_id(session))},
+        )
+        message = _append_message(
+            db,
+            session=session,
+            role="assistant",
+            message_type="action_update",
+            content="已取消 SSH 凭据配置。你可以稍后重新发起，或继续处理别的目标。",
+            payload_json={
+                "secure_input_result": {"kind": kind, "canceled": True},
+                **_build_message_state_metadata(
+                    decision_summary="已取消 SSH 凭据配置",
+                    evidence=[],
+                    state_delta=state_delta,
+                ),
+            },
+        )
+        _sync_current_goal_state(db, session, status_override="blocked", blocked_reason="用户已取消 SSH 凭据配置", latest_summary=message.content)
+        db.commit()
+        db.refresh(session)
+        _emit_session_snapshot(stream_emitter, session)
+        return serialize_agent_session(session)
+
+    result_items: list[dict[str, Any]] = []
+    if kind == "ssh_credential_single":
+        result_items = [
+            {
+                "asset_id": _sanitize_line(str(details.get("asset_id") or ""), max_length=64) or None,
+                "saved": bool(details.get("saved")),
+                "verified": bool(details.get("verified")),
+                "effective_privilege": _sanitize_line(str(details.get("effective_privilege") or ""), max_length=32) or None,
+                "error_summary": sanitize_text(str(details.get("error_summary") or ""), max_length=220) or None,
+                "auth_type": _sanitize_line(str(details.get("auth_type") or ""), max_length=16) or None,
+                "username": sanitize_text(str(details.get("username") or ""), max_length=128, single_line=True) or None,
+            }
+        ]
+    elif kind == "ssh_credential_batch":
+        raw_results = details.get("results") if isinstance(details.get("results"), list) else []
+        for item in raw_results[:32]:
+            if not isinstance(item, dict):
+                continue
+            result_items.append(
+                {
+                    "asset_id": _sanitize_line(str(item.get("asset_id") or ""), max_length=64) or None,
+                    "saved": bool(item.get("saved")),
+                    "verified": bool(item.get("verified")),
+                    "effective_privilege": _sanitize_line(str(item.get("effective_privilege") or ""), max_length=32) or None,
+                    "error_summary": sanitize_text(str(item.get("error_summary") or ""), max_length=220) or None,
+                }
+            )
+
+    success_asset_ids = [
+        str(item.get("asset_id"))
+        for item in result_items
+        if item.get("asset_id") and item.get("verified") is True
+    ]
+    failed_items = [item for item in result_items if item.get("verified") is not True]
+    child_task_ids: list[str] = []
+    resume_results: list[dict[str, Any]] = []
+    if success_asset_ids and pending_secure_input.get("auto_resume") is not False:
+        resume_goal_id = _sanitize_line(str(pending_secure_input.get("resume_goal_id") or ""), max_length=64)
+        if resume_goal_id:
+            try:
+                resume_agent_goal_binding(db, user=user, session=session, goal_id=resume_goal_id)
+            except Exception:
+                pass
+        resume_actions = _expand_secure_resume_actions(pending_secure_input, success_asset_ids=success_asset_ids)
+        if resume_actions:
+            resume_results = _execute_auto_actions(
+                db,
+                session=session,
+                user=user,
+                actions=resume_actions,
+                browser_context=browser_context,
+                platform_url=platform_url,
+            )
+            child_task_ids = [
+                _sanitize_line(str(item.get("child_task_id") or ""), max_length=64)
+                for item in resume_results
+                if isinstance(item, dict)
+            ]
+            child_task_ids = [item for item in child_task_ids if item]
+
+    blocked_resume_results, blocked_resume_blockers, blocked_resume_summary = _collect_blocked_resume_results(resume_results)
+    blocked_resume_count = len(blocked_resume_results)
+    auto_resumed_count = len(child_task_ids)
+
+    failure_lines = [
+        f"{item.get('asset_id') or '目标资产'}：{item.get('error_summary') or '未通过管理员权限验证'}"
+        for item in failed_items[:6]
+    ]
+    if kind == "ssh_credential_batch":
+        content_lines = [
+            f"SSH 凭据批量处理完成：共 {len(result_items)} 台，成功 {len(success_asset_ids)} 台，失败 {len(failed_items)} 台。",
+        ]
+        if auto_resumed_count:
+            content_lines.append(f"已自动续接 {auto_resumed_count} 台资产的原目标。")
+        if blocked_resume_count:
+            blocked_intro = f"另有 {blocked_resume_count} 台资产在补齐 SSH 后，原修复目标仍未继续执行"
+            if blocked_resume_summary:
+                content_lines.append(f"{blocked_intro}：{blocked_resume_summary}。")
+            else:
+                content_lines.append(f"{blocked_intro}。")
+        if failure_lines:
+            content_lines.append("失败资产：")
+            content_lines.extend(f"- {line}" for line in failure_lines)
+        content = "\n".join(content_lines)
+    else:
+        asset_id = success_asset_ids[0] if success_asset_ids else _sanitize_line(str(details.get("asset_id") or ""), max_length=64) or "目标资产"
+        if success_asset_ids:
+            if blocked_resume_count:
+                content = f"资产 {asset_id} 的 SSH 凭据已保存并验证成功，但修复暂未继续执行。"
+                if blocked_resume_summary:
+                    content = f"{content} 剩余阻塞：{blocked_resume_summary}。"
+                else:
+                    content = f"{content} 仍有其他前置条件未满足。"
+            elif auto_resumed_count:
+                content = f"资产 {asset_id} 的 SSH 凭据已保存并验证成功。 我已自动续接原目标。"
+            else:
+                content = f"资产 {asset_id} 的 SSH 凭据已保存并验证成功。你现在可以继续执行需要管理员 SSH 的操作。"
+        else:
+            failure_summary = failure_lines[0] if failure_lines else (sanitize_text(str(details.get("error_summary") or ""), max_length=220) or "未通过管理员权限验证")
+            content = f"资产 {asset_id} 的 SSH 凭据已保存，但未验证成功：{failure_summary}"
+
+    _clear_browser_runtime(
+        session,
+        browser_context=browser_context,
+        last_user_intent=last_user_intent,
+        current_objective=sanitize_text(str(current_browser_runtime.get("current_objective") or ""), max_length=240) or None,
+        objective_kind=sanitize_text(str(current_browser_runtime.get("objective_kind") or ""), max_length=64, single_line=True) or None,
+        auto_executed_actions=resume_results,
+        last_step_request_id=step_request_id,
+        last_step_ack_at=accepted_at,
+    )
+    if child_task_ids:
+        session.status = "running"
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                browser_context=browser_context,
+                working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
+                fallback_watch_task_id=child_task_ids[0],
+            ),
+            execution={"stage": "watching_task", "step_kind": "secure_input", "step_label": "凭据验证成功，已续接原目标", "waiting_for": "等待后台任务完成", "missing_slots": [], "pending_ui_actions": []},
+            explanation={
+                "reason": "SSH 凭据验证成功后，已恢复原阻塞目标",
+                "decision_summary": content,
+                "expected_outcome": "等待恢复后的任务完成并自动回传结果",
+                "next_step": "任务完成后自动追加结论消息",
+                "evidence": [],
+            },
+            watch={"primary_task_id": child_task_ids[0], "related_task_ids": child_task_ids, "status": "running", "watching": True},
+        )
+        goal_status_override = "active"
+        blocked_reason = None
+        goal_blockers = None
+    elif blocked_resume_count:
+        session.status = "active"
+        blocked_reason = blocked_resume_summary or "SSH 凭据已验证，但修复暂未继续执行"
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                browser_context=browser_context,
+                working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
+                fallback_watch_task_id=_session_last_task_id(session),
+            ),
+            execution={
+                "stage": "blocked",
+                "step_kind": "secure_input",
+                "step_label": "SSH 已验证，等待补齐剩余修复条件",
+                "waiting_for": "请先补齐 Runner、包管理器识别或其他修复前置条件",
+                "missing_slots": [],
+                "pending_ui_actions": [],
+            },
+            explanation={
+                "reason": "SSH 凭据验证成功，但恢复原修复目标时仍存在剩余阻塞",
+                "decision_summary": content,
+                "expected_outcome": "明确剩余阻塞并等待补齐条件后继续修复",
+                "next_step": "补齐剩余阻塞条件后继续修复，或进入修复工作台查看详情",
+                "evidence": blocked_resume_blockers[:4],
+            },
+            watch={"primary_task_id": _session_last_task_id(session), "watching": False},
+        )
+        goal_status_override = "blocked"
+        goal_blockers = blocked_resume_blockers
+    else:
+        session.status = "active"
+        state_delta = _apply_agent_state_patch(
+            session,
+            focus=_resolve_agent_focus(
+                browser_context=browser_context,
+                working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
+                fallback_watch_task_id=_session_last_task_id(session),
+            ),
+            execution={"stage": "completed", "step_kind": "secure_input", "step_label": "SSH 凭据流程已完成", "waiting_for": None, "missing_slots": [], "pending_ui_actions": []},
+            explanation={
+                "reason": "SSH 凭据流程已完成",
+                "decision_summary": content,
+                "expected_outcome": "返回普通聊天或等待新的目标",
+                "next_step": "继续追问或发起新的操作",
+                "evidence": [],
+            },
+            watch={"primary_task_id": _session_last_task_id(session), "watching": False},
+        )
+        goal_status_override = "active" if success_asset_ids else "blocked"
+        blocked_reason = None if success_asset_ids else "SSH 凭据尚未验证成功"
+        goal_blockers = None
+
+    resume_hint = _build_secure_input_resume_hint(
+        pending_secure_input,
+        success_asset_ids=success_asset_ids,
+        child_task_ids=child_task_ids,
+    )
+    message = _append_message(
+        db,
+        session=session,
+        role="assistant",
+        message_type="action_update",
+        content=content,
+        payload_json={
+            "secure_input_result": {
+                "kind": kind,
+                "results": result_items,
+                "success_asset_ids": success_asset_ids,
+                "failure_count": len(failed_items),
+                "auto_resumed_count": auto_resumed_count,
+                "blocked_resume_count": blocked_resume_count,
+            },
+            "auto_executed_actions": resume_results,
+            "resume_hint": resume_hint,
+            **_build_message_state_metadata(
+                decision_summary=content,
+                evidence=[],
+                state_delta=state_delta,
+            ),
+        },
+    )
+    _sync_current_goal_state(
+        db,
+        session,
+        status_override=goal_status_override,
+        blocked_reason=blocked_reason,
+        latest_summary=message.content,
+        goal_blockers=goal_blockers,
+    )
+    db.commit()
+    db.refresh(session)
+    _emit_session_snapshot(stream_emitter, session)
+    return serialize_agent_session(session)
+
+
 def post_agent_step(
     db: Session,
     *,
@@ -7407,6 +8514,23 @@ def post_agent_step(
     ui_action_results = _normalize_ui_action_results(
         [item.model_dump(mode="json") for item in payload.ui_action_results]
     )
+
+    secure_step_result = _handle_secure_input_step(
+        db,
+        session=session,
+        user=user,
+        browser_context=browser_context,
+        current_browser_runtime=current_browser_runtime,
+        ui_action_results=ui_action_results,
+        platform_url=platform_url,
+        step_request_id=step_request_id,
+        stream_emitter=stream_emitter,
+        turn_id=turn_id,
+    )
+    if secure_step_result is not None:
+        return secure_step_result
+    if isinstance(current_browser_runtime.get("pending_secure_input"), dict) and current_browser_runtime.get("pending_secure_input"):
+        return serialize_agent_session(session)
 
     if not pending_ui_actions:
         _clear_browser_runtime(

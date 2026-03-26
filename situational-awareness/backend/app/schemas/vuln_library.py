@@ -104,6 +104,25 @@ class VulnRuleUpdate(VulnRuleBase):
     pass
 
 
+class VulnIntelSummaryRead(BaseModel):
+    cve_count: int
+    max_cvss: float | None = None
+    max_epss: float | None = None
+    kev_flag: bool
+    exploit_maturity: str | None = None
+    intel_synced_at: datetime | None = None
+    stale: bool = False
+
+
+class VulnRuleGovernanceRead(BaseModel):
+    owner_id: str | None = None
+    review_status: str
+    change_ticket: str | None = None
+    last_validated_at: datetime | None = None
+    last_preview_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class VulnRuleRead(ORMModel):
     id: str
     name: str
@@ -125,6 +144,9 @@ class VulnRuleRead(ORMModel):
     active_check: VulnRuleActiveCheck | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    intel_summary: VulnIntelSummaryRead = Field(default_factory=lambda: VulnIntelSummaryRead(cve_count=0, kev_flag=False))
+    governance: VulnRuleGovernanceRead = Field(default_factory=lambda: VulnRuleGovernanceRead(review_status="published"))
+    affected_open_finding_count: int = 0
 
 
 class VulnRuleListResponse(BaseModel):
@@ -138,6 +160,8 @@ class RuleEngineStatusRead(BaseModel):
     source_mtime: float | None
     rule_count: int
     last_error: str | None
+    schema_ready: bool
+    schema_error: str | None
     indexed_rule_count: int
     index_synced_at: datetime | None
     index_in_sync: bool
@@ -147,6 +171,23 @@ class RuleEngineStatusRead(BaseModel):
 class VulnRuleImportErrorRead(BaseModel):
     rule_id: str | None
     message: str
+
+
+class RuleImportImpactChangeRead(BaseModel):
+    rule_id: str
+    operation: str
+    changed_fields: list[str] = Field(default_factory=list)
+    high_risk_flags: list[str] = Field(default_factory=list)
+    affected_open_findings: int = 0
+
+
+class RuleImportImpactPreviewRead(BaseModel):
+    created_rule_ids: list[str] = Field(default_factory=list)
+    updated_rule_ids: list[str] = Field(default_factory=list)
+    skipped_rule_ids: list[str] = Field(default_factory=list)
+    total_affected_open_findings: int = 0
+    high_risk_rule_ids: list[str] = Field(default_factory=list)
+    changes: list[RuleImportImpactChangeRead] = Field(default_factory=list)
 
 
 class VulnRuleImportResponse(BaseModel):
@@ -162,6 +203,18 @@ class VulnRuleImportResponse(BaseModel):
     updated_ids: list[str]
     skipped_ids: list[str]
     errors: list[VulnRuleImportErrorRead]
+    impact_preview: RuleImportImpactPreviewRead | None = None
+
+
+class VulnIntelStatusRead(BaseModel):
+    total_cves: int
+    tracked_rule_cves: int
+    synced_cves: int
+    stale: bool
+    stale_count: int
+    last_synced_at: datetime | None = None
+    sources: list[str] = Field(default_factory=list)
+    updated_cves: int = 0
 
 
 class VulnRuleBatchStatusRequest(BaseModel):

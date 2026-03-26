@@ -2,7 +2,7 @@
 
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Badge, Button, Input, message } from "antd";
+import { Alert, Badge, Button, Checkbox, Input, Modal, Radio, message } from "antd";
 
 import { getStoredToken, type StoredUserRole } from "@/lib/auth";
 import { collectBrowserContext, executeUIActions } from "@/lib/haor-browser-runtime";
@@ -19,6 +19,9 @@ import {
   postHaorStep,
   recoverHaorSession,
   resetHaorSession,
+  setAssetCredential,
+  setAssetCredentialBatch,
+  verifyAssetCredential,
 } from "@/services/api";
 import type {
   AgentActionUpdateEvent,
@@ -27,6 +30,7 @@ import type {
   AgentErrorEvent,
   AgentGoal,
   AgentMessage,
+  AgentPendingSecureInput,
   AgentPageContext,
   AgentPlanPendingEvent,
   AgentProposedAction,
@@ -42,6 +46,11 @@ import type {
   AgentUIActionResult,
   AgentUIActionsRequestedEvent,
 } from "@/types/agent";
+import type {
+  AssetCredentialBatchResult,
+  AssetCredentialUpsertRequest,
+  CredentialAuthType,
+} from "@/types/collection";
 import type { TaskEvent, TaskRunDetail } from "@/types/task";
 
 type HaorAgentDrawerProps = {
@@ -117,6 +126,14 @@ type GoalProgressSummary = {
   watch_task_id?: string;
 };
 
+type SecureInputResultItem = {
+  asset_id: string;
+  saved: boolean;
+  verified: boolean;
+  effective_privilege?: string | null;
+  error_summary?: string | null;
+};
+
 const MESSAGE_TURN_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_FAIL_OPEN_TEXT = "上次页面动作未收到继续结果，已结束等待。你可以继续提问、重试，或新开会话。";
@@ -147,6 +164,20 @@ const EMPTY_RUNTIME_SNAPSHOT: AgentRuntimeSnapshot = {
   recoverable_error: null,
   can_interrupt: false,
   can_resume: false,
+};
+
+const EMPTY_SECURE_INPUT: AgentPendingSecureInput = {
+  kind: "",
+  mode: "single_asset",
+  asset_ids: [],
+  asset_labels: [],
+  auth_type: null,
+  username: null,
+  resume_goal_id: null,
+  resume_action: null,
+  auto_verify: true,
+  auto_resume: true,
+  blocker_summary: null,
 };
 
 type ChatBubbleProps = {
@@ -320,6 +351,39 @@ function toRuntimeSnapshot(session: AgentSession | null): AgentRuntimeSnapshot {
 
 function toBrowserRuntime(session: AgentSession | null): Record<string, unknown> {
   return session?.browser_runtime_json && typeof session.browser_runtime_json === "object" ? session.browser_runtime_json : {};
+}
+
+function toPendingSecureInput(session: AgentSession | null): AgentPendingSecureInput {
+  const runtime = toBrowserRuntime(session);
+  const raw = runtime.pending_secure_input;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return EMPTY_SECURE_INPUT;
+  }
+  const record = raw as Record<string, unknown>;
+  const assetIds = Array.isArray(record.asset_ids)
+    ? record.asset_ids.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+  const assetLabels = Array.isArray(record.asset_labels)
+    ? record.asset_labels.filter((item): item is string => typeof item === "string")
+    : [];
+  return {
+    kind: typeof record.kind === "string" ? record.kind : "",
+    mode: typeof record.mode === "string" ? record.mode : (assetIds.length > 1 ? "batch_choice" : "single_asset"),
+    asset_ids: assetIds,
+    asset_labels: assetIds.map((assetId, index) => {
+      const label = assetLabels[index];
+      return label && label.trim() ? label.trim() : `资产 ${assetId}`;
+    }),
+    auth_type: typeof record.auth_type === "string" ? record.auth_type : null,
+    username: typeof record.username === "string" ? record.username : null,
+    resume_goal_id: typeof record.resume_goal_id === "string" ? record.resume_goal_id : null,
+    resume_action: record.resume_action && typeof record.resume_action === "object" && !Array.isArray(record.resume_action)
+      ? (record.resume_action as Record<string, unknown>)
+      : null,
+    auto_verify: record.auto_verify !== false,
+    auto_resume: record.auto_resume !== false,
+    blocker_summary: typeof record.blocker_summary === "string" ? record.blocker_summary : null,
+  };
 }
 
 function toAgentState(session: AgentSession | null): AgentState {
@@ -531,7 +595,17 @@ function planTargetLabel(action: AgentProposedAction): string | null {
 }
 
 function isMockSession(session: AgentSession | null): boolean {
-  return Boolean(session?.messages?.some((item) => Boolean(item.payload_json?.mock_mode)));
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const item = messages[index];
+    if (item?.role !== "assistant") {
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(item.payload_json || {}, "mock_mode")) {
+      return item.payload_json?.mock_mode === true;
+    }
+  }
+  return false;
 }
 
 function joinSections(parts: Array<string | null | undefined>) {
@@ -543,6 +617,66 @@ function createClientId() {
     return crypto.randomUUID();
   }
   return `haor-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function buildSecureStepBrowserContext(context: AgentPageContext): AgentBrowserContext {
+  if (typeof window === "undefined") {
+    return {
+      pathname: context.pathname,
+      query: context.query,
+      asset_id: context.asset_id || null,
+      finding_id: context.finding_id || null,
+      task_id: context.task_id || null,
+    };
+  }
+  return {
+    pathname: context.pathname,
+    origin: window.location.origin,
+    title: document.title || "",
+    query: context.query,
+    asset_id: context.asset_id || null,
+    finding_id: context.finding_id || null,
+    task_id: context.task_id || null,
+    selected_entities: [],
+    open_panels: [],
+    forms: [],
+    visible_actions: [],
+    semantic_page_context: {
+      page_kind: "secure_input",
+      summary: "haor ssh secure input",
+      primary_entity: context.asset_id ? { kind: "asset", id: context.asset_id } : {},
+      selected_rows: [],
+    },
+    semantic_actions: [],
+    semantic_forms: [],
+    summary_json: {
+      page_kind: "secure_input",
+      primary_entity: context.asset_id ? { kind: "asset", id: context.asset_id } : {},
+      selected_rows: [],
+      active_dialog: {},
+      has_modal_or_drawer: false,
+      summary: "haor ssh secure input",
+    },
+    dom_snapshot: [],
+  };
+}
+
+function buildCredentialPayload(
+  authType: CredentialAuthType,
+  username: string,
+  password: string,
+  privateKey: string,
+  sudoPassword: string,
+  adminAuthorized: boolean,
+): AssetCredentialUpsertRequest {
+  return {
+    auth_type: authType,
+    username: username.trim(),
+    password: authType === "password" ? password : undefined,
+    private_key: authType === "key" ? privateKey : undefined,
+    sudo_password: username.trim().toLowerCase() === "root" ? undefined : sudoPassword,
+    admin_authorized: adminAuthorized,
+  };
 }
 
 function messageClientMessageId(message: AgentMessage): string | null {
@@ -710,10 +844,22 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const [streamFeed, setStreamFeed] = useState<StreamFeedItem[]>([]);
   const [pendingUiRequest, setPendingUiRequest] = useState<{ turnId: string; uiActions: AgentUIAction[]; content?: string | null } | null>(null);
   const [sessionInitialized, setSessionInitialized] = useState(false);
+  const [secureSubmitting, setSecureSubmitting] = useState(false);
+  const [secureAuthType, setSecureAuthType] = useState<CredentialAuthType>("password");
+  const [secureUsername, setSecureUsername] = useState("");
+  const [securePassword, setSecurePassword] = useState("");
+  const [securePrivateKey, setSecurePrivateKey] = useState("");
+  const [secureSudoPassword, setSecureSudoPassword] = useState("");
+  const [secureAuthorized, setSecureAuthorized] = useState(false);
+  const [secureBatchMode, setSecureBatchMode] = useState<"same_credential_batch" | "per_asset_guided" | "">("");
+  const [secureGuidedIndex, setSecureGuidedIndex] = useState(0);
+  const [secureGuidedResults, setSecureGuidedResults] = useState<SecureInputResultItem[]>([]);
+  const [secureErrorText, setSecureErrorText] = useState<string | null>(null);
 
   const pageContext = useMemo(() => buildPageContext(pathname, searchParams), [pathname, searchParams]);
   const runtimeSnapshot = useMemo(() => toRuntimeSnapshot(session), [session]);
   const browserRuntime = useMemo(() => toBrowserRuntime(session), [session]);
+  const pendingSecureInput = useMemo(() => toPendingSecureInput(session), [session]);
   const agentState = useMemo(() => toAgentState(session), [session]);
   const sessionSummary = useMemo(() => deriveSessionSummary(session), [session]);
   const proposedActions = useMemo(() => toProposedActions(session), [session]);
@@ -741,7 +887,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const runningStateResolving = rawRunningSession && !confirmedRunningTask;
   const showInterrupt = runtimeSnapshot.can_interrupt;
   const hasAttention = open ? (session ? sessionSummary.has_attention : summary.has_attention) : summary.has_attention;
-  const composerLocked = runtimeInputLocked || sending || stepping || approving || interrupting || resetting;
+  const composerLocked = runtimeInputLocked || sending || approving || interrupting || resetting;
   const sendDisabled = composerLocked;
   const resetDisabled = resetting || interrupting;
   const approvalActionLabel = remediationAutoSubmitPlan ? "确认并自动修复" : "确认执行";
@@ -780,6 +926,14 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     : session?.updated_at
       ? formatDateTime(session.updated_at)
       : "等待新的会话更新";
+  const secureInputVisible = open && pendingSecureInput.kind === "ssh_credential" && pendingSecureInput.asset_ids.length > 0;
+  const secureAssetCount = pendingSecureInput.asset_ids.length;
+  const secureCurrentAssetId = secureInputVisible && secureBatchMode === "per_asset_guided"
+    ? pendingSecureInput.asset_ids[Math.min(secureGuidedIndex, Math.max(0, secureAssetCount - 1))]
+    : (pendingSecureInput.asset_ids[0] || "");
+  const secureCurrentAssetLabel = secureInputVisible && secureBatchMode === "per_asset_guided"
+    ? pendingSecureInput.asset_labels[Math.min(secureGuidedIndex, Math.max(0, secureAssetCount - 1))] || secureCurrentAssetId
+    : (pendingSecureInput.asset_labels[0] || secureCurrentAssetId);
 
   useEffect(() => {
     sessionRef.current = session;
@@ -803,6 +957,36 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   useEffect(() => {
     pendingUiRequestRef.current = pendingUiRequest;
   }, [pendingUiRequest]);
+
+  useEffect(() => {
+    if (!secureInputVisible) {
+      setSecureSubmitting(false);
+      setSecurePassword("");
+      setSecurePrivateKey("");
+      setSecureSudoPassword("");
+      setSecureGuidedIndex(0);
+      setSecureGuidedResults([]);
+      setSecureErrorText(null);
+      return;
+    }
+    setSecureSubmitting(false);
+    setSecureAuthType(pendingSecureInput.auth_type === "key" ? "key" : "password");
+    setSecureUsername(pendingSecureInput.username || "");
+    setSecureAuthorized(false);
+    setSecurePassword("");
+    setSecurePrivateKey("");
+    setSecureSudoPassword("");
+    setSecureBatchMode(
+      secureAssetCount <= 1
+        ? "same_credential_batch"
+        : pendingSecureInput.mode === "per_asset_guided" || pendingSecureInput.mode === "same_credential_batch"
+          ? pendingSecureInput.mode
+          : "",
+    );
+    setSecureGuidedIndex(0);
+    setSecureGuidedResults([]);
+    setSecureErrorText(null);
+  }, [secureInputVisible, pendingSecureInput, secureAssetCount]);
 
   useEffect(() => {
     if (!session) {
@@ -882,6 +1066,12 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
         tone: "muted" as const,
       };
     }
+    if (sessionPhase === "awaiting_secure_input") {
+      return {
+        text: "当前正在等待通过安全弹层填写 SSH 敏感信息。保存并验证 SSH 后，Haor 会自动续接原目标；若仍缺 Runner 或其他条件，也会继续明确提示。",
+        tone: "warning" as const,
+      };
+    }
     if (snapshotAwaitingMessage || sending) {
       return {
         text: "haor 正在处理上一轮消息，刷新后也会按当前会话快照继续恢复输入状态。",
@@ -946,6 +1136,8 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
           ? "haor 正在生成回复…"
           : snapshotUiInProgress || stepping
             ? "haor 正在继续处理当前请求…"
+            : sessionPhase === "awaiting_secure_input"
+              ? "请先在安全弹层中填写 SSH 敏感信息"
             : sessionPhase === "waiting_approval"
               ? "当前计划等待确认，输入暂时锁定"
               : sessionPhase === "recovering"
@@ -2151,6 +2343,275 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     }
   };
 
+  const applySecureStepResult = async (result: AgentSession) => {
+    setSession(result);
+    setSummary(deriveSessionSummary(result));
+    if (result.current_goal_id) {
+      await loadCurrentGoal(result.current_goal_id, true);
+    } else {
+      setCurrentGoal(null);
+    }
+    const watchTaskId = result.runtime_snapshot?.watch_task_id || result.last_task_id;
+    if (watchTaskId) {
+      await loadTask(watchTaskId, true);
+    } else {
+      setTask(null);
+      setTaskEvents([]);
+    }
+    setErrorText(null);
+    setStreamError(null);
+  };
+
+  const submitSecureStep = async (detailJson: Record<string, unknown>) => {
+    const result = await postHaorStep({
+      step_request_id: createClientId(),
+      browser_context: buildSecureStepBrowserContext(pageContext),
+      ui_action_results: [
+        {
+          action_id: createClientId(),
+          action_type: "submit",
+          ok: true,
+          detail_json: detailJson,
+        },
+      ],
+    });
+    await applySecureStepResult(result);
+  };
+
+  const currentCredentialPayloadError = () => {
+    if (!secureUsername.trim()) {
+      return "请先填写用户名";
+    }
+    if (secureAuthType === "password" && !securePassword.trim()) {
+      return "认证方式为密码时必须填写密码";
+    }
+    if (secureAuthType === "key" && !securePrivateKey.trim()) {
+      return "认证方式为私钥时必须填写私钥";
+    }
+    if (secureUsername.trim().toLowerCase() !== "root" && !secureSudoPassword.trim()) {
+      return "非 root 用户必须填写 sudo 密码";
+    }
+    if (!secureAuthorized) {
+      return "请先确认已获得管理员授权";
+    }
+    return "";
+  };
+
+  const handleSecureCancel = async () => {
+    try {
+      setSecureSubmitting(true);
+      await submitSecureStep({ kind: "ssh_credential_cancel", canceled: true });
+      message.info("已取消 SSH 凭据配置");
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "取消 SSH 凭据配置失败";
+      setSecureErrorText(text);
+      message.error(text);
+    } finally {
+      setSecureSubmitting(false);
+    }
+  };
+
+  const handleSecureSameBatchSubmit = async () => {
+    const validationError = currentCredentialPayloadError();
+    if (validationError) {
+      setSecureErrorText(validationError);
+      message.warning(validationError);
+      return;
+    }
+    try {
+      setSecureSubmitting(true);
+      setSecureErrorText(null);
+      const payload = buildCredentialPayload(
+        secureAuthType,
+        secureUsername,
+        securePassword,
+        securePrivateKey,
+        secureSudoPassword,
+        secureAuthorized,
+      );
+
+      if (secureAssetCount <= 1) {
+        const assetId = pendingSecureInput.asset_ids[0];
+        let saved = false;
+        let verified = false;
+        let effectivePrivilege: string | null = null;
+        let errorSummary: string | null = null;
+        try {
+          await setAssetCredential(assetId, payload);
+          saved = true;
+          const verifyResult = await verifyAssetCredential(assetId);
+          verified = verifyResult.status === "success";
+          effectivePrivilege = verifyResult.effective_privilege || null;
+          if (!verified) {
+            errorSummary = verifyResult.summary || "未通过管理员权限验证";
+          }
+        } catch (error) {
+          errorSummary = error instanceof Error ? error.message : "保存或验证 SSH 凭据失败";
+        }
+        await submitSecureStep({
+          kind: "ssh_credential_single",
+          asset_id: assetId,
+          auth_type: secureAuthType,
+          username: secureUsername.trim(),
+          saved,
+          verified,
+          effective_privilege: effectivePrivilege,
+          resume_goal_id: pendingSecureInput.resume_goal_id,
+          resume_action: pendingSecureInput.resume_action,
+          error_summary: errorSummary,
+        });
+        message.success(verified ? "SSH 凭据已保存并验证" : "SSH 凭据已保存，但验证未通过");
+        return;
+      }
+
+      const batchResult = await setAssetCredentialBatch({
+        ...payload,
+        asset_ids: pendingSecureInput.asset_ids,
+        mode: "same_credential_batch",
+        verify_after_save: true,
+      });
+      await submitSecureStep({
+        kind: "ssh_credential_batch",
+        mode: "same_credential_batch",
+        total_count: batchResult.total_count,
+        success_count: batchResult.success_count,
+        failure_count: batchResult.failure_count,
+        results: batchResult.results,
+        resume_goal_id: pendingSecureInput.resume_goal_id,
+        resume_action: pendingSecureInput.resume_action,
+      });
+      message.success(`批量 SSH 凭据处理完成：成功 ${batchResult.success_count} 台`);
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "SSH 凭据处理失败";
+      setSecureErrorText(text);
+      message.error(text);
+    } finally {
+      setSecureSubmitting(false);
+    }
+  };
+
+  const handleSecureGuidedSubmit = async () => {
+    const validationError = currentCredentialPayloadError();
+    if (validationError) {
+      setSecureErrorText(validationError);
+      message.warning(validationError);
+      return;
+    }
+    const assetId = secureCurrentAssetId;
+    if (!assetId) {
+      return;
+    }
+    try {
+      setSecureSubmitting(true);
+      setSecureErrorText(null);
+      const payload = buildCredentialPayload(
+        secureAuthType,
+        secureUsername,
+        securePassword,
+        securePrivateKey,
+        secureSudoPassword,
+        secureAuthorized,
+      );
+      let resultItem: SecureInputResultItem = {
+        asset_id: assetId,
+        saved: false,
+        verified: false,
+        effective_privilege: null,
+        error_summary: null,
+      };
+      try {
+        await setAssetCredential(assetId, payload);
+        resultItem = { ...resultItem, saved: true };
+        const verifyResult = await verifyAssetCredential(assetId);
+        resultItem = {
+          ...resultItem,
+          verified: verifyResult.status === "success",
+          effective_privilege: verifyResult.effective_privilege || null,
+          error_summary: verifyResult.status === "success" ? null : (verifyResult.summary || "未通过管理员权限验证"),
+        };
+      } catch (error) {
+        resultItem = {
+          ...resultItem,
+          error_summary: error instanceof Error ? error.message : "保存或验证 SSH 凭据失败",
+        };
+      }
+      const nextResults = [...secureGuidedResults, resultItem];
+      if (secureGuidedIndex >= secureAssetCount - 1) {
+        await submitSecureStep({
+          kind: "ssh_credential_batch",
+          mode: "per_asset_guided",
+          total_count: nextResults.length,
+          success_count: nextResults.filter((item) => item.verified).length,
+          failure_count: nextResults.filter((item) => !item.verified).length,
+          results: nextResults,
+          resume_goal_id: pendingSecureInput.resume_goal_id,
+          resume_action: pendingSecureInput.resume_action,
+        });
+        message.success("逐台 SSH 凭据配置已完成");
+      } else {
+        setSecureGuidedResults(nextResults);
+        setSecureGuidedIndex((current) => current + 1);
+        setSecurePassword("");
+        setSecurePrivateKey("");
+        setSecureSudoPassword("");
+        setSecureAuthorized(false);
+      }
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "逐台 SSH 凭据配置失败";
+      setSecureErrorText(text);
+      message.error(text);
+    } finally {
+      setSecureSubmitting(false);
+    }
+  };
+
+  const handleSecureGuidedSkip = async () => {
+    const assetId = secureCurrentAssetId;
+    if (!assetId) {
+      return;
+    }
+    const nextResults = [
+      ...secureGuidedResults,
+      {
+        asset_id: assetId,
+        saved: false,
+        verified: false,
+        effective_privilege: null,
+        error_summary: "用户跳过当前资产",
+      },
+    ];
+    if (secureGuidedIndex >= secureAssetCount - 1) {
+      try {
+        setSecureSubmitting(true);
+        await submitSecureStep({
+          kind: "ssh_credential_batch",
+          mode: "per_asset_guided",
+          total_count: nextResults.length,
+          success_count: nextResults.filter((item) => item.verified).length,
+          failure_count: nextResults.filter((item) => !item.verified).length,
+          results: nextResults,
+          resume_goal_id: pendingSecureInput.resume_goal_id,
+          resume_action: pendingSecureInput.resume_action,
+        });
+        message.info("已完成逐台 SSH 凭据配置流程");
+      } catch (error) {
+        const text = error instanceof Error ? error.message : "提交逐台 SSH 配置结果失败";
+        setSecureErrorText(text);
+        message.error(text);
+      } finally {
+        setSecureSubmitting(false);
+      }
+      return;
+    }
+    setSecureGuidedResults(nextResults);
+    setSecureGuidedIndex((current) => current + 1);
+    setSecurePassword("");
+    setSecurePrivateKey("");
+    setSecureSudoPassword("");
+    setSecureAuthorized(false);
+    setSecureErrorText(null);
+  };
+
   return (
     <>
       <div className={`haor-fab-shell ${open ? "haor-fab-shell-open" : ""} ${hasAttention ? "haor-fab-shell-attention" : ""}`}>
@@ -2167,6 +2628,136 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       {open ? (
         <div className="haor-chat-shell" role="dialog" aria-modal="true" aria-label="haor 聊天助手">
           <button type="button" className="haor-chat-backdrop" onClick={() => setOpen(false)} aria-label="关闭 haor 聊天窗口" />
+
+          <Modal
+            open={secureInputVisible}
+            title="SSH 凭据安全配置"
+            onCancel={() => {
+              if (!secureSubmitting) {
+                void handleSecureCancel();
+              }
+            }}
+            destroyOnClose
+            maskClosable={!secureSubmitting}
+            keyboard={!secureSubmitting}
+            closable={!secureSubmitting}
+            okButtonProps={{ style: { display: "none" } }}
+            cancelButtonProps={{ style: { display: "none" } }}
+            footer={[
+              secureBatchMode === "per_asset_guided" && secureAssetCount > 1 ? (
+                <Button key="skip" onClick={() => void handleSecureGuidedSkip()} disabled={secureSubmitting}>
+                  跳过当前资产
+                </Button>
+              ) : null,
+              <Button key="cancel" onClick={() => void handleSecureCancel()} disabled={secureSubmitting}>
+                取消
+              </Button>,
+              <Button
+                key="submit"
+                type="primary"
+                loading={secureSubmitting}
+                disabled={secureAssetCount > 1 && !secureBatchMode}
+                onClick={() => {
+                  if (secureBatchMode === "per_asset_guided") {
+                    void handleSecureGuidedSubmit();
+                    return;
+                  }
+                  void handleSecureSameBatchSubmit();
+                }}
+              >
+                {secureBatchMode === "per_asset_guided"
+                  ? (secureGuidedIndex >= secureAssetCount - 1 ? "完成并验证" : "保存并继续下一台")
+                  : (secureAssetCount > 1 ? "保存并批量验证" : "保存并验证")}
+              </Button>,
+            ]}
+          >
+            <div data-haor-sensitive-input="true">
+              <div style={{ display: "grid", gap: 12 }}>
+                <Alert
+                  type="info"
+                  showIcon
+                  message={secureAssetCount > 1 ? `目标资产：共 ${secureAssetCount} 台` : `目标资产：${secureCurrentAssetLabel || "当前资产"}`}
+                  description={
+                    secureAssetCount > 1
+                      ? "聊天中只保留非敏感信息；密码、私钥与 sudo 密码只会在这个安全弹层中输入。保存并验证 SSH 后，Haor 会自动续接原目标；若仍缺 Runner 或其他条件，会继续明确提示。"
+                      : "聊天中只保留认证方式、用户名与验证结果；密码、私钥与 sudo 密码不会写入会话记录。保存并验证 SSH 后，Haor 会自动续接修复；若仍缺 Runner 或其他条件，会继续明确提示。"
+                  }
+                />
+                {pendingSecureInput.blocker_summary ? (
+                  <Alert type="warning" showIcon message={`当前阻塞：${pendingSecureInput.blocker_summary}`} />
+                ) : null}
+                {secureErrorText ? <Alert type="error" showIcon message={secureErrorText} /> : null}
+                {secureAssetCount > 1 ? (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <strong>批量模式</strong>
+                    <Radio.Group
+                      value={secureBatchMode}
+                      onChange={(event) => setSecureBatchMode(event.target.value)}
+                      disabled={secureSubmitting}
+                    >
+                      <Radio.Button value="same_credential_batch">同一套凭据批量应用</Radio.Button>
+                      <Radio.Button value="per_asset_guided">逐台引导配置</Radio.Button>
+                    </Radio.Group>
+                    {secureBatchMode === "per_asset_guided" ? (
+                      <span style={{ color: "rgba(15,23,42,0.72)", fontSize: 13 }}>
+                        当前第 {Math.min(secureGuidedIndex + 1, secureAssetCount)} / {secureAssetCount} 台：{secureCurrentAssetLabel}
+                      </span>
+                    ) : null}
+                  </div>
+                ) : null}
+                <div style={{ display: "grid", gap: 8 }}>
+                  <strong>认证方式</strong>
+                  <Radio.Group value={secureAuthType} onChange={(event) => setSecureAuthType(event.target.value)} disabled={secureSubmitting}>
+                    <Radio.Button value="password">密码</Radio.Button>
+                    <Radio.Button value="key">私钥</Radio.Button>
+                  </Radio.Group>
+                </div>
+                <div style={{ display: "grid", gap: 8 }}>
+                  <strong>用户名</strong>
+                  <Input
+                    value={secureUsername}
+                    onChange={(event) => setSecureUsername(event.target.value)}
+                    disabled={secureSubmitting}
+                    placeholder="例如 root 或 sudo 用户名"
+                  />
+                </div>
+                {secureAuthType === "password" ? (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <strong>SSH 密码</strong>
+                    <Input.Password
+                      value={securePassword}
+                      onChange={(event) => setSecurePassword(event.target.value)}
+                      disabled={secureSubmitting}
+                      placeholder="仅在安全弹层中输入"
+                    />
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <strong>SSH 私钥</strong>
+                    <Input.TextArea
+                      autoSize={{ minRows: 4, maxRows: 10 }}
+                      value={securePrivateKey}
+                      onChange={(event) => setSecurePrivateKey(event.target.value)}
+                      disabled={secureSubmitting}
+                      placeholder="粘贴 PEM/OpenSSH 私钥内容"
+                    />
+                  </div>
+                )}
+                <div style={{ display: "grid", gap: 8 }}>
+                  <strong>{secureUsername.trim().toLowerCase() === "root" ? "无需 sudo 密码" : "sudo 密码"}</strong>
+                  <Input.Password
+                    value={secureSudoPassword}
+                    onChange={(event) => setSecureSudoPassword(event.target.value)}
+                    disabled={secureSubmitting || secureUsername.trim().toLowerCase() === "root"}
+                    placeholder={secureUsername.trim().toLowerCase() === "root" ? "root 用户可留空" : "非 root 用户必填"}
+                  />
+                </div>
+                <Checkbox checked={secureAuthorized} onChange={(event) => setSecureAuthorized(event.target.checked)} disabled={secureSubmitting}>
+                  我确认已经获得目标主机管理员授权
+                </Checkbox>
+              </div>
+            </div>
+          </Modal>
 
           <section className="haor-chat-window" data-haor-agent-root="true">
             <div className="haor-chat-body">

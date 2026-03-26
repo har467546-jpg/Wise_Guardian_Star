@@ -112,6 +112,8 @@ def test_create_or_resume_remediation_auto_submits_when_ready(monkeypatch) -> No
         "session_id": "session-1",
         "execution_ready": True,
         "blocked_reasons": [],
+        "blocker_codes": [],
+        "blockers": [],
         "submitted_task_id": "remediation-task-1",
     }
     assert observed["approved_by"] == "user-1"
@@ -155,10 +157,93 @@ def test_create_or_resume_remediation_returns_blockers_without_submitting(monkey
         "session_id": "session-1",
         "execution_ready": False,
         "blocked_reasons": ["当前主机尚未安装 Host Runner"],
+        "blocker_codes": ["runner_not_installed"],
+        "blockers": [
+            {
+                "code": "runner_not_installed",
+                "message": "当前主机尚未安装 Host Runner",
+                "scope": None,
+                "blocking": None,
+                "stage_code": None,
+                "step_id": None,
+            }
+        ],
         "submitted_task_id": None,
     }
     assert "当前未自动执行" in result.summary
     assert "当前主机尚未安装 Host Runner" in result.summary
+
+
+def test_create_or_resume_remediation_prefers_structured_plan_blockers(monkeypatch) -> None:
+    monkeypatch.setattr(
+        execution_registry,
+        "create_or_resume_remediation_session",
+        lambda db, asset_id: SimpleNamespace(
+            session_id="session-structured-1",
+            plan=SimpleNamespace(
+                execution_ready=False,
+                blocked_reasons=["当前自动修复仍缺少 SSH 管理员凭据"],
+                global_blockers=[
+                    {
+                        "code": "unknown_blocker",
+                        "message": "当前自动修复仍缺少 SSH 管理员凭据",
+                        "scope": "asset",
+                        "blocking": "hard",
+                        "stage_code": "preflight",
+                    }
+                ],
+                step_blockers=[
+                    {
+                        "code": "runner_not_installed",
+                        "message": "当前主机尚未安装 Host Runner",
+                        "scope": "asset",
+                        "blocking": "hard",
+                        "step_id": "install-runner",
+                    }
+                ],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        execution_registry,
+        "approve_remediation_session",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not submit remediation")),
+    )
+
+    context = execution_registry.AgentActionExecutorContext(
+        db=_UserLookupDB({"user-1"}),
+        session_user_id="user-1",
+        platform_url="http://localhost:3000",
+        get_manual_credential=lambda *_args, **_kwargs: None,
+    )
+
+    result = execution_registry.execute_registered_action(
+        context,
+        action={
+            "action_type": "create_or_resume_remediation_session",
+            "params": {"asset_id": "asset-1", "submit_if_ready": True},
+        },
+    )
+
+    assert result.payload["blocker_codes"] == ["missing_ssh_credential", "runner_not_installed"]
+    assert result.payload["blockers"] == [
+        {
+            "code": "missing_ssh_credential",
+            "message": "当前自动修复仍缺少 SSH 管理员凭据",
+            "scope": "asset",
+            "blocking": "hard",
+            "stage_code": "preflight",
+            "step_id": None,
+        },
+        {
+            "code": "runner_not_installed",
+            "message": "当前主机尚未安装 Host Runner",
+            "scope": "asset",
+            "blocking": "hard",
+            "stage_code": None,
+            "step_id": "install-runner",
+        },
+    ]
 
 
 def test_approve_remediation_uses_session_user_id(monkeypatch) -> None:

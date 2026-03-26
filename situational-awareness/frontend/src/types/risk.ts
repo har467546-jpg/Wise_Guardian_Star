@@ -11,6 +11,14 @@ export type RiskFinding = {
   evidence_json: Record<string, unknown>;
   detected_at: string;
   resolved_at: string | null;
+  priority_score?: number | null;
+  priority_tier?: string | null;
+  priority_reason?: Record<string, unknown> | null;
+  owner_id?: string | null;
+  sla_due_at?: string | null;
+  waiver_status: string;
+  governance?: FindingGovernance | null;
+  waivers?: FindingWaiver[];
 };
 
 export type RiskFindingListResponse = {
@@ -82,4 +90,37 @@ export type RiskBatchVerifyRequest = {
 export type RiskBatchVerifyResponse = {
   queued: number;
   task_ids: string[];
+};
+
+export type FindingGovernance = {
+  finding_id: string;
+  priority_score: number;
+  priority_tier: string;
+  priority_reason: Record<string, unknown>;
+  owner_id: string | null;
+  sla_due_at: string | null;
+  status: string;
+  updated_at: string;
+};
+
+export type FindingWaiver = {
+  id: string;
+  finding_id: string;
+  waiver_type: "false_positive" | "accepted_risk" | "temporary_exception";
+  reason: string;
+  expires_at: string | null;
+  approved_by: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RiskFindingAssignRequest = {
+  owner_id?: string | null;
+};
+
+export type RiskFindingWaiverCreateRequest = {
+  waiver_type: "false_positive" | "accepted_risk" | "temporary_exception";
+  reason: string;
+  expires_at?: string | null;
 };

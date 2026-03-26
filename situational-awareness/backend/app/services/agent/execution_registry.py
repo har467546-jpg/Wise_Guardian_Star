@@ -16,7 +16,7 @@ from app.tasks.runner_tasks import run_runner_install_task
 from app.tasks.scan_tasks import run_asset_scan_task
 from app.tasks.verify_tasks import run_risk_verify_task
 from app.utils.net import normalize_cidr
-from app.utils.sanitize import sanitize_text
+from app.utils.sanitize import sanitize_json_value, sanitize_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +56,110 @@ def _resolve_approved_by_user_id(context: AgentActionExecutorContext) -> str:
     if context.db.get(User, approved_by) is None:
         raise RuntimeError("审批人信息无效，请刷新页面后重试")
     return approved_by
+
+
+def _infer_remediation_blocker_code(message: str | None) -> str:
+    normalized = sanitize_text(message, max_length=280) or ""
+    lowered = normalized.lower()
+    if ("ssh" in lowered and any(marker in normalized for marker in ("凭据", "私钥", "密码", "授权"))) or "未配置 ssh" in lowered:
+        return "missing_ssh_credential"
+    if "管理员授权" in normalized:
+        return "authorization_unconfirmed"
+    if "管理员权限验证" in normalized:
+        return "authorization_not_verified"
+    if "未验证到管理员权限" in normalized or "root/sudo" in lowered or "sudo 凭据" in normalized:
+        return "insufficient_privilege"
+    if "尚未安装" in normalized:
+        return "runner_not_installed"
+    if "正在安装中" in normalized:
+        return "runner_installing"
+    if "当前离线" in normalized:
+        return "runner_offline"
+    if "未解析到" in normalized:
+        return "missing_target"
+    if "白名单" in normalized:
+        return "action_not_allowed"
+    if "snapshot" in lowered or "深度检查结果" in normalized:
+        return "missing_snapshot"
+    return "unknown_blocker"
+
+
+def _serialize_remediation_blockers(plan: Any) -> tuple[list[str], list[dict[str, Any]]]:
+    blockers: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str, str]] = set()
+    for field_name in ("global_blockers", "step_blockers"):
+        raw_items = getattr(plan, field_name, None)
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            payload = item.model_dump(mode="json") if hasattr(item, "model_dump") else item if isinstance(item, dict) else {}
+            if not isinstance(payload, dict):
+                continue
+            message = sanitize_text(
+                str(payload.get("message") or payload.get("blocker_message") or ""),
+                max_length=280,
+            ) or ""
+            if not message:
+                continue
+            code = sanitize_text(
+                str(payload.get("code") or payload.get("blocker_code") or ""),
+                max_length=64,
+                single_line=True,
+            ) or _infer_remediation_blocker_code(message)
+            if code == "unknown_blocker":
+                inferred_code = _infer_remediation_blocker_code(message)
+                if inferred_code != "unknown_blocker":
+                    code = inferred_code
+            blocker = {
+                "code": code or "unknown_blocker",
+                "message": message,
+                "scope": sanitize_text(str(payload.get("scope") or ""), max_length=64, single_line=True) or None,
+                "blocking": sanitize_text(str(payload.get("blocking") or ""), max_length=32, single_line=True) or None,
+                "stage_code": sanitize_text(str(payload.get("stage_code") or ""), max_length=64, single_line=True) or None,
+                "step_id": sanitize_text(str(payload.get("step_id") or ""), max_length=64, single_line=True) or None,
+            }
+            signature = (
+                blocker["code"] or "",
+                blocker["message"] or "",
+                blocker["scope"] or "",
+                blocker["blocking"] or "",
+                blocker["stage_code"] or "",
+                blocker["step_id"] or "",
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            blockers.append(blocker)
+
+    if not blockers:
+        blocked_reasons = getattr(plan, "blocked_reasons", None)
+        if isinstance(blocked_reasons, list):
+            for raw_message in blocked_reasons:
+                message = sanitize_text(str(raw_message or ""), max_length=280) or ""
+                if not message:
+                    continue
+                code = _infer_remediation_blocker_code(message)
+                signature = (code, message, "", "", "", "")
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                blockers.append(
+                    {
+                        "code": code,
+                        "message": message,
+                        "scope": None,
+                        "blocking": None,
+                        "stage_code": None,
+                        "step_id": None,
+                    }
+                )
+
+    blocker_codes: list[str] = []
+    for item in blockers:
+        code = sanitize_text(str(item.get("code") or ""), max_length=64, single_line=True) or ""
+        if code and code not in blocker_codes:
+            blocker_codes.append(code)
+    return blocker_codes, sanitize_json_value(blockers)
 
 
 def _queue_discovery_job(context: AgentActionExecutorContext, *, action: dict[str, Any]) -> AgentExecutionResult:
@@ -170,11 +274,14 @@ def _create_or_resume_remediation(context: AgentActionExecutorContext, *, action
         raise RuntimeError("修复会话计划缺少 asset_id")
     session = create_or_resume_remediation_session(db, asset_id=asset_id)
     blocked_reasons = list(session.plan.blocked_reasons or [])
+    blocker_codes, blockers = _serialize_remediation_blockers(session.plan)
     payload = {
         "asset_id": asset_id,
         "session_id": session.session_id,
         "execution_ready": bool(session.plan.execution_ready),
         "blocked_reasons": blocked_reasons,
+        "blocker_codes": blocker_codes,
+        "blockers": blockers,
         "submitted_task_id": None,
     }
     if submit_if_ready and session.plan.execution_ready:

@@ -26,7 +26,7 @@ services:
       dockerfile: Dockerfile
     container_name: sa-backend
     restart: unless-stopped
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
       - path: ../backend/.env.example
         required: true
@@ -41,8 +41,6 @@ services:
       - redis
     ports:
       - "8000:8000"
-    volumes:
-      - ../backend:/app
 
   worker:
     build:
@@ -62,8 +60,6 @@ services:
       DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
       REDIS_URL: redis://redis:6379/0
     command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report", "--loglevel=info"]
-    volumes:
-      - ../backend:/app
 
   settings-helper:
     build:
@@ -74,8 +70,6 @@ services:
     env_file:
       - path: ../backend/.env.example
         required: true
-      - path: ../backend/.env.runtime
-        required: false
     depends_on:
       - backend
     volumes:
@@ -86,8 +80,75 @@ services:
     build:
       context: ../frontend
       dockerfile: Dockerfile
-      target: dev
+      target: runner
     container_name: sa-frontend
+    restart: unless-stopped
+    command: ["npm", "run", "start"]
+    env_file:
+      - ../frontend/.env.example
+    environment:
+      BACKEND_INTERNAL_URL: http://backend:8000
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+
+  backend-dev:
+    profiles: ["dev"]
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: sa-backend-dev
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
+    env_file:
+      - path: ../backend/.env.example
+        required: true
+      - path: ../backend/.env.runtime
+        required: false
+    environment:
+      ENV: dev
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8001:8000"
+    volumes:
+      - ../backend:/app
+
+  worker-dev:
+    profiles: ["dev"]
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: sa-worker-dev
+    restart: unless-stopped
+    env_file:
+      - path: ../backend/.env.example
+        required: true
+      - path: ../backend/.env.runtime
+        required: false
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      ENV: dev
+      DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
+      REDIS_URL: redis://redis:6379/0
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report", "--loglevel=info"]
+    volumes:
+      - ../backend:/app
+
+  frontend-dev:
+    profiles: ["dev"]
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      target: dev
+    container_name: sa-frontend-dev
     restart: unless-stopped
     command:
       [
@@ -98,36 +159,18 @@ services:
     env_file:
       - ../frontend/.env.example
     environment:
-      BACKEND_INTERNAL_URL: http://backend:8000
+      BACKEND_INTERNAL_URL: http://backend-dev:8000
       NEXT_ALLOWED_DEV_ORIGINS: ${NEXT_ALLOWED_DEV_ORIGINS:-localhost,127.0.0.1,192.168.*.*,10.*.*.*,172.*.*.*}
       WATCHPACK_POLLING: ${WATCHPACK_POLLING:-true}
     depends_on:
-      - backend
+      - backend-dev
     ports:
-      - "3000:3000"
+      - "3001:3000"
     volumes:
       - ../frontend:/app
       - /app/node_modules
       - /app/.next
       - /app/.next-dev
-
-  frontend-prod:
-    profiles: ["prod"]
-    build:
-      context: ../frontend
-      dockerfile: Dockerfile
-      target: runner
-    container_name: sa-frontend-prod
-    restart: unless-stopped
-    command: ["npm", "run", "start"]
-    env_file:
-      - ../frontend/.env.example
-    environment:
-      BACKEND_INTERNAL_URL: http://backend:8000
-    depends_on:
-      - backend
-    ports:
-      - "3001:3000"
 
 volumes:
   pgdata:

@@ -48,6 +48,7 @@ from app.schemas.remediation import (
     RunnerTaskEventBatch,
     RunnerTaskStepRead,
 )
+from app.services.remediation_evidence_service import build_remediation_evidence
 from app.tasks.task_runtime import append_current_task_event
 from app.tasks.verify_tasks import run_risk_verify_task
 from app.db.session import SessionLocal
@@ -953,6 +954,7 @@ def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1)
             session_id=context.get("session_id"),
             task_type="remediation_execute",
             summary=stage_name or str((plan.get("summary_text") or plan.get("summary") or "整机修复计划")).strip(),
+            execution_mode="apply",
             plan=plan,
             steps=[
                 RunnerTaskStepRead(
@@ -963,6 +965,14 @@ def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1)
                     execution_state="blocked" if str(step.get("execution_state") or "").strip().lower() == "blocked" else "ready",
                     blocked_reason=str(step.get("blocked_reason") or "").strip() or None,
                     backup_plan=step.get("backup_plan"),
+                    risk_level=str(step.get("risk_level") or "medium"),
+                    idempotent=bool(step.get("idempotent")),
+                    dry_run_supported=bool(step.get("dry_run_supported")),
+                    rollback_supported=bool(step.get("rollback_supported")),
+                    evidence_items=[str(item).strip() for item in (step.get("evidence_items") or []) if str(item).strip()],
+                    requires_maintenance_window=bool(step.get("requires_maintenance_window")),
+                    adapter_id=str(step.get("adapter_id") or "").strip() or None,
+                    adapter_version=str(step.get("adapter_version") or "").strip() or None,
                 )
                 for step in steps
                 if isinstance(step, dict)
@@ -1050,7 +1060,15 @@ def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload:
     if payload.step_results:
         execution["step_results"] = [item.model_dump(mode="json") for item in payload.step_results]
     backups = dict(payload.backups or execution.get("backup_map") or {})
+    step_results = execution.get("step_results") if isinstance(execution.get("step_results"), list) else []
     success_count = int(execution.get("success_count") or 0)
+    if step_results and success_count <= 0:
+        success_count = sum(1 for item in step_results if isinstance(item, dict) and str(item.get("status") or "").strip() == "success")
+    execution["success_count"] = success_count
+    failed_count = int(execution.get("failed_count") or 0)
+    if step_results and failed_count <= 0:
+        failed_count = sum(1 for item in step_results if isinstance(item, dict) and str(item.get("status") or "").strip() == "failed")
+    execution["failed_count"] = failed_count
     reverify = {"reverify_triggered": False, "reverify_task_id": None, "reverify_status": None}
     if bool(settings.REMEDIATION_AUTO_REVERIFY_ENABLED) and success_count > 0:
         reverify_task = create_task_run(
@@ -1078,18 +1096,57 @@ def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload:
             payload_json=reverify,
         )
 
+    execution_mode = str(execution.get("execution_mode") or "apply").strip().lower() or "apply"
+    if failed_count > 0 or payload.status == "failure":
+        overall_status = "apply_failed"
+        final_message = payload.message or f"共有 {failed_count or 1} 个 Runner 修复步骤执行失败"
+    elif reverify.get("reverify_triggered"):
+        overall_status = "applied_pending_reverify"
+        final_message = payload.message or "Host Runner 已执行修复命令，自动复测已触发，等待复测结论"
+    else:
+        overall_status = "applied"
+        final_message = payload.message or "Host Runner 已完成整机修复计划"
+    execution["execution_mode"] = execution_mode
+    execution["overall_status"] = overall_status
+    execution["final_message"] = final_message
+    plan = result_json.get("plan") if isinstance(result_json.get("plan"), dict) else {}
+    execution_context = result_json.get("execution") if isinstance(result_json.get("execution"), dict) else {}
+    submitted_steps = execution_context.get("submitted_steps") if isinstance(execution_context.get("submitted_steps"), list) else []
+    submitted_step_ids = {
+        str(item.get("step_id") or "").strip()
+        for item in submitted_steps
+        if isinstance(item, dict) and str(item.get("step_id") or "").strip()
+    }
+    selected_steps = [
+        dict(step)
+        for step in (plan.get("steps") or [])
+        if isinstance(step, dict) and (not submitted_step_ids or str(step.get("step_id") or "").strip() in submitted_step_ids)
+    ]
+    result_json["evidence"] = build_remediation_evidence(
+        task_id=task.id,
+        plan=plan,
+        selected_steps=selected_steps,
+        execution_mode=execution_mode,
+        execution_boundary=str(execution.get("execution_boundary") or "runner_dispatch"),
+        step_results=[dict(item) for item in step_results if isinstance(item, dict)],
+        reverify=reverify,
+        change_ticket=str(execution_context.get("change_ticket") or execution.get("change_ticket") or "").strip() or None,
+        maintenance_window_id=str(execution_context.get("maintenance_window_id") or execution.get("maintenance_window_id") or "").strip() or None,
+        stage_code=str(execution_context.get("stage_code") or "").strip() or None,
+        stage_name=str(execution_context.get("stage_name") or "").strip() or None,
+    )
     result_json["execution"] = execution
     result_json["backups"] = backups
     result_json["reverify"] = reverify
     result_json.setdefault("context", {})
     result_json["context"]["runner_id"] = runner.id
-    status = TaskExecutionStatus.SUCCESS if payload.status == "success" else TaskExecutionStatus.FAILURE
+    status = TaskExecutionStatus.SUCCESS if overall_status != "apply_failed" else TaskExecutionStatus.FAILURE
     update_task_run(
         db,
         task,
         status=status,
         progress=100,
-        message=payload.message or ("Host Runner 已完成整机修复计划" if payload.status == "success" else "Host Runner 执行失败"),
+        message=final_message,
         result_json=result_json,
     )
     create_task_event(
@@ -1097,7 +1154,7 @@ def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload:
         task_run_id=task.id,
         event_type="success" if status == TaskExecutionStatus.SUCCESS else "failure",
         level="info" if status == TaskExecutionStatus.SUCCESS else "error",
-        message=payload.message or ("Host Runner 已完成整机修复计划" if payload.status == "success" else "Host Runner 执行失败"),
+        message=final_message,
         progress=100,
         payload_json=result_json,
     )

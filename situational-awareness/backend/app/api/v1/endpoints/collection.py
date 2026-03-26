@@ -22,6 +22,9 @@ from app.scanner.service_enrichment import (
 )
 from app.scanner.service_fingerprint import DEFAULT_SERVICE_BY_PORT
 from app.schemas.collection import (
+    AssetCredentialBatchResponse,
+    AssetCredentialBatchResult,
+    AssetCredentialBatchUpsertRequest,
     AssetCredentialReadResponse,
     AssetCredentialUpsertRequest,
     AssetCredentialVerifyResponse,
@@ -163,6 +166,80 @@ def _build_authorization_response(asset_id: str, result: dict) -> AssetCredentia
         errors=result.get("errors") if isinstance(result.get("errors"), list) else [],
         detail_json=result.get("detail_json") if isinstance(result.get("detail_json"), dict) else {},
     )
+
+
+def _upsert_manual_asset_credential(
+    db: Session,
+    *,
+    asset: Asset,
+    payload: AssetCredentialUpsertRequest,
+    current_user: User,
+) -> SSHCredential:
+    credential = _get_manual_credential(db=db, asset_id=asset.id)
+    auth_type = CredentialAuthType(payload.auth_type)
+    password_ciphertext = encrypt_text((payload.password or "").strip()) if auth_type == CredentialAuthType.PASSWORD else None
+    key_ciphertext = encrypt_text((payload.private_key or "").strip()) if auth_type == CredentialAuthType.KEY else None
+    sudo_password = (payload.sudo_password or "").strip()
+    sudo_ciphertext = encrypt_text(sudo_password) if payload.username.strip().lower() != "root" and sudo_password else None
+
+    if credential is None:
+        credential = SSHCredential(
+            name=_manual_credential_name(asset.id),
+            username=payload.username.strip(),
+            auth_type=auth_type,
+            secret_ciphertext=password_ciphertext,
+            key_ciphertext=key_ciphertext,
+            sudo_secret_ciphertext=sudo_ciphertext,
+            treat_success_as_risk=False,
+            admin_authorized=payload.admin_authorized,
+            last_verified_at=None,
+            last_verification_status=None,
+            last_effective_privilege=None,
+            created_by=current_user.id,
+        )
+    else:
+        credential.username = payload.username.strip()
+        credential.auth_type = auth_type
+        credential.secret_ciphertext = password_ciphertext
+        credential.key_ciphertext = key_ciphertext
+        credential.sudo_secret_ciphertext = sudo_ciphertext
+        credential.treat_success_as_risk = False
+        credential.admin_authorized = payload.admin_authorized
+        credential.last_verified_at = None
+        credential.last_verification_status = None
+        credential.last_effective_privilege = None
+        credential.created_by = current_user.id
+
+    db.add(credential)
+    db.flush()
+    _ensure_manual_binding(db=db, asset_id=asset.id, credential_id=credential.id)
+    db.commit()
+    db.refresh(credential)
+    return credential
+
+
+def _verify_manual_asset_credential(
+    db: Session,
+    *,
+    asset: Asset,
+    credential: SSHCredential,
+) -> AssetCredentialVerifyResponse:
+    if credential.admin_authorized is not True:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="保存 SSH 凭据前必须确认已获得管理员授权")
+
+    try:
+        profile = _build_profile(asset=asset, credential=credential)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    result = asyncio.run(AsyncSSHCollector().verify_authorization(profile))
+    credential.last_verified_at = result.verified_at
+    credential.last_verification_status = result.status
+    credential.last_effective_privilege = result.effective_privilege
+    db.add(credential)
+    db.commit()
+    db.refresh(credential)
+    return _build_authorization_response(asset.id, result.to_dict())
 
 
 def _build_probe_response_from_authorization(asset: Asset, result: AssetCredentialVerifyResponse) -> CollectProbeRunResponse:
@@ -640,46 +717,7 @@ def upsert_asset_credential(
     if not asset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="资产不存在")
 
-    credential = _get_manual_credential(db=db, asset_id=asset.id)
-    auth_type = CredentialAuthType(payload.auth_type)
-    password_ciphertext = encrypt_text((payload.password or "").strip()) if auth_type == CredentialAuthType.PASSWORD else None
-    key_ciphertext = encrypt_text((payload.private_key or "").strip()) if auth_type == CredentialAuthType.KEY else None
-    sudo_password = (payload.sudo_password or "").strip()
-    sudo_ciphertext = encrypt_text(sudo_password) if payload.username.strip().lower() != "root" and sudo_password else None
-
-    if credential is None:
-        credential = SSHCredential(
-            name=_manual_credential_name(asset.id),
-            username=payload.username.strip(),
-            auth_type=auth_type,
-            secret_ciphertext=password_ciphertext,
-            key_ciphertext=key_ciphertext,
-            sudo_secret_ciphertext=sudo_ciphertext,
-            treat_success_as_risk=False,
-            admin_authorized=payload.admin_authorized,
-            last_verified_at=None,
-            last_verification_status=None,
-            last_effective_privilege=None,
-            created_by=current_user.id,
-        )
-    else:
-        credential.username = payload.username.strip()
-        credential.auth_type = auth_type
-        credential.secret_ciphertext = password_ciphertext
-        credential.key_ciphertext = key_ciphertext
-        credential.sudo_secret_ciphertext = sudo_ciphertext
-        credential.treat_success_as_risk = False
-        credential.admin_authorized = payload.admin_authorized
-        credential.last_verified_at = None
-        credential.last_verification_status = None
-        credential.last_effective_privilege = None
-        credential.created_by = current_user.id
-
-    db.add(credential)
-    db.flush()
-    _ensure_manual_binding(db=db, asset_id=asset.id, credential_id=credential.id)
-    db.commit()
-    db.refresh(credential)
+    credential = _upsert_manual_asset_credential(db, asset=asset, payload=payload, current_user=current_user)
     return _credential_response(asset_id=asset.id, credential=credential, bound=True)
 
 
@@ -696,22 +734,83 @@ def verify_asset_credential(
     credential = _get_manual_credential(db=db, asset_id=asset.id)
     if credential is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前资产未配置凭据，请先在资产详情中设置 SSH 凭据")
-    if credential.admin_authorized is not True:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="保存 SSH 凭据前必须确认已获得管理员授权")
+    return _verify_manual_asset_credential(db, asset=asset, credential=credential)
 
-    try:
-        profile = _build_profile(asset=asset, credential=credential)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    result = asyncio.run(AsyncSSHCollector().verify_authorization(profile))
-    credential.last_verified_at = result.verified_at
-    credential.last_verification_status = result.status
-    credential.last_effective_privilege = result.effective_privilege
-    db.add(credential)
-    db.commit()
-    db.refresh(credential)
-    return _build_authorization_response(asset.id, result.to_dict())
+@router.post("/assets/credentials/batch", response_model=AssetCredentialBatchResponse)
+def batch_upsert_asset_credentials(
+    payload: AssetCredentialBatchUpsertRequest,
+    db: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
+) -> AssetCredentialBatchResponse:
+    results: list[AssetCredentialBatchResult] = []
+    for asset_id in payload.asset_ids:
+        normalized_asset_id = str(asset_id or "").strip()
+        if not normalized_asset_id:
+            continue
+        asset = db.get(Asset, normalized_asset_id)
+        if asset is None:
+            results.append(
+                AssetCredentialBatchResult(
+                    asset_id=normalized_asset_id,
+                    saved=False,
+                    verified=False,
+                    effective_privilege=None,
+                    error_summary="资产不存在",
+                )
+            )
+            continue
+
+        saved = False
+        verified = False
+        effective_privilege: str | None = None
+        error_summary: str | None = None
+        try:
+            credential = _upsert_manual_asset_credential(
+                db,
+                asset=asset,
+                payload=AssetCredentialUpsertRequest(
+                    auth_type=payload.auth_type,
+                    username=payload.username,
+                    password=payload.password,
+                    private_key=payload.private_key,
+                    sudo_password=payload.sudo_password,
+                    admin_authorized=payload.admin_authorized,
+                ),
+                current_user=current_user,
+            )
+            saved = True
+            if payload.verify_after_save:
+                verify_result = _verify_manual_asset_credential(db, asset=asset, credential=credential)
+                verified = str(verify_result.status or "").strip().lower() == "success"
+                effective_privilege = verify_result.effective_privilege
+                if not verified:
+                    error_summary = verify_result.summary or "凭据已保存，但未通过管理员权限验证"
+        except HTTPException as exc:
+            db.rollback()
+            error_summary = str(exc.detail or "保存或验证 SSH 凭据失败")
+        except Exception:
+            db.rollback()
+            error_summary = "保存或验证 SSH 凭据失败"
+
+        results.append(
+            AssetCredentialBatchResult(
+                asset_id=normalized_asset_id,
+                saved=saved,
+                verified=verified,
+                effective_privilege=effective_privilege,
+                error_summary=error_summary,
+            )
+        )
+
+    success_count = sum(1 for item in results if item.verified)
+    return AssetCredentialBatchResponse(
+        mode=payload.mode,
+        total_count=len(results),
+        success_count=success_count,
+        failure_count=max(0, len(results) - success_count),
+        results=results,
+    )
 
 
 @router.post("/assets/batch/run", response_model=CollectRunResponse, status_code=status.HTTP_202_ACCEPTED)

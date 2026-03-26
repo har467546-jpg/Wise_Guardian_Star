@@ -10,7 +10,9 @@ from app.db.models.user import User
 from app.rules import RuleConflictError, RuleDefinition, RuleNotFoundError, RuleStore
 from app.schemas.common import PageMeta
 from app.schemas.vuln_library import (
+    RuleImportImpactPreviewRead,
     RuleEngineStatusRead,
+    VulnIntelStatusRead,
     VulnRuleBatchStatusRequest,
     VulnRuleBatchStatusResponse,
     VulnRuleCreate,
@@ -21,7 +23,9 @@ from app.schemas.vuln_library import (
     VulnRuleUpdate,
 )
 from app.services.vuln_library_service import (
+    RuleCatalogMetadata,
     VulnLibraryService,
+    VulnLibrarySchemaNotReadyError,
     VulnRuleImportResult,
 )
 
@@ -41,11 +45,26 @@ def get_vuln_library_status(_: User = Depends(get_current_user)) -> RuleEngineSt
         source_mtime=status_payload.source_mtime,
         rule_count=status_payload.rule_count,
         last_error=status_payload.last_error,
+        schema_ready=status_payload.schema_ready,
+        schema_error=status_payload.schema_error,
         indexed_rule_count=status_payload.indexed_rule_count,
         index_synced_at=status_payload.index_synced_at,
         index_in_sync=status_payload.index_in_sync,
         index_last_error=status_payload.index_last_error,
     )
+
+
+@router.get("/intel/status", response_model=VulnIntelStatusRead)
+def get_vuln_intel_status(_: User = Depends(get_current_user)) -> VulnIntelStatusRead:
+    return _to_intel_status_read(RULE_SERVICE.get_intel_status())
+
+
+@router.post("/intel/sync", response_model=VulnIntelStatusRead)
+def sync_vuln_intel_catalog(_: User = Depends(get_admin_user)) -> VulnIntelStatusRead:
+    try:
+        return _to_intel_status_read(RULE_SERVICE.sync_intel())
+    except VulnLibrarySchemaNotReadyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.get("/rules", response_model=VulnRuleListResponse)
@@ -68,8 +87,9 @@ def list_vuln_rules(
         enabled=enabled,
         catalog_view=catalog_view,
     )
+    metadata_map = RULE_SERVICE.get_rule_catalog_metadata(items)
     return VulnRuleListResponse(
-        items=[_to_read_model(item) for item in items],
+        items=[_to_read_model(item, metadata_map.get(item.rule_id)) for item in items],
         meta=PageMeta(total=total, page=page, page_size=page_size),
     )
 
@@ -141,7 +161,7 @@ def get_vuln_rule(rule_id: str, _: User = Depends(get_current_user)) -> VulnRule
     rule = RULE_SERVICE.get_rule(rule_id)
     if rule is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="规则不存在")
-    return _to_read_model(rule)
+    return _to_read_model(rule, RULE_SERVICE.get_rule_catalog_metadata([rule]).get(rule.rule_id))
 
 
 @router.post("/rules", response_model=VulnRuleRead, status_code=status.HTTP_201_CREATED)
@@ -152,7 +172,7 @@ def create_vuln_rule(payload: VulnRuleCreate, _: User = Depends(get_admin_user))
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return _to_read_model(rule)
+    return _to_read_model(rule, RULE_SERVICE.get_rule_catalog_metadata([rule]).get(rule.rule_id))
 
 
 @router.put("/rules/{rule_id}", response_model=VulnRuleRead)
@@ -163,7 +183,7 @@ def update_vuln_rule(rule_id: str, payload: VulnRuleUpdate, _: User = Depends(ge
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return _to_read_model(rule)
+    return _to_read_model(rule, RULE_SERVICE.get_rule_catalog_metadata([rule]).get(rule.rule_id))
 
 
 @router.delete("/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -186,7 +206,7 @@ def rebuild_vuln_rule_index(_: User = Depends(get_admin_user)) -> VulnRuleIndexR
     )
 
 
-def _to_read_model(rule: RuleDefinition) -> VulnRuleRead:
+def _to_read_model(rule: RuleDefinition, metadata: RuleCatalogMetadata | None = None) -> VulnRuleRead:
     payload = RuleStore.serialize_rule(rule)
     payload.setdefault("cve_ids", [])
     payload.setdefault("cwe_ids", [])
@@ -201,6 +221,24 @@ def _to_read_model(rule: RuleDefinition) -> VulnRuleRead:
     payload.setdefault("active_check", None)
     payload.setdefault("created_at", None)
     payload.setdefault("updated_at", None)
+    payload["intel_summary"] = {
+        "cve_count": metadata.intel_summary.cve_count if metadata else len(payload["cve_ids"]),
+        "max_cvss": metadata.intel_summary.max_cvss if metadata else None,
+        "max_epss": metadata.intel_summary.max_epss if metadata else None,
+        "kev_flag": metadata.intel_summary.kev_flag if metadata else False,
+        "exploit_maturity": metadata.intel_summary.exploit_maturity if metadata else None,
+        "intel_synced_at": metadata.intel_summary.intel_synced_at if metadata else None,
+        "stale": metadata.intel_summary.stale if metadata else False,
+    }
+    payload["governance"] = {
+        "owner_id": metadata.owner_id if metadata else None,
+        "review_status": metadata.review_status if metadata else "published",
+        "change_ticket": metadata.change_ticket if metadata else None,
+        "last_validated_at": metadata.last_validated_at if metadata else None,
+        "last_preview_at": metadata.last_preview_at if metadata else None,
+        "updated_at": metadata.updated_at if metadata else None,
+    }
+    payload["affected_open_finding_count"] = metadata.affected_open_finding_count if metadata else 0
     return VulnRuleRead.model_validate(payload)
 
 
@@ -221,4 +259,38 @@ def _to_import_response(result: VulnRuleImportResult) -> VulnRuleImportResponse:
             {"rule_id": item.rule_id, "message": item.message}
             for item in result.errors
         ],
+        impact_preview=RuleImportImpactPreviewRead.model_validate(
+            {
+                "created_rule_ids": result.impact_preview.created_rule_ids,
+                "updated_rule_ids": result.impact_preview.updated_rule_ids,
+                "skipped_rule_ids": result.impact_preview.skipped_rule_ids,
+                "total_affected_open_findings": result.impact_preview.total_affected_open_findings,
+                "high_risk_rule_ids": result.impact_preview.high_risk_rule_ids,
+                "changes": [
+                    {
+                        "rule_id": item.rule_id,
+                        "operation": item.operation,
+                        "changed_fields": item.changed_fields,
+                        "high_risk_flags": item.high_risk_flags,
+                        "affected_open_findings": item.affected_open_findings,
+                    }
+                    for item in result.impact_preview.changes
+                ],
+            }
+        ) if result.impact_preview is not None else None,
+    )
+
+
+def _to_intel_status_read(payload) -> VulnIntelStatusRead:
+    return VulnIntelStatusRead.model_validate(
+        {
+            "total_cves": payload.total_cves,
+            "tracked_rule_cves": payload.tracked_rule_cves,
+            "synced_cves": payload.synced_cves,
+            "stale": payload.stale,
+            "stale_count": payload.stale_count,
+            "last_synced_at": payload.last_synced_at,
+            "sources": payload.sources,
+            "updated_cves": payload.updated_cves,
+        }
     )

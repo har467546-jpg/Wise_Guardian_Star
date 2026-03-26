@@ -1,24 +1,34 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
-from sqlalchemy import String, case, delete, desc, distinct, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import String, case, delete, desc, distinct, func, inspect as sa_inspect, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 from sqlalchemy.sql import text
 
-from app.db.models.enums import RiskSeverity
+from app.db.models.enums import FindingStatus, RiskSeverity
+from app.db.models.risk_finding import RiskFinding
+from app.db.models.vuln_rule_governance import VulnRuleGovernance
 from app.db.models.vuln_rule_index import VulnRuleIndex
 from app.db.session import SessionLocal
 from app.rules.rule_loader import RuleLoadError, RuleSet
 from app.rules.rule_matcher import RuleDefinition
 from app.rules.rule_store import RuleBatchStatusResult, RuleImportWriteResult, RuleStore
+from app.services.finding_governance_service import recalculate_open_finding_priorities
+from app.services.vuln_intel_service import (
+    RuleIntelSummary,
+    VulnIntelSyncResult,
+    build_rule_intel_summary_map,
+    get_vuln_intel_status,
+    sync_vuln_intel,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +47,8 @@ class VulnLibraryStatusPayload:
     source_mtime: float | None
     rule_count: int
     last_error: str | None
+    schema_ready: bool
+    schema_error: str | None
     indexed_rule_count: int
     index_synced_at: datetime | None
     index_in_sync: bool
@@ -44,9 +56,38 @@ class VulnLibraryStatusPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class VulnLibrarySchemaStatus:
+    ready: bool
+    error: str | None = None
+
+
+class VulnLibrarySchemaNotReadyError(RuntimeError):
+    """Raised when the vuln intel/governance schema has not been migrated."""
+
+
+@dataclass(frozen=True, slots=True)
 class VulnRuleImportError:
     rule_id: str | None
     message: str
+
+
+@dataclass(frozen=True, slots=True)
+class RuleImportImpactChange:
+    rule_id: str
+    operation: str
+    changed_fields: list[str] = field(default_factory=list)
+    high_risk_flags: list[str] = field(default_factory=list)
+    affected_open_findings: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RuleImportImpactPreview:
+    created_rule_ids: list[str] = field(default_factory=list)
+    updated_rule_ids: list[str] = field(default_factory=list)
+    skipped_rule_ids: list[str] = field(default_factory=list)
+    total_affected_open_findings: int = 0
+    high_risk_rule_ids: list[str] = field(default_factory=list)
+    changes: list[RuleImportImpactChange] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +100,7 @@ class VulnRuleImportResult:
     updated_ids: list[str] = field(default_factory=list)
     skipped_ids: list[str] = field(default_factory=list)
     errors: list[VulnRuleImportError] = field(default_factory=list)
+    impact_preview: RuleImportImpactPreview | None = None
 
     @property
     def created(self) -> int:
@@ -93,9 +135,61 @@ class VulnRuleIndexRebuildResult:
     index_last_error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class RuleCatalogMetadata:
+    rule_id: str
+    intel_summary: RuleIntelSummary
+    owner_id: str | None = None
+    review_status: str = "published"
+    change_ticket: str | None = None
+    last_validated_at: datetime | None = None
+    last_preview_at: datetime | None = None
+    updated_at: datetime | None = None
+    affected_open_finding_count: int = 0
+
+
 class VulnLibraryService:
     LEGACY_EXPOSURE_TAG = "legacy-exposure"
     HIGH_VALUE_TAG = "high-value"
+    _REQUIRED_SCHEMA_TABLES = (
+        "vuln_cve_intel",
+        "finding_governance",
+        "finding_waivers",
+        "vuln_rule_governance",
+    )
+    _REQUIRED_INDEX_COLUMNS = (
+        "cve_count",
+        "max_cvss",
+        "max_epss",
+        "kev_flag",
+        "exploit_maturity",
+        "intel_synced_at",
+    )
+    _TRACKED_IMPORT_FIELDS = (
+        "name",
+        "enabled",
+        "service",
+        "severity",
+        "description",
+        "match",
+        "cve_ids",
+        "cwe_ids",
+        "affected_versions_text",
+        "exploit_module",
+        "preconditions",
+        "verify_playbook",
+        "mitigations",
+        "remediation",
+        "references",
+        "tags",
+        "active_check",
+    )
+    _SEVERITY_RANK = {
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "critical": 4,
+    }
 
     def __init__(
         self,
@@ -150,27 +244,74 @@ class VulnLibraryService:
         self._ensure_index_current(self.rule_store.loader.maybe_reload())
         return self.rule_store.get_rule(rule_id)
 
+    def get_rule_catalog_metadata(self, rules: list[RuleDefinition]) -> dict[str, RuleCatalogMetadata]:
+        if not rules:
+            return {}
+        with self.session_factory() as db:
+            intel_summaries = build_rule_intel_summary_map(db, rules)
+            governance_rows = self._load_rule_governance_map(db, [rule.rule_id for rule in rules])
+            open_finding_counts = self._count_open_findings_by_rule(db)
+
+        metadata: dict[str, RuleCatalogMetadata] = {}
+        for rule in rules:
+            governance = governance_rows.get(rule.rule_id)
+            metadata[rule.rule_id] = RuleCatalogMetadata(
+                rule_id=rule.rule_id,
+                intel_summary=intel_summaries.get(rule.rule_id, RuleIntelSummary(cve_count=len(rule.cve_ids or []))),
+                owner_id=governance.owner_id if governance is not None else None,
+                review_status=governance.review_status if governance is not None else "published",
+                change_ticket=governance.change_ticket if governance is not None else None,
+                last_validated_at=governance.last_validated_at if governance is not None else None,
+                last_preview_at=governance.last_preview_at if governance is not None else None,
+                updated_at=governance.updated_at if governance is not None else None,
+                affected_open_finding_count=open_finding_counts.get(rule.rule_id, 0),
+            )
+        return metadata
+
+    def get_intel_status(self) -> VulnIntelSyncResult:
+        rules = self.rule_store.loader.maybe_reload().rules
+        with self.session_factory() as db:
+            return get_vuln_intel_status(db, rules=rules)
+
+    def sync_intel(self) -> VulnIntelSyncResult:
+        ruleset = self.rule_store.loader.maybe_reload()
+        schema_status = self._get_schema_status()
+        if not schema_status.ready:
+            raise VulnLibrarySchemaNotReadyError(schema_status.error or self._default_schema_error_message())
+        expected_hash = self._calculate_source_hash(ruleset.rules)
+        with self.session_factory() as db:
+            result = sync_vuln_intel(db, rules=ruleset.rules)
+            self._rebuild_index_in_session(db, ruleset.rules, expected_hash)
+            recalculate_open_finding_priorities(db, rules=ruleset.rules)
+            return result
+
     def create_rule(self, payload: dict[str, Any]) -> RuleDefinition:
         rule = self.rule_store.create_rule(payload)
+        self.touch_rule_governance([rule.rule_id], validated=True)
         self._refresh_index_after_write()
         return rule
 
     def update_rule(self, rule_id: str, payload: dict[str, Any]) -> RuleDefinition:
         rule = self.rule_store.update_rule(rule_id, payload)
+        self.touch_rule_governance([rule.rule_id], validated=True)
         self._refresh_index_after_write()
         return rule
 
     def delete_rule(self, rule_id: str) -> None:
         self.rule_store.delete_rule(rule_id)
+        self._delete_rule_governance([rule_id])
         self._refresh_index_after_write()
 
     def bootstrap_rules(self, payload_rules: list[dict[str, Any]]) -> tuple[list[RuleDefinition], list[str]]:
         result = self.rule_store.bootstrap_rules(payload_rules)
+        self.touch_rule_governance([rule.rule_id for rule in result[0]], validated=True)
         self._refresh_index_after_write()
         return result
 
     def batch_update_status(self, rule_ids: list[str], *, enabled: bool) -> RuleBatchStatusResult:
         result = self.rule_store.set_rules_enabled(rule_ids, enabled=enabled)
+        if result.updated_ids:
+            self.touch_rule_governance(result.updated_ids, validated=True)
         self._refresh_index_after_write()
         return result
 
@@ -252,21 +393,26 @@ class VulnLibraryService:
             )
 
         preview = self._preview_import(imported_payloads, mode=normalized_mode)
+        preview = replace(
+            preview,
+            dry_run=dry_run,
+            mode=normalized_mode,
+            detected_format=detected_format,
+            total_in_file=total_in_file,
+        )
         if dry_run:
-            return VulnRuleImportResult(
-                dry_run=True,
-                mode=normalized_mode,
-                detected_format=detected_format,
-                total_in_file=total_in_file,
-                created_ids=preview.created_ids,
-                updated_ids=preview.updated_ids,
-                skipped_ids=preview.skipped_ids,
-            )
+            impacted_rule_ids = preview.created_ids + preview.updated_ids
+            if impacted_rule_ids:
+                self.touch_rule_governance(impacted_rule_ids, previewed=True)
+            return preview
 
         if preview.error_count:
             return preview
 
         write_result = self.rule_store.import_rules(imported_payloads, mode=normalized_mode)
+        changed_rule_ids = write_result.created_ids + write_result.updated_ids
+        if changed_rule_ids:
+            self.touch_rule_governance(changed_rule_ids, previewed=True, validated=True)
         self._refresh_index_after_write()
         return VulnRuleImportResult(
             dry_run=False,
@@ -276,10 +422,14 @@ class VulnLibraryService:
             created_ids=write_result.created_ids,
             updated_ids=write_result.updated_ids,
             skipped_ids=write_result.skipped_ids,
+            impact_preview=preview.impact_preview,
         )
 
     def upsert_rules(self, payload_rules: list[dict[str, Any]]) -> RuleImportWriteResult:
         write_result = self.rule_store.import_rules(payload_rules, mode="upsert")
+        changed_rule_ids = write_result.created_ids + write_result.updated_ids
+        if changed_rule_ids:
+            self.touch_rule_governance(changed_rule_ids, validated=True)
         self._refresh_index_after_write()
         return write_result
 
@@ -296,22 +446,59 @@ class VulnLibraryService:
 
     def get_status(self) -> VulnLibraryStatusPayload:
         ruleset = self.rule_store.loader.maybe_reload()
-        index_status = self._ensure_index_current(ruleset)
+        schema_status = self._get_schema_status()
+        if schema_status.ready:
+            index_status = self._ensure_index_current(ruleset)
+        else:
+            index_status = VulnLibraryIndexStatus(
+                indexed_rule_count=0,
+                index_synced_at=None,
+                index_in_sync=False,
+                source_hash=self._calculate_source_hash(ruleset.rules),
+                index_last_error=schema_status.error,
+            )
         return VulnLibraryStatusPayload(
             path=ruleset.path,
             loaded_at=ruleset.loaded_at,
             source_mtime=ruleset.source_mtime,
             rule_count=len(ruleset.rules),
             last_error=ruleset.last_error,
+            schema_ready=schema_status.ready,
+            schema_error=schema_status.error,
             indexed_rule_count=index_status.indexed_rule_count,
             index_synced_at=index_status.index_synced_at,
             index_in_sync=index_status.index_in_sync,
             index_last_error=index_status.index_last_error,
         )
 
+    def touch_rule_governance(
+        self,
+        rule_ids: list[str],
+        *,
+        previewed: bool = False,
+        validated: bool = False,
+    ) -> None:
+        normalized_rule_ids = [item for item in dict.fromkeys(rule_ids) if item]
+        if not normalized_rule_ids:
+            return
+        with self.session_factory() as db:
+            now = datetime.now(timezone.utc)
+            rows = self._ensure_rule_governance_rows(db, normalized_rule_ids)
+            for row in rows.values():
+                if previewed:
+                    row.last_preview_at = now
+                if validated:
+                    row.last_validated_at = now
+                row.updated_at = now
+                db.add(row)
+            db.commit()
+
     def _refresh_index_after_write(self) -> None:
         try:
-            self._ensure_index_current(self.rule_store.loader.load(force=True), force=True, raise_on_error=True)
+            ruleset = self.rule_store.loader.load(force=True)
+            self._ensure_index_current(ruleset, force=True, raise_on_error=True)
+            with self.session_factory() as db:
+                recalculate_open_finding_priorities(db, rules=ruleset.rules)
         except Exception as exc:  # pragma: no cover - fallback for degraded index sync
             self._last_index_error = str(exc)
 
@@ -350,6 +537,57 @@ class VulnLibraryService:
                 index_last_error=str(exc),
             )
 
+    def _get_schema_status(self) -> VulnLibrarySchemaStatus:
+        try:
+            with self.session_factory() as db:
+                bind = db.get_bind()
+                inspector = sa_inspect(bind)
+                table_names = set(inspector.get_table_names())
+                missing_tables = [name for name in self._REQUIRED_SCHEMA_TABLES if name not in table_names]
+                missing_columns: list[str] = []
+                if "vuln_rule_index" not in table_names:
+                    missing_tables.append("vuln_rule_index")
+                else:
+                    columns = {item["name"] for item in inspector.get_columns("vuln_rule_index")}
+                    missing_columns = [
+                        f"vuln_rule_index.{name}"
+                        for name in self._REQUIRED_INDEX_COLUMNS
+                        if name not in columns
+                    ]
+                if missing_tables or missing_columns:
+                    return VulnLibrarySchemaStatus(
+                        ready=False,
+                        error=self._format_schema_error_message(
+                            missing_tables=missing_tables,
+                            missing_columns=missing_columns,
+                        ),
+                    )
+        except Exception as exc:  # pragma: no cover - defensive health reporting
+            return VulnLibrarySchemaStatus(
+                ready=False,
+                error=f"{self._default_schema_error_message()}（结构检查失败：{exc}）",
+            )
+        return VulnLibrarySchemaStatus(ready=True, error=None)
+
+    @staticmethod
+    def _default_schema_error_message() -> str:
+        return "数据库结构未升级，请先执行 alembic upgrade head"
+
+    def _format_schema_error_message(
+        self,
+        *,
+        missing_tables: list[str],
+        missing_columns: list[str],
+    ) -> str:
+        details: list[str] = []
+        if missing_tables:
+            details.append(f"缺少表：{', '.join(missing_tables)}")
+        if missing_columns:
+            details.append(f"缺少列：{', '.join(missing_columns)}")
+        if not details:
+            return self._default_schema_error_message()
+        return f"{self._default_schema_error_message()}（{'；'.join(details)}）"
+
     def _list_rule_ids_from_index(
         self,
         *,
@@ -378,6 +616,9 @@ class VulnLibraryService:
             ordered_ids = db.execute(
                 ids_stmt.order_by(
                     desc(self._catalog_priority_expression()),
+                    desc(VulnRuleIndex.kev_flag),
+                    desc(VulnRuleIndex.max_epss).nullslast(),
+                    desc(VulnRuleIndex.max_cvss).nullslast(),
                     desc(VulnRuleIndex.yaml_updated_at).nullslast(),
                     VulnRuleIndex.service.asc(),
                     VulnRuleIndex.name.asc(),
@@ -419,6 +660,9 @@ class VulnLibraryService:
                     ordered_ids = db.execute(
                         ids_stmt.order_by(
                             desc(self._catalog_priority_expression()),
+                            desc(VulnRuleIndex.kev_flag),
+                            desc(VulnRuleIndex.max_epss).nullslast(),
+                            desc(VulnRuleIndex.max_cvss).nullslast(),
                             desc(VulnRuleIndex.yaml_updated_at).nullslast(),
                             VulnRuleIndex.service.asc(),
                             VulnRuleIndex.name.asc(),
@@ -444,12 +688,24 @@ class VulnLibraryService:
         created_ids: list[str] = []
         updated_ids: list[str] = []
         skipped_ids: list[str] = []
+        changes: list[RuleImportImpactChange] = []
+
+        with self.session_factory() as db:
+            open_finding_counts = self._count_open_findings_by_rule(db)
 
         for payload in imported_payloads:
             rule_id = payload["id"]
             current_payload = existing_payloads.get(rule_id)
             if current_payload is None:
                 created_ids.append(rule_id)
+                changes.append(
+                    RuleImportImpactChange(
+                        rule_id=rule_id,
+                        operation="create",
+                        changed_fields=["new_rule"],
+                        affected_open_findings=0,
+                    )
+                )
                 continue
 
             if mode == "skip_existing":
@@ -458,8 +714,29 @@ class VulnLibraryService:
 
             if self.rule_store._payloads_equal(current_payload, payload):
                 skipped_ids.append(rule_id)
-            else:
-                updated_ids.append(rule_id)
+                continue
+
+            changed_fields = self._detect_changed_fields(current_payload, payload)
+            high_risk_flags = self._detect_high_risk_flags(current_payload, payload)
+            updated_ids.append(rule_id)
+            changes.append(
+                RuleImportImpactChange(
+                    rule_id=rule_id,
+                    operation="update",
+                    changed_fields=changed_fields,
+                    high_risk_flags=high_risk_flags,
+                    affected_open_findings=open_finding_counts.get(rule_id, 0),
+                )
+            )
+
+        impact_preview = RuleImportImpactPreview(
+            created_rule_ids=created_ids,
+            updated_rule_ids=updated_ids,
+            skipped_rule_ids=skipped_ids,
+            total_affected_open_findings=sum(item.affected_open_findings for item in changes),
+            high_risk_rule_ids=[item.rule_id for item in changes if item.high_risk_flags],
+            changes=changes,
+        )
 
         return VulnRuleImportResult(
             dry_run=True,
@@ -469,7 +746,81 @@ class VulnLibraryService:
             created_ids=created_ids,
             updated_ids=updated_ids,
             skipped_ids=skipped_ids,
+            impact_preview=impact_preview,
         )
+
+    def _load_rule_governance_map(self, db: Session, rule_ids: list[str]) -> dict[str, VulnRuleGovernance]:
+        if not rule_ids:
+            return {}
+        rows = db.execute(
+            select(VulnRuleGovernance).where(VulnRuleGovernance.rule_id.in_(rule_ids))
+        ).scalars().all()
+        return {row.rule_id: row for row in rows}
+
+    def _ensure_rule_governance_rows(self, db: Session, rule_ids: list[str]) -> dict[str, VulnRuleGovernance]:
+        governance_rows = self._load_rule_governance_map(db, rule_ids)
+        for rule_id in rule_ids:
+            if rule_id in governance_rows:
+                continue
+            row = VulnRuleGovernance(rule_id=rule_id, review_status="published")
+            db.add(row)
+            governance_rows[rule_id] = row
+        db.flush()
+        return governance_rows
+
+    def _delete_rule_governance(self, rule_ids: list[str]) -> None:
+        normalized_rule_ids = [item for item in dict.fromkeys(rule_ids) if item]
+        if not normalized_rule_ids:
+            return
+        with self.session_factory() as db:
+            db.execute(delete(VulnRuleGovernance).where(VulnRuleGovernance.rule_id.in_(normalized_rule_ids)))
+            db.commit()
+
+    def _count_open_findings_by_rule(self, db: Session) -> dict[str, int]:
+        findings = db.execute(
+            select(RiskFinding.evidence_json).where(RiskFinding.status == FindingStatus.OPEN)
+        ).scalars().all()
+        counts: dict[str, int] = {}
+        for evidence in findings:
+            if not isinstance(evidence, dict):
+                continue
+            rule_id = str(evidence.get("yaml_rule_id") or "").strip()
+            if not rule_id:
+                continue
+            counts[rule_id] = counts.get(rule_id, 0) + 1
+        return counts
+
+    def _detect_changed_fields(self, current_payload: dict[str, Any], incoming_payload: dict[str, Any]) -> list[str]:
+        changed_fields: list[str] = []
+        for field_name in self._TRACKED_IMPORT_FIELDS:
+            if self._stable_payload_value(current_payload.get(field_name)) != self._stable_payload_value(incoming_payload.get(field_name)):
+                changed_fields.append(field_name)
+        return changed_fields
+
+    def _detect_high_risk_flags(self, current_payload: dict[str, Any], incoming_payload: dict[str, Any]) -> list[str]:
+        flags: list[str] = []
+
+        current_severity = str(current_payload.get("severity") or "").strip().lower()
+        incoming_severity = str(incoming_payload.get("severity") or "").strip().lower()
+        if current_severity and incoming_severity and self._SEVERITY_RANK.get(incoming_severity, 0) < self._SEVERITY_RANK.get(current_severity, 0):
+            flags.append("severity_downgraded")
+
+        current_cves = {str(item or "").strip().upper() for item in current_payload.get("cve_ids") or [] if str(item or "").strip()}
+        incoming_cves = {str(item or "").strip().upper() for item in incoming_payload.get("cve_ids") or [] if str(item or "").strip()}
+        if current_cves - incoming_cves:
+            flags.append("cve_ids_removed")
+
+        if current_payload.get("active_check") and not incoming_payload.get("active_check"):
+            flags.append("active_check_removed")
+
+        if current_payload.get("remediation") and not incoming_payload.get("remediation"):
+            flags.append("remediation_removed")
+
+        return flags
+
+    @staticmethod
+    def _stable_payload_value(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 
     def _read_index_status(self, db: Session, *, expected_hash: str, expected_count: int) -> VulnLibraryIndexStatus:
         indexed_rule_count = int(db.scalar(select(func.count()).select_from(VulnRuleIndex)) or 0)
@@ -497,11 +848,14 @@ class VulnLibraryService:
 
     def _rebuild_index_in_session(self, db: Session, rules: list[RuleDefinition], expected_hash: str) -> VulnLibraryIndexStatus:
         indexed_at = datetime.now(timezone.utc)
+        intel_summaries = build_rule_intel_summary_map(db, rules)
         # Serialize index rebuild writers to avoid concurrent delete-and-reinsert races.
-        db.execute(text("LOCK TABLE vuln_rule_index IN EXCLUSIVE MODE"))
+        if getattr(getattr(db, "bind", None), "dialect", None) and db.bind.dialect.name != "sqlite":
+            db.execute(text("LOCK TABLE vuln_rule_index IN EXCLUSIVE MODE"))
         db.execute(delete(VulnRuleIndex))
         db.flush()
         for rule in rules:
+            intel_summary = intel_summaries.get(rule.rule_id, RuleIntelSummary(cve_count=len(rule.cve_ids or [])))
             db.add(
                 VulnRuleIndex(
                     rule_id=rule.rule_id,
@@ -516,6 +870,12 @@ class VulnLibraryService:
                     active_detector=rule.active_check.detector if rule.active_check else None,
                     active_trigger=rule.active_check.trigger if rule.active_check else None,
                     cve_ids=rule.cve_ids,
+                    cve_count=intel_summary.cve_count,
+                    max_cvss=intel_summary.max_cvss,
+                    max_epss=intel_summary.max_epss,
+                    kev_flag=intel_summary.kev_flag,
+                    exploit_maturity=intel_summary.exploit_maturity,
+                    intel_synced_at=intel_summary.intel_synced_at,
                     tags=rule.tags,
                     yaml_created_at=self._parse_yaml_datetime(rule.created_at),
                     yaml_updated_at=self._parse_yaml_datetime(rule.updated_at),
@@ -545,20 +905,19 @@ class VulnLibraryService:
         keyword_value = (keyword or "").strip().lower()
         if keyword_value:
             like_value = f"%{keyword_value}%"
+            search_blob = (
+                func.coalesce(VulnRuleIndex.rule_id, "")
+                + " "
+                + func.coalesce(VulnRuleIndex.name, "")
+                + " "
+                + func.coalesce(VulnRuleIndex.service, "")
+                + " "
+                + func.coalesce(func.cast(VulnRuleIndex.cve_ids, String), "")
+                + " "
+                + func.coalesce(func.cast(VulnRuleIndex.tags, String), "")
+            )
             conditions.append(
-                func.lower(
-                    func.concat(
-                        VulnRuleIndex.rule_id,
-                        " ",
-                        VulnRuleIndex.name,
-                        " ",
-                        VulnRuleIndex.service,
-                        " ",
-                        func.coalesce(func.cast(VulnRuleIndex.cve_ids, String), ""),
-                        " ",
-                        func.coalesce(func.cast(VulnRuleIndex.tags, String), ""),
-                    )
-                ).like(like_value)
+                func.lower(search_blob).like(like_value)
             )
         service_value = (service or "").strip().lower()
         if service_value:

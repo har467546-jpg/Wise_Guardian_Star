@@ -6,6 +6,7 @@ from typing import Any
 
 from celery import Task
 from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.orm.exc import DetachedInstanceError
 
 from app.core.celery_app import celery_app
 from app.db.models.agent_session import AgentSession
@@ -13,12 +14,14 @@ from app.db.models.enums import TaskExecutionStatus
 from app.db.session import SessionLocal
 from app.repositories.task_repo import get_task_run, update_task_run
 from app.services.haor_agent_service import (
+    append_blocked_action_result_message,
     append_agent_task_message,
     build_auto_action_task_followup_content,
     execute_approved_action,
     has_agent_task_followup_message,
     mark_agent_session_interrupted,
     sync_agent_task_watch_state,
+    transition_session_to_remediation_secure_input,
     wait_for_child_task,
 )
 from app.tasks.task_runtime import (
@@ -43,6 +46,17 @@ _NON_RETRYABLE_REMEDIATION_ERRORS = (
     "仅允许审批当前最早可执行阶段",
     "修复会话不存在",
 )
+_NON_RETRYABLE_ORCHESTRATE_ERRORS = _NON_RETRYABLE_REMEDIATION_ERRORS + (
+    "会话状态已过期，请刷新页面后重试",
+)
+_SSH_REMEDIATION_BLOCKER_CODES = {
+    "missing_ssh_credential",
+    "authorization_unconfirmed",
+    "authorization_not_verified",
+    "insufficient_privilege",
+}
+_TERMINAL_FOLLOWUP_SECURE_INPUT = "secure_input_required"
+_TERMINAL_FOLLOWUP_BLOCKED = "blocked"
 
 
 def _deep_merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -78,6 +92,10 @@ def _humanize_orchestrate_error(exc: Exception) -> str:
     raw_message = str(exc).strip()
     if not raw_message:
         return "haor 编排执行失败，请稍后重试"
+    if isinstance(exc, DetachedInstanceError) or (
+        "is not bound to a Session" in raw_message and "attribute refresh operation cannot proceed" in raw_message
+    ):
+        return "会话状态已过期，请刷新页面后重试"
     if isinstance(exc, (IntegrityError, ProgrammingError)):
         lowered = raw_message.lower()
         if "remediation_sessions_approved_by_fkey" in raw_message or (
@@ -85,11 +103,50 @@ def _humanize_orchestrate_error(exc: Exception) -> str:
         ):
             return "审批人信息无效，请刷新页面后重试"
         return "haor 编排执行失败，请稍后重试"
-    for message in _NON_RETRYABLE_REMEDIATION_ERRORS:
+    for message in _NON_RETRYABLE_ORCHESTRATE_ERRORS:
         if message in raw_message:
             return message
     sanitized = sanitize_text(raw_message, max_length=200, single_line=True) or ""
     return sanitized or "haor 编排执行失败，请稍后重试"
+
+
+def _is_submit_if_ready_remediation_action(action: dict[str, Any]) -> bool:
+    if str(action.get("action_type") or "").strip() != "create_or_resume_remediation_session":
+        return False
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    raw_submit_if_ready = params.get("submit_if_ready")
+    if isinstance(raw_submit_if_ready, bool):
+        return raw_submit_if_ready
+    if isinstance(raw_submit_if_ready, str):
+        return raw_submit_if_ready.strip().lower() in {"true", "1", "yes", "y", "on"}
+    return bool(raw_submit_if_ready)
+
+
+def _result_blocker_codes(result_payload: dict[str, Any] | None) -> list[str]:
+    payload = result_payload if isinstance(result_payload, dict) else {}
+    blocker_codes = payload.get("blocker_codes") if isinstance(payload.get("blocker_codes"), list) else []
+    normalized: list[str] = []
+    for item in blocker_codes:
+        code = str(item or "").strip()
+        if code and code not in normalized:
+            normalized.append(code)
+    return normalized
+
+
+def _remediation_blocked_followup_mode(
+    action: dict[str, Any],
+    *,
+    child_task_id: str | None,
+    result_payload: dict[str, Any] | None,
+) -> str | None:
+    if child_task_id or not _is_submit_if_ready_remediation_action(action):
+        return None
+    payload = result_payload if isinstance(result_payload, dict) else {}
+    if payload.get("execution_ready") is not False:
+        return None
+    if any(code in _SSH_REMEDIATION_BLOCKER_CODES for code in _result_blocker_codes(payload)):
+        return _TERMINAL_FOLLOWUP_SECURE_INPUT
+    return _TERMINAL_FOLLOWUP_BLOCKED
 
 
 def _should_retry_orchestrate_error(
@@ -105,7 +162,7 @@ def _should_retry_orchestrate_error(
     if isinstance(exc, (IntegrityError, ProgrammingError)):
         return False
     humanized = _humanize_orchestrate_error(exc)
-    if humanized in _NON_RETRYABLE_REMEDIATION_ERRORS:
+    if humanized in _NON_RETRYABLE_ORCHESTRATE_ERRORS:
         return False
     return True
 
@@ -187,6 +244,7 @@ def run_agent_orchestrate_task(
                     session = db.get(AgentSession, session_id)
                     if session is None:
                         raise RuntimeError("haor 会话不存在")
+                    current_goal_id = getattr(session, "current_goal_id", None)
                     entered_action_execution = True
                     result = execute_approved_action(
                         db,
@@ -257,7 +315,7 @@ def run_agent_orchestrate_task(
                             "child_task": child_summary,
                             "resume_hint": {
                                 **followup_resume_hint,
-                                "goal_id": getattr(session, "current_goal_id", None),
+                                "goal_id": current_goal_id,
                             },
                         },
                     }
@@ -272,8 +330,13 @@ def run_agent_orchestrate_task(
                     if child_summary.get("status") != TaskExecutionStatus.SUCCESS.value:
                         raise RuntimeError(followup_content)
                 elif result.summary:
+                    remediation_followup_mode = _remediation_blocked_followup_mode(
+                        action,
+                        child_task_id=result.child_task_id,
+                        result_payload=result.payload,
+                    )
                     terminal_followup = {
-                        "message_type": "task_update",
+                        "message_type": remediation_followup_mode or "task_update",
                         "content": result.summary,
                         "payload_json": {
                             "task_id": task_run_id,
@@ -313,13 +376,48 @@ def run_agent_orchestrate_task(
                     final_watch_task_id = task_run_id
                     if len(action_results) == 1 and isinstance(terminal_followup, dict):
                         followup_payload = terminal_followup.get("payload_json")
-                        final_message_type = str(terminal_followup.get("message_type") or "task_update")
-                        final_message_content = str(terminal_followup.get("content") or final_message_content)
+                        followup_message_type = str(terminal_followup.get("message_type") or "task_update")
+                        followup_content = str(terminal_followup.get("content") or final_message_content)
+                        followup_payload_json = followup_payload if isinstance(followup_payload, dict) else {}
+                        if followup_message_type == _TERMINAL_FOLLOWUP_SECURE_INPUT:
+                            transition_session_to_remediation_secure_input(
+                                db,
+                                session_id=session_id,
+                                task_id=task_run_id,
+                                action=followup_payload_json.get("action")
+                                if isinstance(followup_payload_json.get("action"), dict)
+                                else (actions[0] if actions else {}),
+                                result_payload=followup_payload_json.get("result_payload")
+                                if isinstance(followup_payload_json.get("result_payload"), dict)
+                                else {},
+                                content=followup_content,
+                            )
+                            db.commit()
+                            set_task_success(task_run_id, "haor 编排任务完成", current_result)
+                            return task_run_id
+                        if followup_message_type == _TERMINAL_FOLLOWUP_BLOCKED:
+                            append_blocked_action_result_message(
+                                db,
+                                session_id=session_id,
+                                task_id=task_run_id,
+                                action=followup_payload_json.get("action")
+                                if isinstance(followup_payload_json.get("action"), dict)
+                                else (actions[0] if actions else {}),
+                                result_payload=followup_payload_json.get("result_payload")
+                                if isinstance(followup_payload_json.get("result_payload"), dict)
+                                else {},
+                                content=followup_content,
+                            )
+                            db.commit()
+                            set_task_success(task_run_id, "haor 编排任务完成", current_result)
+                            return task_run_id
+                        final_message_type = followup_message_type
+                        final_message_content = followup_content
                         final_message_payload = {
                             "results": action_results,
                             "task_id": task_run_id,
                             "orchestrate_task_id": task_run_id,
-                            **(followup_payload if isinstance(followup_payload, dict) else {}),
+                            **followup_payload_json,
                         }
                         final_watch_task_id = str(final_message_payload.get("task_id") or task_run_id)
                     session.status = "active"

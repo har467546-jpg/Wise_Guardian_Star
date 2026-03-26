@@ -13,7 +13,7 @@ from app.db.models.enums import TaskExecutionStatus, TaskType, UserRole
 from app.db.models.remediation_session import RemediationSession
 from app.db.models.user import User
 from app.db.session import SessionLocal
-from app.repositories.task_event_repo import list_task_events_for_runs
+from app.repositories.task_event_repo import create_task_event, list_task_events_for_runs
 from app.repositories.task_repo import create_task_run, get_task_run, update_task_run
 from app.schemas.remediation import (
     HostRunnerInstallRead,
@@ -29,13 +29,16 @@ from app.schemas.remediation import (
     RemediationSessionMessageCreateRequest,
     RemediationSessionRead,
     RemediationTaskRead,
+    RemediationTaskEvidenceRead,
     RemediationWorkspaceRead,
 )
+from app.services.remediation_executor import build_remediation_preview_result
 from app.services.remediation_service import (
     build_plan,
     build_workspace,
     get_manual_credential,
     list_remediation_assets,
+    selected_steps_require_maintenance_window,
     select_executable_plan_steps,
 )
 from app.services.remediation_session_service import (
@@ -193,6 +196,9 @@ def approve_host_remediation_session(
             session_id=session_id,
             approved_by=user.id,
             stage_code=payload.stage_code if payload else None,
+            execution_mode=payload.execution_mode if payload else "apply",
+            change_ticket=payload.change_ticket if payload else None,
+            maintenance_window_id=payload.maintenance_window_id if payload else None,
         )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -236,14 +242,26 @@ def execute_remediation_plan(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    execution_mode = str(payload.execution_mode or "dry_run").strip().lower() or "dry_run"
+    change_ticket = str(payload.change_ticket or "").strip() or None
+    maintenance_window_id = str(payload.maintenance_window_id or "").strip() or None
+    if execution_mode == "apply" and selected_steps_require_maintenance_window(selected_steps) and not maintenance_window_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="当前所选步骤需要维护窗口，请先填写 maintenance_window_id 后再正式执行",
+        )
     submitted_steps = [{"step_id": step.step_id} for step in selected_steps]
     task_run = create_task_run(
         db,
         task_type=TaskType.REMEDIATION_EXECUTE,
         scope_type="asset",
         scope_id=plan.asset_id,
-        message="交互式漏洞修复任务已入队",
+        message="修复预演任务已生成" if execution_mode == "dry_run" else "交互式漏洞修复任务已入队",
     )
+    selected_step_payloads = [
+        step.model_dump(mode="json") if hasattr(step, "model_dump") else step
+        for step in selected_steps
+    ]
     initial_result = {
         "context": {
             "asset_id": plan.asset_id,
@@ -256,26 +274,64 @@ def execute_remediation_plan(
             "submitted_steps": [
                 item.model_dump(mode="json") if hasattr(item, "model_dump") else item
                 for item in submitted_steps
-            ]
+            ],
+            "execution_mode": execution_mode,
+            "change_ticket": change_ticket,
+            "maintenance_window_id": maintenance_window_id,
         },
         "backups": {},
         "reverify": {},
     }
-    update_task_run(db, task_run, result_json=initial_result)
-    task = run_remediation_execute_task.delay(
-        task_run.id,
-        finding_id,
-        plan.model_dump(mode="json"),
-        [
-            item.model_dump(mode="json") if hasattr(item, "model_dump") else item
-            for item in submitted_steps
-        ],
-    )
-    update_task_run(db, task_run, celery_task_id=task.id)
+    if execution_mode == "dry_run":
+        preview_result = build_remediation_preview_result(
+            task_run_id=task_run.id,
+            context=initial_result["context"],
+            plan=plan.model_dump(mode="json"),
+            selected_steps=selected_step_payloads,
+            change_ticket=change_ticket,
+            maintenance_window_id=maintenance_window_id,
+        )
+        update_task_run(
+            db,
+            task_run,
+            status=TaskExecutionStatus.SUCCESS,
+            progress=100,
+            message="修复预演已生成，尚未执行任何主机变更",
+            result_json=preview_result,
+        )
+        create_task_event(
+            db,
+            task_run_id=task_run.id,
+            event_type="success",
+            level="info",
+            stage_code="dry_run_preview",
+            stage_name="修复预演",
+            message="修复预演已生成，尚未执行任何主机变更",
+            progress=100,
+            payload_json=preview_result,
+        )
+    else:
+        update_task_run(db, task_run, result_json=initial_result)
+        task = run_remediation_execute_task.delay(
+            task_run.id,
+            finding_id,
+            plan.model_dump(mode="json"),
+            [
+                item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+                for item in submitted_steps
+            ],
+            {
+                "execution_mode": execution_mode,
+                "change_ticket": change_ticket,
+                "maintenance_window_id": maintenance_window_id,
+            },
+        )
+        update_task_run(db, task_run, celery_task_id=task.id)
     return RemediationExecuteResponse(
         task_id=task_run.id,
         status=task_run.status,
         stream_url=f"/api/v1/remediation/tasks/{task_run.id}/stream",
+        execution_mode=execution_mode,
     )
 
 
@@ -304,11 +360,34 @@ def get_remediation_task(
         event_count=len(events),
         last_event_at=events[-1].created_at if events else None,
         execution_boundary=(result_json.get("execution") or {}).get("execution_boundary"),
+        execution_mode=(result_json.get("execution") or {}).get("execution_mode"),
         context=context,
         plan=result_json.get("plan") if isinstance(result_json.get("plan"), dict) else {},
         execution=result_json.get("execution") if isinstance(result_json.get("execution"), dict) else {},
         backups=result_json.get("backups") if isinstance(result_json.get("backups"), dict) else {},
         reverify=result_json.get("reverify") if isinstance(result_json.get("reverify"), dict) else {},
+    )
+
+
+@router.get("/tasks/{task_id}/evidence", response_model=RemediationTaskEvidenceRead)
+def get_remediation_task_evidence(
+    task_id: str,
+    db: Session = Depends(get_db_session),
+    _: User = Depends(get_admin_user),
+) -> RemediationTaskEvidenceRead:
+    task = get_task_run(db, task_id)
+    if task is None or task.task_type not in {TaskType.REMEDIATION_EXECUTE, TaskType.RUNNER_INSTALL}:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="修复任务不存在")
+    result_json = task.result_json if isinstance(task.result_json, dict) else {}
+    evidence = result_json.get("evidence") if isinstance(result_json.get("evidence"), dict) else {}
+    return RemediationTaskEvidenceRead(
+        task_id=task.id,
+        execution_mode=evidence.get("execution_mode"),
+        execution_boundary=evidence.get("execution_boundary"),
+        generated_at=evidence.get("generated_at"),
+        item_count=int(evidence.get("item_count") or 0),
+        items=evidence.get("items") if isinstance(evidence.get("items"), list) else [],
+        summary=evidence.get("summary") if isinstance(evidence.get("summary"), dict) else {},
     )
 
 

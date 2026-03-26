@@ -13,6 +13,7 @@ PLAYBOOK_ANALYZE_ASSET_RISKS = "analyze_asset_risks"
 PLAYBOOK_VERIFY_ASSET_RISKS = "verify_asset_risks"
 PLAYBOOK_INSTALL_RUNNER = "install_runner"
 PLAYBOOK_START_REMEDIATION_SESSION = "start_remediation_session"
+PLAYBOOK_CONFIGURE_SSH_CREDENTIAL = "configure_ssh_credential"
 GOAL_KIND_GENERAL = "general"
 
 
@@ -98,6 +99,17 @@ SKILL_REGISTRY: dict[str, AgentSkillDefinition] = {
         resume_strategy="resume_hint_or_goal",
         default_next_step="复盘修复结果或补齐阻塞条件",
     ),
+    PLAYBOOK_CONFIGURE_SSH_CREDENTIAL: AgentSkillDefinition(
+        skill_id=PLAYBOOK_CONFIGURE_SSH_CREDENTIAL,
+        title="配置 SSH 凭据",
+        entry_intents=["配置 ssh", "ssh 凭据", "管理员凭据", "私钥", "密码", "sudo 密码"],
+        required_context=["asset_id|selected_rows"],
+        write_chain=["configure_ssh_credential"],
+        success_criteria=["敏感字段已通过安全弹层保存", "凭据已验证", "原阻塞目标已自动续接或给出下一步"],
+        blockers=["缺少目标资产", "未选择批量资产"],
+        resume_strategy="goal_context",
+        default_next_step="验证凭据并恢复原目标",
+    ),
     "resume_task_detail": AgentSkillDefinition(
         skill_id="resume_task_detail",
         title="继续查看任务详情",
@@ -149,8 +161,92 @@ def _contains_risk_verification_intent(content: str) -> bool:
     )
 
 
+def _contains_ssh_credential_intent(content: str) -> bool:
+    lowered = content.lower()
+    return _contains_any(
+        content,
+        ("ssh 凭据", "SSH 凭据", "管理员凭据", "凭据配置", "配置凭据", "配置 ssh", "配置SSH", "私钥", "sudo 密码", "管理员授权"),
+    ) or ("ssh" in lowered and any(marker in content for marker in ("配置", "设置", "密码", "私钥", "授权", "凭据")))
+
+
 def _asset_id_from_context(page_context: dict[str, Any], working_context: dict[str, Any]) -> str | None:
     return _normalize_id(working_context.get("asset_id") or page_context.get("asset_id"))
+
+
+def _selected_asset_targets(browser_context: dict[str, Any]) -> list[dict[str, str]]:
+    semantic_page = browser_context.get("semantic_page_context") if isinstance(browser_context.get("semantic_page_context"), dict) else {}
+    selected_rows = semantic_page.get("selected_rows") if isinstance(semantic_page.get("selected_rows"), list) else []
+    targets: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in selected_rows:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        asset_id = _normalize_id(item.get("asset_id") or item.get("id") or meta.get("asset_id"))
+        if not asset_id or asset_id in seen:
+            continue
+        seen.add(asset_id)
+        label = _normalize_text(str(item.get("label") or meta.get("label") or f"资产 {asset_id}"), max_length=160) or f"资产 {asset_id}"
+        targets.append({"asset_id": asset_id, "label": label})
+        if len(targets) >= 20:
+            break
+    return targets
+
+
+def _current_goal_blockers(current_goal: Any | None) -> tuple[list[str], list[str]]:
+    if current_goal is None:
+        return [], []
+    blocker_messages: list[str] = []
+    blocker_codes: list[str] = []
+    blocked_reason = _normalize_text(str(getattr(current_goal, "blocked_reason", "") or ""), max_length=200)
+    if blocked_reason:
+        blocker_messages.append(blocked_reason)
+    progress_json = getattr(current_goal, "progress_json", None)
+    if isinstance(progress_json, dict):
+        blockers = progress_json.get("blockers") if isinstance(progress_json.get("blockers"), list) else []
+        for item in blockers:
+            if not isinstance(item, dict):
+                continue
+            code = _normalize_text(str(item.get("blocker_code") or ""), max_length=64)
+            message = _normalize_text(str(item.get("blocker_message") or ""), max_length=200)
+            if code:
+                blocker_codes.append(code)
+            if message:
+                blocker_messages.append(message)
+    return blocker_codes, blocker_messages
+
+
+def _goal_resume_action(
+    current_goal: Any | None,
+    *,
+    asset_targets: list[dict[str, str]],
+) -> dict[str, Any]:
+    if current_goal is None or not asset_targets:
+        return {}
+    goal_kind = _normalize_text(str(getattr(current_goal, "goal_kind", "") or ""), max_length=128)
+    asset_id = asset_targets[0]["asset_id"]
+    if goal_kind == PLAYBOOK_VERIFY_ASSET_RISKS:
+        return {
+            "action_type": "verify_asset_risks",
+            "title": f"验证资产 {asset_id} 的风险",
+            "reason": "SSH 凭据验证成功后，继续原风险验证目标。",
+            "params": {"asset_id": asset_id},
+        }
+    if goal_kind == PLAYBOOK_INSTALL_RUNNER:
+        return {
+            "action_type": "install_runner",
+            "title": f"为资产 {asset_id} 安装 Runner",
+            "reason": "SSH 凭据验证成功后，继续原 Runner 安装目标。",
+            "params": {"asset_id": asset_id},
+        }
+    if goal_kind == PLAYBOOK_START_REMEDIATION_SESSION:
+        return {
+            "action_type": "create_or_resume_remediation_session",
+            "title": f"为资产 {asset_id} 准备修复会话",
+            "reason": "SSH 凭据验证成功后，继续原自动修复目标。",
+            "params": {"asset_id": asset_id, "submit_if_ready": True},
+        }
+    return {}
 
 
 def _goal_success_criteria(goal_kind: str, *, title: str, working_context: dict[str, Any]) -> dict[str, Any]:
@@ -195,6 +291,14 @@ def _goal_success_criteria(goal_kind: str, *, title: str, working_context: dict[
                 "已给出下一步修复执行建议",
             ],
         }
+    if goal_kind == PLAYBOOK_CONFIGURE_SSH_CREDENTIAL:
+        return {
+            "goal_kind": goal_kind,
+            "done_when": [
+                f"已为资产 {asset_id or '当前目标'} 打开安全凭据配置流程",
+                "敏感字段已在专用弹层提交并验证",
+            ],
+        }
     return {
         "goal_kind": goal_kind or GOAL_KIND_GENERAL,
         "done_when": [
@@ -219,6 +323,9 @@ def infer_goal_profile(
     elif asset_id and _contains_any(normalized, ("修复", "整改", "修补", "恢复修复")):
         title = f"为资产 {asset_id} 启动修复会话"
         goal_kind = PLAYBOOK_START_REMEDIATION_SESSION
+    elif _contains_ssh_credential_intent(normalized):
+        title = "配置 SSH 凭据"
+        goal_kind = PLAYBOOK_CONFIGURE_SSH_CREDENTIAL
     elif asset_id and _contains_any(normalized, ("安装 runner", "安装runner", "重装 runner", "重装runner", "runner")):
         title = f"为资产 {asset_id} 安装 Runner"
         goal_kind = PLAYBOOK_INSTALL_RUNNER
@@ -340,18 +447,107 @@ def _playbook_start_remediation_session(content: str, *, page_context: dict[str,
     )
 
 
+def _playbook_configure_ssh_credential(
+    content: str,
+    *,
+    page_context: dict[str, Any],
+    browser_context: dict[str, Any],
+    working_context: dict[str, Any],
+    current_goal: Any | None,
+) -> AgentPlaybookDecision | None:
+    asset_targets = _selected_asset_targets(browser_context)
+    primary_asset_id = _asset_id_from_context(page_context, working_context)
+    if primary_asset_id:
+        primary_label = _normalize_text(f"资产 {primary_asset_id}", max_length=160) or f"资产 {primary_asset_id}"
+        asset_targets = [{"asset_id": primary_asset_id, "label": primary_label}, *[item for item in asset_targets if item["asset_id"] != primary_asset_id]]
+
+    blocker_codes, blocker_messages = _current_goal_blockers(current_goal)
+    blocked_by_credential = any(
+        code in {"missing_ssh_credential", "authorization_unconfirmed", "authorization_not_verified", "insufficient_privilege"}
+        for code in blocker_codes
+    ) or any("SSH" in message or "管理员授权" in message or "管理员权限验证" in message for message in blocker_messages)
+    explicit_intent = _contains_ssh_credential_intent(content)
+    short_resume = content in {"继续", "好的", "可以", "看", "继续吧", "继续处理"}
+    if not explicit_intent and not (blocked_by_credential and short_resume):
+        return None
+
+    if not asset_targets:
+        return AgentPlaybookDecision(
+            playbook_id=PLAYBOOK_CONFIGURE_SSH_CREDENTIAL,
+            objective="确认 SSH 凭据配置目标",
+            reply_markdown="要继续配置 SSH 凭据，我需要知道目标资产。请打开目标资产详情页，或先在资产列表中勾选要批量处理的资产。",
+            conversation_state="clarifying",
+            stop_reason="playbook_configure_ssh_credential_missing_target",
+        )
+
+    resume_action = _goal_resume_action(current_goal, asset_targets=asset_targets)
+    resume_goal_id = _normalize_id(getattr(current_goal, "id", None))
+    asset_ids = [item["asset_id"] for item in asset_targets]
+    asset_labels = [item["label"] for item in asset_targets]
+    blocker_summary = "；".join(blocker_messages[:2]) if blocker_messages else None
+    target_summary = asset_labels[0] if len(asset_labels) == 1 else f"已选择 {len(asset_labels)} 台资产"
+    reply = (
+        f"我会先为 {target_summary} 打开 SSH 凭据安全配置弹层。"
+        "聊天里只保留目标资产、认证方式和用户名，密码、私钥与 sudo 密码只在专用弹层中填写。"
+        "保存后我会立即验证管理员权限；如果当前目标正被 SSH 凭据阻塞，验证成功后会自动续接原目标。"
+    )
+    if len(asset_ids) > 1:
+        reply = (
+            f"我会先为这 {len(asset_ids)} 台资产打开 SSH 凭据安全配置弹层。"
+            "你需要先选择“同一套凭据批量应用”或“逐台引导配置”；敏感字段只会在弹层中填写。"
+            "保存后我会立即验证，成功资产会自动续接原阻塞目标，失败资产会单独汇总原因。"
+        )
+    if blocker_summary:
+        reply = f"{reply}\n\n当前阻塞：{blocker_summary}"
+
+    return AgentPlaybookDecision(
+        playbook_id=PLAYBOOK_CONFIGURE_SSH_CREDENTIAL,
+        objective=f"为 {target_summary} 配置 SSH 凭据",
+        reply_markdown=reply,
+        proposed_write_actions=[
+            {
+                "action_type": "configure_ssh_credential",
+                "title": f"为 {target_summary} 配置 SSH 凭据",
+                "reason": "当前目标缺少可用 SSH 管理员凭据，需要进入安全输入流程。",
+                "params": {
+                    "asset_id": asset_ids[0] if len(asset_ids) == 1 else None,
+                    "asset_ids": asset_ids,
+                    "asset_labels": asset_labels,
+                    "mode": "single_asset" if len(asset_ids) == 1 else "batch_choice",
+                    "auth_type": None,
+                    "username": None,
+                    "resume_goal_id": resume_goal_id,
+                    "resume_action": resume_action,
+                    "auto_verify": True,
+                    "auto_resume": True,
+                    "blocker_summary": blocker_summary,
+                },
+            }
+        ],
+        stop_reason="playbook_configure_ssh_credential",
+    )
+
+
 def match_registered_playbook(
     *,
     content: str,
     page_context: dict[str, Any],
     browser_context: dict[str, Any],
     working_context: dict[str, Any],
+    current_goal: Any | None = None,
 ) -> AgentPlaybookDecision | None:
     normalized = _normalize_text(content)
     if not normalized:
         return None
 
     matchers = (
+        lambda: _playbook_configure_ssh_credential(
+            normalized,
+            page_context=page_context,
+            browser_context=browser_context,
+            working_context=working_context,
+            current_goal=current_goal,
+        ),
         lambda: _playbook_scan_and_analyze_cidr(normalized),
         lambda: _playbook_verify_asset_risks(normalized, page_context=page_context, working_context=working_context),
         lambda: _playbook_install_runner(normalized, page_context=page_context, working_context=working_context),

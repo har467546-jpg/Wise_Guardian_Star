@@ -9,6 +9,8 @@ import {
   AgentUIStepRequest,
 } from "@/types/agent";
 import {
+  AssetCredentialBatchResponse,
+  AssetCredentialBatchUpsertRequest,
   AssetCredentialReadResponse,
   AssetCredentialUpsertRequest,
   AssetCredentialVerifyResponse,
@@ -25,7 +27,16 @@ import { PlatformLogListResponse, PlatformLogLevel, PlatformLogServiceName, Plat
 import { MobileOverview } from "@/types/mobile";
 import { PlatformLiveMetrics } from "@/types/monitoring";
 import { BootstrapStatusResponse, TokenResponse } from "@/types/auth";
-import { RiskBatchVerifyResponse, RiskFindingListResponse, RiskFindingPageResponse, RiskRemediationTemplate } from "@/types/risk";
+import {
+  FindingGovernance,
+  FindingWaiver,
+  RiskBatchVerifyResponse,
+  RiskFindingAssignRequest,
+  RiskFindingListResponse,
+  RiskFindingPageResponse,
+  RiskFindingWaiverCreateRequest,
+  RiskRemediationTemplate,
+} from "@/types/risk";
 import {
   HostRunner,
   HostRunnerInstallResponse,
@@ -40,6 +51,7 @@ import {
   RemediationSessionCreateRequest,
   RemediationSessionMessageCreateRequest,
   RemediationTask,
+  RemediationTaskEvidence,
   RemediationWorkspace,
 } from "@/types/remediation";
 import {
@@ -62,6 +74,7 @@ import {
   SettingsApplyResponse,
 } from "@/types/settings";
 import {
+  VulnIntelStatus,
   VulnLibraryStatus,
   VulnRule,
   VulnRuleBatchStatusResponse,
@@ -512,6 +525,27 @@ export function listGlobalRisks(params?: {
   return apiFetch<RiskFindingPageResponse>(`/risks?${query.toString()}`);
 }
 
+export function assignRiskFinding(findingId: string, payload: RiskFindingAssignRequest = {}) {
+  return apiFetch<FindingGovernance>(`/risks/${findingId}/assign`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, { preferBackendDetail: true });
+}
+
+export function createRiskWaiver(findingId: string, payload: RiskFindingWaiverCreateRequest) {
+  return apiFetch<FindingWaiver>(`/risks/${findingId}/waivers`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, { preferBackendDetail: true });
+}
+
+export function recalculateRiskPriority(findingId: string) {
+  return apiFetch<FindingGovernance>(`/risks/${findingId}/recalculate-priority`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, { preferBackendDetail: true });
+}
+
 export function getDashboardOverview() {
   return apiFetch<DashboardOverview>("/dashboard/overview");
 }
@@ -672,6 +706,13 @@ export function verifyAssetCredential(assetId: string) {
     method: "POST",
     body: JSON.stringify({}),
   });
+}
+
+export function setAssetCredentialBatch(payload: AssetCredentialBatchUpsertRequest) {
+  return apiFetch<AssetCredentialBatchResponse>("/collection/assets/credentials/batch", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, { preferBackendDetail: true });
 }
 
 export function runAssetProbe(
@@ -905,6 +946,10 @@ export function getRemediationTask(taskId: string) {
   return apiFetch<RemediationTask>(`/remediation/tasks/${taskId}`);
 }
 
+export function getRemediationTaskEvidence(taskId: string) {
+  return apiFetch<RemediationTaskEvidence>(`/remediation/tasks/${taskId}/evidence`);
+}
+
 export function runRiskVerifyBatch(assetIds: string[]) {
   return apiFetch<RiskBatchVerifyResponse>("/risks/assets/batch/verify", {
     method: "POST",
@@ -1025,5 +1070,18 @@ export function getVulnLibraryStatus() {
 export function rebuildVulnLibraryIndex() {
   return apiFetch<VulnRuleIndexRebuildResponse>("/vuln-library/index/rebuild", {
     method: "POST",
+  });
+}
+
+export function getVulnIntelStatus() {
+  return apiFetch<VulnIntelStatus>("/vuln-library/intel/status");
+}
+
+export function syncVulnIntel() {
+  return apiFetch<VulnIntelStatus>("/vuln-library/intel/sync", {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, {
+    preferBackendDetail: true,
   });
 }

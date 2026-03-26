@@ -37,8 +37,10 @@ from app.services.remediation_service import (
     build_workspace,
     get_latest_collection_snapshot,
     get_manual_credential,
+    selected_steps_require_maintenance_window,
     select_executable_plan_steps,
 )
+from app.services.remediation_executor import build_remediation_preview_result
 from app.services.remediation_ai_explanation_service import (
     RemediationAIExplanationService,
 )
@@ -242,6 +244,9 @@ def approve_remediation_session(
     session_id: str,
     approved_by: str,
     stage_code: str | None = None,
+    execution_mode: str = "apply",
+    change_ticket: str | None = None,
+    maintenance_window_id: str | None = None,
 ) -> RemediationSessionApproveResponse:
     session = db.get(RemediationSession, session_id)
     if session is None:
@@ -258,59 +263,111 @@ def approve_remediation_session(
         raise RuntimeError("仅允许审批当前最早可执行阶段")
     stage = approvable_stage
     ready_steps = [step.model_dump(mode="json") for step in select_executable_plan_steps(stage.steps)]
+    normalized_execution_mode = str(execution_mode or "apply").strip().lower() or "apply"
+    normalized_change_ticket = str(change_ticket or "").strip() or None
+    normalized_maintenance_window_id = str(maintenance_window_id or "").strip() or None
+    if normalized_execution_mode == "apply" and selected_steps_require_maintenance_window(ready_steps) and not normalized_maintenance_window_id:
+        raise RuntimeError("当前阶段包含高风险步骤，请先填写 maintenance_window_id 后再正式执行")
     task_run = create_task_run(
         db,
         task_type=TaskType.REMEDIATION_EXECUTE,
         scope_type="asset",
         scope_id=session.asset_id,
-        message=f"Host Runner 阶段修复任务已入队：{stage.stage_name}",
+        message=f"阶段预演已生成：{stage.stage_name}" if normalized_execution_mode == "dry_run" else f"Host Runner 阶段修复任务已入队：{stage.stage_name}",
     )
     summary_state = _summary_state(session)
-    summary_state["running_stage_code"] = stage.stage_code
+    if normalized_execution_mode == "apply":
+        summary_state["running_stage_code"] = stage.stage_code
     session.summary_json = summary_state
+    result_context = {
+        "asset_id": session.asset_id,
+        "session_id": session.id,
+        "runner_id": session.runner_id,
+        "stage_code": stage.stage_code,
+        "stage_name": stage.stage_name,
+    }
     result_json = {
         "context": {
-            "asset_id": session.asset_id,
-            "session_id": session.id,
-            "runner_id": session.runner_id,
-            "stage_code": stage.stage_code,
-            "stage_name": stage.stage_name,
+            **result_context,
         },
         "plan": plan.model_dump(mode="json"),
         "execution": {
             "submitted_steps": [{"step_id": item["step_id"]} for item in ready_steps],
-            "execution_boundary": "runner_dispatch",
+            "execution_boundary": "runner_dispatch" if normalized_execution_mode == "apply" else "dry_run_preview",
             "stage_code": stage.stage_code,
             "stage_name": stage.stage_name,
+            "execution_mode": normalized_execution_mode,
+            "change_ticket": normalized_change_ticket,
+            "maintenance_window_id": normalized_maintenance_window_id,
         },
         "backups": {},
         "reverify": {},
     }
-    update_task_run(db, task_run, result_json=result_json)
-    create_task_event(
-        db,
-        task_run_id=task_run.id,
-        event_type="stage",
-        level="info",
-        stage_code=stage.stage_code,
-        stage_name=stage.stage_name,
-        message=f"阶段“{stage.stage_name}”已排队，等待 Host Runner 拉取执行",
-        progress=5,
-        payload_json={"session_id": session.id, "stage_code": stage.stage_code},
-    )
-    session.status = "running"
-    session.approved_at = datetime.now(timezone.utc)
-    session.approved_by = approved_by
+    if normalized_execution_mode == "dry_run":
+        result_json = build_remediation_preview_result(
+            task_run_id=task_run.id,
+            context=result_context,
+            plan=plan.model_dump(mode="json"),
+            selected_steps=ready_steps,
+            change_ticket=normalized_change_ticket,
+            maintenance_window_id=normalized_maintenance_window_id,
+            stage_code=stage.stage_code,
+            stage_name=stage.stage_name,
+        )
+        update_task_run(
+            db,
+            task_run,
+            status=TaskExecutionStatus.SUCCESS,
+            progress=100,
+            message=f"阶段“{stage.stage_name}”预演已生成",
+            result_json=result_json,
+        )
+        create_task_event(
+            db,
+            task_run_id=task_run.id,
+            event_type="success",
+            level="info",
+            stage_code=stage.stage_code,
+            stage_name=stage.stage_name,
+            message=f"阶段“{stage.stage_name}”预演已生成，尚未提交 Host Runner 执行",
+            progress=100,
+            payload_json={"session_id": session.id, "stage_code": stage.stage_code, "execution_mode": "dry_run"},
+        )
+        _append_session_audit_message(
+            db,
+            session=session,
+            event_code="preview_generated",
+            task_id=task_run.id,
+            status=session.status,
+            content=f"已生成阶段“{stage.stage_name}”的修复预演，可先检查命令、证据项和维护窗口要求。",
+        )
+    else:
+        update_task_run(db, task_run, result_json=result_json)
+        create_task_event(
+            db,
+            task_run_id=task_run.id,
+            event_type="stage",
+            level="info",
+            stage_code=stage.stage_code,
+            stage_name=stage.stage_name,
+            message=f"阶段“{stage.stage_name}”已排队，等待 Host Runner 拉取执行",
+            progress=5,
+            payload_json={"session_id": session.id, "stage_code": stage.stage_code},
+        )
+        session.status = "running"
+        session.approved_at = datetime.now(timezone.utc)
+        session.approved_by = approved_by
     session.last_task_id = task_run.id
     _persist_session_snapshot(db, session, asset_detail, plan)
-    _append_session_audit_message(
-        db,
-        session=session,
-        event_code="task_submitted",
-        task_id=task_run.id,
-        status="running",
-        content=f"已提交阶段“{stage.stage_name}”的修复任务，等待 Host Runner 拉取执行。",
-    )
+    if normalized_execution_mode == "apply":
+        _append_session_audit_message(
+            db,
+            session=session,
+            event_code="task_submitted",
+            task_id=task_run.id,
+            status="running",
+            content=f"已提交阶段“{stage.stage_name}”的修复任务，等待 Host Runner 拉取执行。",
+        )
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -319,6 +376,7 @@ def approve_remediation_session(
         task_id=task_run.id,
         status=task_run.status,
         stream_url=f"/api/v1/remediation/tasks/{task_run.id}/stream",
+        execution_mode=normalized_execution_mode,
     )
 
 
@@ -760,19 +818,22 @@ def _reconcile_session_task_progress(db: Session, session: RemediationSession) -
         return
     summary_state = _summary_state(session)
     task_context = task.result_json.get("context") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("context"), dict) else {}
+    task_execution = task.result_json.get("execution") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("execution"), dict) else {}
     stage_code = str(task_context.get("stage_code") or "").strip()
     running_stage_code = str(summary_state.get("running_stage_code") or "").strip()
+    execution_mode = str(task_execution.get("execution_mode") or "").strip().lower()
     changed = False
 
     if task.status in RUNNING_TASK_STATUSES and stage_code and running_stage_code != stage_code:
         summary_state["running_stage_code"] = stage_code
         changed = True
     elif task.status == TaskExecutionStatus.SUCCESS:
-        completed_stage_codes = _completed_stage_codes(session)
-        if stage_code and stage_code not in completed_stage_codes:
-            completed_stage_codes.append(stage_code)
-            summary_state["completed_stage_codes"] = completed_stage_codes
-            changed = True
+        if execution_mode != "dry_run":
+            completed_stage_codes = _completed_stage_codes(session)
+            if stage_code and stage_code not in completed_stage_codes:
+                completed_stage_codes.append(stage_code)
+                summary_state["completed_stage_codes"] = completed_stage_codes
+                changed = True
         if running_stage_code and (not stage_code or running_stage_code == stage_code):
             summary_state["running_stage_code"] = None
             changed = True
@@ -890,7 +951,9 @@ def _synchronize_session_runtime_state_with_plan(
     next_status = "ready" if plan.execution_ready else "draft"
     if task is not None:
         task_context = task.result_json.get("context") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("context"), dict) else {}
+        task_execution = task.result_json.get("execution") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("execution"), dict) else {}
         running_stage_name = str(task_context.get("stage_name") or "").strip()
+        task_execution_mode = str(task_execution.get("execution_mode") or "").strip().lower()
         if task.status in RUNNING_TASK_STATUSES:
             next_status = "running"
             _append_session_audit_message(
@@ -902,7 +965,9 @@ def _synchronize_session_runtime_state_with_plan(
                 content=f"已提交阶段“{running_stage_name}”的修复任务，等待 Host Runner 拉取执行。" if running_stage_name else "已提交整机修复任务，等待 Host Runner 拉取执行。",
             )
         elif task.status == TaskExecutionStatus.SUCCESS:
-            if plan.plan_mode == "completed":
+            if task_execution_mode == "dry_run":
+                content = f"阶段“{running_stage_name}”预演已生成，可继续审核命令、证据和维护窗口要求。" if running_stage_name else "修复预演已生成。"
+            elif plan.plan_mode == "completed":
                 next_status = "completed"
                 content = "Host Runner 已完成整机修复计划。"
             else:
@@ -1070,6 +1135,14 @@ def _build_host_plan(db: Session, asset_detail: RemediationAssetDetailRead, sess
                     fallback_candidates=list(step.fallback_candidates),
                     verify_items=list(step.verify_items),
                     rollback_hint=step.rollback_hint,
+                    risk_level=step.risk_level,
+                    idempotent=step.idempotent,
+                    dry_run_supported=step.dry_run_supported,
+                    rollback_supported=step.rollback_supported,
+                    evidence_items=list(step.evidence_items),
+                    requires_maintenance_window=step.requires_maintenance_window,
+                    adapter_id=step.adapter_id,
+                    adapter_version=step.adapter_version,
                     blockers=blockers,
                     related_findings=[related_finding],
                     related_rules=[plan.rule_id],
@@ -1081,7 +1154,11 @@ def _build_host_plan(db: Session, asset_detail: RemediationAssetDetailRead, sess
                 merged.target_paths = _merge_unique_strings(merged.target_paths, step.target_paths)
                 merged.fallback_candidates = _merge_unique_strings(merged.fallback_candidates, step.fallback_candidates)
                 merged.verify_items = _merge_unique_strings(merged.verify_items, step.verify_items)
+                merged.evidence_items = _merge_unique_strings(merged.evidence_items, step.evidence_items)
                 merged.related_rules = _merge_unique_strings(merged.related_rules, [plan.rule_id])
+                if step.risk_level == "high" or (step.risk_level == "medium" and merged.risk_level == "low"):
+                    merged.risk_level = step.risk_level
+                merged.requires_maintenance_window = merged.requires_maintenance_window or step.requires_maintenance_window
                 if not merged.fallback_strategy and step.fallback_strategy:
                     merged.fallback_strategy = step.fallback_strategy
                 if not any(item.finding_id == related_finding.finding_id for item in merged.related_findings):
@@ -1315,7 +1392,7 @@ def _make_blocker(
     normalized = str(message or "").strip()
     message_lower = normalized.lower()
     code = "unknown_blocker"
-    if "未配置 ssh" in normalized:
+    if ("ssh" in message_lower and any(marker in normalized for marker in ("凭据", "私钥", "密码", "授权"))) or "未配置 ssh" in message_lower:
         code = "missing_ssh_credential"
     elif "管理员授权" in normalized:
         code = "authorization_unconfirmed"
@@ -1323,7 +1400,7 @@ def _make_blocker(
         code = "authorization_not_verified"
     elif "未验证到管理员权限" in normalized:
         code = "insufficient_privilege"
-    elif "root/sudo" in normalized or "sudo 凭据" in normalized:
+    elif "root/sudo" in message_lower or "sudo 凭据" in normalized:
         code = "insufficient_privilege"
     elif "深度检查结果" in normalized or "snapshot" in message_lower:
         code = "missing_snapshot"

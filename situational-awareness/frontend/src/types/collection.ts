@@ -68,6 +68,28 @@ export type AssetCredentialVerifyResponse = {
   detail_json: Record<string, unknown>;
 };
 
+export type AssetCredentialBatchUpsertRequest = AssetCredentialUpsertRequest & {
+  asset_ids: string[];
+  mode: "same_credential_batch";
+  verify_after_save: boolean;
+};
+
+export type AssetCredentialBatchResult = {
+  asset_id: string;
+  saved: boolean;
+  verified: boolean;
+  effective_privilege: "root" | "sudo" | null | string;
+  error_summary: string | null;
+};
+
+export type AssetCredentialBatchResponse = {
+  mode: "same_credential_batch";
+  total_count: number;
+  success_count: number;
+  failure_count: number;
+  results: AssetCredentialBatchResult[];
+};
+
 export type AssetLatestCollectionResponse = {
   asset_id: string;
   status: "success" | "partial" | "failed";

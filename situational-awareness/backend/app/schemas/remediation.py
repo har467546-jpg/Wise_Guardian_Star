@@ -97,6 +97,14 @@ class RemediationPlanStepRead(BaseModel):
     fallback_candidates: list[str] = Field(default_factory=list)
     verify_items: list[str] = Field(default_factory=list)
     rollback_hint: str | None = None
+    risk_level: Literal["low", "medium", "high"] = "medium"
+    idempotent: bool = False
+    dry_run_supported: bool = False
+    rollback_supported: bool = False
+    evidence_items: list[str] = Field(default_factory=list)
+    requires_maintenance_window: bool = False
+    adapter_id: str | None = None
+    adapter_version: str | None = None
 
 
 class RemediationPlanRead(BaseModel):
@@ -124,12 +132,16 @@ class RemediationExecuteStepInput(BaseModel):
 
 class RemediationExecuteRequest(BaseModel):
     steps: list[RemediationExecuteStepInput] = Field(default_factory=list)
+    execution_mode: Literal["dry_run", "apply"] = "dry_run"
+    change_ticket: str | None = None
+    maintenance_window_id: str | None = None
 
 
 class RemediationExecuteResponse(BaseModel):
     task_id: str
     status: TaskExecutionStatus
     stream_url: str
+    execution_mode: Literal["dry_run", "apply"] = "dry_run"
 
 
 class RemediationTaskStepResultRead(BaseModel):
@@ -157,12 +169,34 @@ class RemediationTaskRead(BaseModel):
     finished_at: datetime | None = None
     event_count: int = 0
     last_event_at: datetime | None = None
-    execution_boundary: Literal["template_generated", "runner_dispatch"] | None = None
+    execution_boundary: Literal["template_generated", "runner_dispatch", "dry_run_preview"] | None = None
+    execution_mode: Literal["dry_run", "apply"] | None = None
     context: dict[str, Any] = Field(default_factory=dict)
     plan: dict[str, Any] = Field(default_factory=dict)
     execution: dict[str, Any] = Field(default_factory=dict)
     backups: dict[str, Any] = Field(default_factory=dict)
     reverify: dict[str, Any] = Field(default_factory=dict)
+
+
+class RemediationTaskEvidenceItemRead(BaseModel):
+    item_id: str
+    item_type: str
+    step_id: str | None = None
+    title: str
+    status: str
+    summary: str
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+    collected_at: str | None = None
+
+
+class RemediationTaskEvidenceRead(BaseModel):
+    task_id: str
+    execution_mode: Literal["dry_run", "apply"] | None = None
+    execution_boundary: Literal["template_generated", "runner_dispatch", "dry_run_preview"] | None = None
+    generated_at: str | None = None
+    item_count: int = 0
+    items: list[RemediationTaskEvidenceItemRead] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class HostRunnerRead(BaseModel):
@@ -244,6 +278,14 @@ class HostRemediationPlanStepRead(BaseModel):
     fallback_candidates: list[str] = Field(default_factory=list)
     verify_items: list[str] = Field(default_factory=list)
     rollback_hint: str | None = None
+    risk_level: Literal["low", "medium", "high"] = "medium"
+    idempotent: bool = False
+    dry_run_supported: bool = False
+    rollback_supported: bool = False
+    evidence_items: list[str] = Field(default_factory=list)
+    requires_maintenance_window: bool = False
+    adapter_id: str | None = None
+    adapter_version: str | None = None
     blockers: list[RemediationBlockerRead] = Field(default_factory=list)
     related_findings: list[HostRemediationRelatedFindingRead] = Field(default_factory=list)
     related_rules: list[str] = Field(default_factory=list)
@@ -349,6 +391,9 @@ class RemediationSessionMessageCreateRequest(BaseModel):
 
 class RemediationSessionApproveRequest(BaseModel):
     stage_code: str | None = None
+    execution_mode: Literal["dry_run", "apply"] = "apply"
+    change_ticket: str | None = None
+    maintenance_window_id: str | None = None
 
 
 class RemediationSessionApproveResponse(BaseModel):
@@ -356,6 +401,7 @@ class RemediationSessionApproveResponse(BaseModel):
     task_id: str
     status: TaskExecutionStatus
     stream_url: str
+    execution_mode: Literal["dry_run", "apply"] = "apply"
 
 
 class RunnerRegisterRequest(BaseModel):
@@ -400,6 +446,14 @@ class RunnerTaskStepRead(BaseModel):
     execution_state: Literal["ready", "blocked"]
     blocked_reason: str | None = None
     backup_plan: RemediationBackupPlanRead | None = None
+    risk_level: Literal["low", "medium", "high"] = "medium"
+    idempotent: bool = False
+    dry_run_supported: bool = False
+    rollback_supported: bool = False
+    evidence_items: list[str] = Field(default_factory=list)
+    requires_maintenance_window: bool = False
+    adapter_id: str | None = None
+    adapter_version: str | None = None
 
 
 class RunnerTaskAssignmentRead(BaseModel):
@@ -408,6 +462,7 @@ class RunnerTaskAssignmentRead(BaseModel):
     session_id: str | None = None
     task_type: Literal["remediation_execute"]
     summary: str
+    execution_mode: Literal["apply"] = "apply"
     plan: HostRemediationPlanRead
     steps: list[RunnerTaskStepRead] = Field(default_factory=list)
 

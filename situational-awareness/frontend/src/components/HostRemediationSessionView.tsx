@@ -30,6 +30,7 @@ import {
   getRemediationAsset,
   getRemediationSession,
   getRemediationTask,
+  getRemediationTaskEvidence,
   installAssetRunner,
   postRemediationSessionMessage,
 } from "@/services/api";
@@ -41,6 +42,7 @@ import type {
   RemediationSessionStreamEnvelope,
   RemediationStreamEnvelope,
   RemediationTask,
+  RemediationTaskEvidence,
 } from "@/types/remediation";
 
 function toRecord(input: unknown): Record<string, unknown> {
@@ -263,8 +265,27 @@ function executionBoundaryLabel(value: string | null | undefined): string {
       return "模板渲染";
     case "runner_dispatch":
       return "Runner 下发";
+    case "dry_run_preview":
+      return "修复预演";
     default:
       return "-";
+  }
+}
+
+function executionModeLabel(value: string | null | undefined): string {
+  return String(value || "").trim().toLowerCase() === "dry_run" ? "预演" : "正式执行";
+}
+
+function stepRiskColor(value: string | null | undefined): string {
+  switch (String(value || "").trim().toLowerCase()) {
+    case "high":
+      return "red";
+    case "medium":
+      return "orange";
+    case "low":
+      return "green";
+    default:
+      return "default";
   }
 }
 
@@ -395,8 +416,9 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
   const [assetLoading, setAssetLoading] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [taskLoading, setTaskLoading] = useState(false);
+  const [taskEvidenceLoading, setTaskEvidenceLoading] = useState(false);
   const [runnerLoading, setRunnerLoading] = useState(false);
-  const [approveLoading, setApproveLoading] = useState(false);
+  const [approveModeLoading, setApproveModeLoading] = useState<"dry_run" | "apply" | null>(null);
   const [messageLoading, setMessageLoading] = useState(false);
   const [streamLines, setStreamLines] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -404,6 +426,9 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
   const [aiGenerationError, setAIGenerationError] = useState<string | null>(null);
   const [activeTaskId, setActiveTaskId] = useState(taskId);
   const [sessionNote, setSessionNote] = useState("");
+  const [changeTicket, setChangeTicket] = useState("");
+  const [maintenanceWindowId, setMaintenanceWindowId] = useState("");
+  const [taskEvidence, setTaskEvidence] = useState<RemediationTaskEvidence | null>(null);
   const [viewState, setViewState] = useState<WorkbenchViewState>(() => buildDefaultWorkbenchViewState({ outputOpen: Boolean(taskId) }));
   const [expandedCommands, setExpandedCommands] = useState<Record<string, boolean>>({});
 
@@ -575,6 +600,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
   useEffect(() => {
     if (!activeTaskId) {
       setTask(null);
+      setTaskEvidence(null);
       setStreamLines([]);
       return;
     }
@@ -586,6 +612,18 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
       })
       .catch((err) => setError((err as Error).message))
       .finally(() => setTaskLoading(false));
+  }, [activeTaskId]);
+
+  useEffect(() => {
+    if (!activeTaskId) {
+      setTaskEvidence(null);
+      return;
+    }
+    setTaskEvidenceLoading(true);
+    getRemediationTaskEvidence(activeTaskId)
+      .then((result) => setTaskEvidence(result))
+      .catch(() => setTaskEvidence(null))
+      .finally(() => setTaskEvidenceLoading(false));
   }, [activeTaskId]);
 
   useEffect(() => {
@@ -621,6 +659,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
         if (payload.type === "complete") {
           void getRemediationTask(activeTaskId).then((result) => {
             setTask(result);
+            void getRemediationTaskEvidence(activeTaskId).then(setTaskEvidence).catch(() => undefined);
             if (!isTaskRunning(result.status)) {
               void loadOrCreateSession();
             }
@@ -641,6 +680,9 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
       void getRemediationTask(activeTaskId)
         .then((result) => {
           setTask(result);
+          if (!isTaskRunning(result.status)) {
+            void getRemediationTaskEvidence(activeTaskId).then(setTaskEvidence).catch(() => undefined);
+          }
           if (!isTaskRunning(result.status)) {
             void loadOrCreateSession();
           }
@@ -869,6 +911,8 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
         setTaskLoading(true);
         const refreshedTask = await getRemediationTask(activeTaskId);
         setTask(refreshedTask);
+        const refreshedEvidence = await getRemediationTaskEvidence(activeTaskId).catch(() => null);
+        setTaskEvidence(refreshedEvidence);
       } catch {
         // ignore task refresh failures and keep current task state
       } finally {
@@ -893,16 +937,23 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
     }
   };
 
-  const onApprove = async () => {
+  const onApprove = async (executionMode: "dry_run" | "apply") => {
     if (!session || !approvableStage) {
       return;
     }
     try {
-      setApproveLoading(true);
+      setApproveModeLoading(executionMode);
       const response = await approveRemediationSession(session.session_id, {
         stage_code: approvableStage.stage_code,
+        execution_mode: executionMode,
+        change_ticket: changeTicket.trim() || null,
+        maintenance_window_id: maintenanceWindowId.trim() || null,
       });
-      message.success(`阶段“${approvableStage.stage_name}”修复任务已提交：${response.task_id}`);
+      message.success(
+        executionMode === "dry_run"
+          ? `阶段“${approvableStage.stage_name}”预演已生成：${response.task_id}`
+          : `阶段“${approvableStage.stage_name}”修复任务已提交：${response.task_id}`,
+      );
       setStreamLines([]);
       setActiveTaskId(response.task_id);
       updateViewState((current) => ({ ...current, outputOpen: true }));
@@ -912,7 +963,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
     } catch (err) {
       message.error((err as Error).message);
     } finally {
-      setApproveLoading(false);
+      setApproveModeLoading(null);
     }
   };
 
@@ -1043,6 +1094,12 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                           <Tag color={step.execution_state === "ready" ? "green" : "orange"}>
                             {step.execution_state === "ready" ? "Runner 可执行" : "阻塞"}
                           </Tag>
+                          <Tag color={stepRiskColor(step.risk_level)}>风险 {step.risk_level}</Tag>
+                          {step.dry_run_supported ? <Tag color="blue">支持预演</Tag> : null}
+                          <Tag color={step.rollback_supported ? "green" : "default"}>
+                            {step.rollback_supported ? "支持回滚" : "回滚受限"}
+                          </Tag>
+                          {step.requires_maintenance_window ? <Tag color="magenta">需维护窗口</Tag> : null}
                           <Tag>{step.phase_name}</Tag>
                           {step.service_name ? <Tag>{step.service_name}</Tag> : null}
                           {step.fallback_strategy === "legacy_debian_auto_guess" ? <Tag color="gold">旧版 Debian 自动解析</Tag> : null}
@@ -1092,6 +1149,14 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                       {step.backup_plan ? (
                         <Typography.Text type="secondary" className="ui-detail-wrap">
                           备份: {step.backup_plan.kind} / {step.backup_plan.targets.join("、") || "-"}
+                        </Typography.Text>
+                      ) : null}
+                      <Typography.Text type="secondary" className="ui-detail-wrap">
+                        适配器: {step.adapter_id || "-"} / {step.adapter_version || "-"}
+                      </Typography.Text>
+                      {step.evidence_items.length ? (
+                        <Typography.Text type="secondary" className="ui-detail-wrap">
+                          证据项: {step.evidence_items.join("、")}
                         </Typography.Text>
                       ) : null}
 
@@ -1365,11 +1430,31 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                     <Alert type="info" showIcon message="当前任务正在执行中，可在右侧任务输出中继续查看流式输出。" />
                   ) : null}
 
+                  <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                    <Input
+                      placeholder="可选：变更单号 / change ticket"
+                      value={changeTicket}
+                      onChange={(event) => setChangeTicket(event.target.value)}
+                    />
+                    <Input
+                      placeholder="可选：维护窗口 ID（高风险步骤正式执行时建议填写）"
+                      value={maintenanceWindowId}
+                      onChange={(event) => setMaintenanceWindowId(event.target.value)}
+                    />
+                  </Space>
+
                   <Space wrap>
                     <Button
                       type="primary"
-                      onClick={() => void onApprove()}
-                      loading={approveLoading}
+                      onClick={() => void onApprove("dry_run")}
+                      loading={approveModeLoading === "dry_run"}
+                      disabled={!approvableStage || session?.status === "running"}
+                    >
+                      {approvableStage ? `生成当前阶段预演：${approvableStage.stage_name}` : "暂无可预演阶段"}
+                    </Button>
+                    <Button
+                      onClick={() => void onApprove("apply")}
+                      loading={approveModeLoading === "apply"}
                       disabled={!approvableStage || session?.status === "running"}
                     >
                       {approvableStage ? `确认执行当前阶段：${approvableStage.stage_name}` : "暂无可执行阶段"}
@@ -1394,7 +1479,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                       type="success"
                       showIcon
                       message={`当前可审批阶段：${approvableStage.stage_name}`}
-                      description={`该阶段包含 ${approvableStage.ready_step_count} 个可执行步骤。审批后仅提交当前阶段，后续阶段会在完成后按顺序解锁。`}
+                      description={`该阶段包含 ${approvableStage.ready_step_count} 个可执行步骤。你可以先生成预演检查命令、证据项和维护窗口要求；确认后再正式提交当前阶段。`}
                     />
                   ) : currentStage?.gate_status === "blocked" ? (
                     <Alert
@@ -1779,6 +1864,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                         <Space wrap>
                           <StatusTag value={task.status} />
                           <Typography.Text>{executionBoundaryLabel(task.execution_boundary)}</Typography.Text>
+                          <Tag>{executionModeLabel(task.execution_mode)}</Tag>
                         </Space>
                       </Descriptions.Item>
                       <Descriptions.Item label="进度">{task.progress}%</Descriptions.Item>
@@ -1786,6 +1872,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                       <Descriptions.Item label="开始时间">{formatDateTime(task.started_at)}</Descriptions.Item>
                       <Descriptions.Item label="完成时间">{formatDateTime(task.finished_at)}</Descriptions.Item>
                       <Descriptions.Item label="自动复测">{String(toRecord(task.reverify).reverify_task_id || "-")}</Descriptions.Item>
+                      <Descriptions.Item label="证据条目">{taskEvidence?.item_count || 0}</Descriptions.Item>
                     </Descriptions>
 
                     <div className="remediation-workbench-task-stream">
@@ -1820,6 +1907,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                     ) : null}
 
                     <CollapsibleJsonBlock title="执行结果（JSON）" value={task.execution} />
+                    <CollapsibleJsonBlock title={`执行证据（JSON）${taskEvidenceLoading ? " · 加载中" : ""}`} value={taskEvidence || {}} />
                     <CollapsibleJsonBlock title="自动复测（JSON）" value={task.reverify} />
                   </Space>
                 ) : (

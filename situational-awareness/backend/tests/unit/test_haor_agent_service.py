@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from app.db.models.agent_goal import AgentGoal
 from app.db.models.enums import TaskExecutionStatus, TaskType
 from app.schemas.agent import AgentMessageCreateRequest
-from app.services import haor_agent_service
+from app.services import agent_playbook_service, haor_agent_service
 
 
 class _FakeUnitDB:
@@ -37,6 +37,20 @@ class _FakeRecoverDB:
         self.refreshed.append(value)
 
     def get(self, _model, _value):
+        return None
+
+
+class _FakeMessageDB(_FakeRecoverDB):
+    def __init__(self, session) -> None:
+        super().__init__()
+        self.session = session
+
+    def get(self, _model, value):
+        if value == getattr(self.session, "id", None):
+            return self.session
+        return None
+
+    def flush(self) -> None:
         return None
 
 
@@ -224,7 +238,39 @@ def test_normalize_dialog_state_accepts_objective_kind_alias() -> None:
     assert normalized["intent_kind"] == "read_followup"
 
 
-def test_append_or_stream_assistant_message_scrubs_reply_stream_output_before_emitting(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_append_or_stream_assistant_message_uses_draft_reply_by_default(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    events: list[dict] = []
+    session = SimpleNamespace(id="session-1", updated_at=None)
+
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+
+    def _unexpected_provider():
+        raise AssertionError("reply rewrite provider should stay disabled by default")
+
+    monkeypatch.setattr(haor_agent_service, "_build_runtime_provider", _unexpected_provider)
+
+    message = haor_agent_service._append_or_stream_assistant_message(
+        _FakeUnitDB(),
+        session=session,
+        message_type="text",
+        content="原始草稿回复",
+        payload_json={},
+        user_content="你好",
+        tool_traces=[],
+        working_context={},
+        stream_emitter=events.append,
+        turn_id="turn-text",
+    )
+
+    delta_text = "".join(str(item.get("delta") or "") for item in events if item.get("type") == "assistant_message_delta")
+    done_event = next(item for item in events if item.get("type") == "assistant_message_done")
+
+    assert delta_text == "原始草稿回复"
+    assert done_event["message"]["content"] == "原始草稿回复"
+    assert message.content == "原始草稿回复"
+
+
+def test_append_or_stream_assistant_message_scrubs_reply_stream_output_when_rewrite_enabled(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     class _FakeProvider:
         def stream_generate(self, _request):
             yield '<think>用户只是打了个招呼"你好"，confirmed_reply_draft 已经准备好了回复。'
@@ -235,6 +281,7 @@ def test_append_or_stream_assistant_message_scrubs_reply_stream_output_before_em
     session = SimpleNamespace(id="session-1", updated_at=None)
 
     monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "_haor_reply_rewrite_enabled", lambda: True)
     monkeypatch.setattr(
         haor_agent_service,
         "_build_runtime_provider",
@@ -295,6 +342,7 @@ def test_apply_agent_decision_updates_pending_plan_reply_to_streamed_content(mon
     )
 
     monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "_haor_reply_rewrite_enabled", lambda: True)
     monkeypatch.setattr(
         haor_agent_service,
         "_build_runtime_provider",
@@ -369,6 +417,7 @@ def test_apply_agent_decision_updates_dialog_state_question_to_streamed_content(
     )
 
     monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "_haor_reply_rewrite_enabled", lambda: True)
     monkeypatch.setattr(
         haor_agent_service,
         "_build_runtime_provider",
@@ -513,6 +562,106 @@ def test_recover_agent_session_repairs_stale_wait_and_unlocks_input(monkeypatch)
     assert result.status == "active"
     assert result.runtime_snapshot.phase == "idle"
     assert result.runtime_snapshot.input_state == "enabled"
+
+
+def test_recover_agent_session_unlocks_when_terminal_followup_already_exists(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    now = datetime.now(UTC)
+    session = SimpleNamespace(
+        id="session-1",
+        agent_id="haor",
+        status="active",
+        route_context_json={"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+        working_context_json={"task_id": "task-1"},
+        dialog_state_json={},
+        pending_plan_json={},
+        browser_runtime_json={
+            "phase": "awaiting_ui_feedback",
+            "pending_ui_actions": [{"action_id": "ui-1", "action_type": "navigate", "href": "/tasks/task-1"}],
+            "last_browser_context": {"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+            "last_user_intent": "继续当前站内动作",
+            "current_objective": "查看扫描结果",
+            "objective_kind": "scan_and_analyze_cidr",
+        },
+        agent_state_json={"watch": {"watching": True, "primary_task_id": "task-1"}},
+        current_goal=None,
+        current_goal_id=None,
+        last_task_id="task-1",
+        messages=[
+            SimpleNamespace(
+                id="msg-1",
+                role="assistant",
+                message_type="task_update",
+                content="任务 task-1 已完成",
+                payload_json={
+                    "task_id": "task-1",
+                    "terminal_status": "success",
+                    "auto_followup": True,
+                    "action": {"action_type": "create_discovery_job"},
+                },
+                created_at=now,
+            )
+        ],
+        created_at=now,
+        updated_at=now,
+    )
+    db = _FakeRecoverDB()
+
+    monkeypatch.setattr(haor_agent_service, "_load_recent_session", lambda _db, user_id: session)
+
+    result = haor_agent_service.recover_agent_session(db, user=SimpleNamespace(id="user-1"))
+
+    assert db.committed is True
+    assert session.browser_runtime_json["phase"] == "idle"
+    assert result.runtime_snapshot.input_state == "enabled"
+    assert result.runtime_snapshot.input_block_reason == "none"
+
+
+def test_append_agent_task_message_clears_stale_ui_phase_and_unlocks_input() -> None:
+    now = datetime.now(UTC)
+    session = SimpleNamespace(
+        id="session-1",
+        status="active",
+        route_context_json={"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+        working_context_json={"task_id": "task-1"},
+        dialog_state_json={},
+        pending_plan_json={},
+        browser_runtime_json={
+            "phase": "resolving_ui_feedback",
+            "pending_ui_actions": [],
+            "completed_ui_actions": [],
+            "last_ui_results": [],
+            "last_browser_context": {"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+            "last_user_intent": "继续当前站内动作",
+            "current_objective": "查看扫描结果",
+            "objective_kind": "scan_and_analyze_cidr",
+            "auto_executed_actions": [{"action_type": "create_discovery_job"}],
+            "last_step_request_id": "step-1",
+        },
+        agent_state_json={"watch": {"watching": True, "primary_task_id": "task-1"}},
+        current_goal=None,
+        current_goal_id=None,
+        last_task_id="task-1",
+        messages=[],
+        created_at=now,
+        updated_at=now,
+    )
+    db = _FakeMessageDB(session)
+
+    haor_agent_service.append_agent_task_message(
+        db,
+        session_id="session-1",
+        content="任务 task-1 已完成",
+        payload_json={"task_id": "task-1", "child_task": {"task_id": "task-1", "status": "success"}},
+        message_type="task_update",
+    )
+
+    snapshot = haor_agent_service._build_runtime_snapshot(session)
+
+    assert session.browser_runtime_json["phase"] == "idle"
+    assert session.browser_runtime_json["pending_ui_actions"] == []
+    assert snapshot.phase == "idle"
+    assert snapshot.input_state == "enabled"
+    assert snapshot.input_block_reason == "none"
 
 
 def test_normalize_assistant_reply_content_deduplicates_repeated_sentences_and_blocks() -> None:
@@ -1368,3 +1517,216 @@ def test_reconcile_running_session_state_keeps_live_orchestrate_task_running(mon
     assert changed is False
     assert session.status == "running"
     assert session.browser_runtime_json["phase"] == "running"
+
+
+def test_match_registered_playbook_routes_blocked_goal_to_secure_ssh_input() -> None:
+    current_goal = SimpleNamespace(
+        id="goal-1",
+        goal_kind="install_runner",
+        blocked_reason="当前 SSH 凭据尚未确认管理员授权",
+        progress_json={
+            "blockers": [
+                {
+                    "blocker_code": "authorization_unconfirmed",
+                    "blocker_message": "当前 SSH 凭据尚未确认管理员授权",
+                }
+            ]
+        },
+    )
+
+    decision = agent_playbook_service.match_registered_playbook(
+        content="继续",
+        page_context={"pathname": "/assets", "asset_id": None, "query": {}},
+        browser_context={
+            "semantic_page_context": {
+                "selected_rows": [
+                    {"asset_id": "asset-1", "label": "192.168.1.10"},
+                    {"asset_id": "asset-2", "label": "192.168.1.11"},
+                ]
+            }
+        },
+        working_context={},
+        current_goal=current_goal,
+    )
+
+    assert decision is not None
+    assert decision.playbook_id == "configure_ssh_credential"
+    assert decision.proposed_write_actions[0]["action_type"] == "configure_ssh_credential"
+    assert decision.proposed_write_actions[0]["params"]["resume_goal_id"] == "goal-1"
+    assert decision.proposed_write_actions[0]["params"]["resume_action"]["action_type"] == "install_runner"
+    assert decision.proposed_write_actions[0]["params"]["asset_ids"] == ["asset-1", "asset-2"]
+
+
+def test_build_runtime_snapshot_locks_input_for_secure_input_phase() -> None:
+    session = SimpleNamespace(
+        status="active",
+        browser_runtime_json={
+            "phase": "awaiting_secure_input",
+            "pending_secure_input": {
+                "asset_id": "asset-1",
+                "asset_labels": ["资产 asset-1"],
+                "resume_action": {
+                    "action_type": "install_runner",
+                    "title": "为资产 asset-1 安装 Runner",
+                    "reason": "继续原目标",
+                    "params": {"asset_id": "asset-1"},
+                },
+            },
+        },
+        agent_state_json={},
+        pending_plan_json={},
+        current_goal=None,
+        last_task_id=None,
+        messages=[],
+    )
+
+    snapshot = haor_agent_service._build_runtime_snapshot(session)
+
+    assert snapshot.phase == "awaiting_secure_input"
+    assert snapshot.input_state == "locked"
+    assert snapshot.input_block_reason == "pending_sensitive_input"
+    assert snapshot.active_skill_id == "configure_ssh_credential"
+
+
+def test_normalize_result_payload_blockers_recovers_ssh_code_from_unknown_blocker() -> None:
+    blockers = haor_agent_service._normalize_result_payload_blockers(
+        {
+            "blockers": [
+                {
+                    "code": "unknown_blocker",
+                    "message": "当前资产未配置 SSH 管理员凭据",
+                    "scope": "global",
+                    "blocking": "hard",
+                }
+            ]
+        }
+    )
+
+    assert blockers == [
+        {
+            "code": "missing_ssh_credential",
+            "message": "当前资产未配置 SSH 管理员凭据",
+            "scope": "global",
+            "blocking": "hard",
+            "stage_code": None,
+            "step_id": None,
+        }
+    ]
+
+
+def test_handle_secure_input_step_reports_remaining_remediation_blockers(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(
+        id="session-1",
+        agent_id="haor",
+        status="active",
+        route_context_json={"pathname": "/assets", "query": {}, "asset_id": "asset-1"},
+        working_context_json={"asset_id": "asset-1"},
+        dialog_state_json={},
+        pending_plan_json={},
+        browser_runtime_json={},
+        agent_state_json={},
+        current_goal=None,
+        current_goal_id="goal-1",
+        last_task_id="task-orchestrate-1",
+        messages=[],
+        created_at=datetime.now(UTC),
+        updated_at=None,
+    )
+    db = _FakeMessageDB(session)
+    synced_goal: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_execute_auto_actions",
+        lambda *args, **kwargs: [
+            {
+                "action_type": "create_or_resume_remediation_session",
+                "title": "继续修复会话 remediation-session-1",
+                "status": "success",
+                "summary": "当前未自动执行：当前主机尚未安装 Host Runner",
+                "params": {"asset_id": "asset-1", "submit_if_ready": True},
+                "payload": {
+                    "asset_id": "asset-1",
+                    "session_id": "remediation-session-1",
+                    "execution_ready": False,
+                    "blocked_reasons": ["当前主机尚未安装 Host Runner"],
+                    "blocker_codes": ["runner_not_installed"],
+                    "blockers": [
+                        {
+                            "code": "runner_not_installed",
+                            "message": "当前主机尚未安装 Host Runner",
+                            "scope": "asset",
+                            "blocking": "hard",
+                        }
+                    ],
+                    "submitted_task_id": None,
+                },
+                "child_task_id": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(haor_agent_service, "resume_agent_goal_binding", lambda *args, **kwargs: None)
+    monkeypatch.setattr(haor_agent_service, "_emit_session_snapshot", lambda *args, **kwargs: None)
+
+    def _fake_sync_goal(_db, _session, **kwargs):  # type: ignore[no-untyped-def]
+        synced_goal.update(kwargs)
+        return None
+
+    monkeypatch.setattr(haor_agent_service, "_sync_current_goal_state", _fake_sync_goal)
+
+    result = haor_agent_service._handle_secure_input_step(
+        db,
+        session=session,
+        user=SimpleNamespace(id="user-1"),
+        browser_context={"pathname": "/assets", "query": {}, "asset_id": "asset-1"},
+        current_browser_runtime={
+            "phase": "awaiting_secure_input",
+            "current_objective": "为资产 asset-1 配置 SSH 凭据",
+            "objective_kind": "configure_ssh_credential",
+            "last_user_intent": "配置 SSH 凭据",
+            "pending_secure_input": {
+                "kind": "ssh_credential",
+                "mode": "single_asset",
+                "asset_id": "asset-1",
+                "asset_ids": ["asset-1"],
+                "asset_labels": ["资产 asset-1"],
+                "resume_goal_id": "goal-1",
+                "resume_action": {
+                    "action_type": "create_or_resume_remediation_session",
+                    "title": "继续修复会话 remediation-session-1",
+                    "reason": "SSH 凭据验证成功后继续修复",
+                    "params": {"asset_id": "asset-1", "submit_if_ready": True},
+                },
+                "auto_verify": True,
+                "auto_resume": True,
+            },
+        },
+        ui_action_results=[
+            {
+                "detail_json": {
+                    "kind": "ssh_credential_single",
+                    "asset_id": "asset-1",
+                    "saved": True,
+                    "verified": True,
+                    "auth_type": "password",
+                    "username": "root",
+                }
+            }
+        ],
+        platform_url="http://localhost:3000",
+    )
+
+    assert result is not None
+    message_objects = [item for item in db.added if getattr(item, "content", None)]
+    assert message_objects
+    content = message_objects[-1].content
+    assert "SSH 凭据已保存并验证成功，但修复暂未继续执行" in content
+    assert "当前主机尚未安装 Host Runner" in content
+    assert "我已自动续接原目标" not in content
+    assert session.status == "active"
+    assert session.agent_state_json["execution"]["stage"] == "blocked"
+    assert synced_goal["status_override"] == "blocked"
+    assert "Host Runner" in str(synced_goal["blocked_reason"])
+    goal_blockers = synced_goal["goal_blockers"]
+    assert isinstance(goal_blockers, list)
+    assert goal_blockers[0]["code"] == "runner_not_installed"

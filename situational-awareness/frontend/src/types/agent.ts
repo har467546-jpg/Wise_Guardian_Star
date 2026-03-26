@@ -30,7 +30,8 @@ export type AgentProposedAction = {
     | "verify_asset_risks"
     | "install_runner"
     | "create_or_resume_remediation_session"
-    | "approve_remediation_session";
+    | "approve_remediation_session"
+    | "configure_ssh_credential";
   title: string;
   reason: string;
   params: Record<string, unknown>;
@@ -117,6 +118,7 @@ export type AgentRuntimeSnapshot = {
     | "idle"
     | "awaiting_agent_reply"
     | "awaiting_ui_feedback"
+    | "awaiting_secure_input"
     | "resolving_ui_feedback"
     | "waiting_approval"
     | "watching_task"
@@ -124,7 +126,15 @@ export type AgentRuntimeSnapshot = {
     | "failed"
     | string;
   input_state: "enabled" | "locked" | string;
-  input_block_reason: "none" | "awaiting_reply" | "pending_ui" | "waiting_approval" | "recovering" | "resetting" | string;
+  input_block_reason:
+    | "none"
+    | "awaiting_reply"
+    | "pending_ui"
+    | "pending_sensitive_input"
+    | "waiting_approval"
+    | "recovering"
+    | "resetting"
+    | string;
   current_turn_id: string | null;
   watch_task_id: string | null;
   active_skill_id: string | null;
@@ -152,6 +162,20 @@ export type AgentSession = {
   messages: AgentMessage[];
   created_at: string;
   updated_at: string;
+};
+
+export type AgentPendingSecureInput = {
+  kind: string;
+  mode: string;
+  asset_ids: string[];
+  asset_labels: string[];
+  auth_type?: "password" | "key" | null | string;
+  username?: string | null;
+  resume_goal_id?: string | null;
+  resume_action?: Record<string, unknown> | null;
+  auto_verify?: boolean;
+  auto_resume?: boolean;
+  blocker_summary?: string | null;
 };
 
 export type AgentAttentionKind = "none" | "waiting_approval" | "running_task" | "pending_ui_action";

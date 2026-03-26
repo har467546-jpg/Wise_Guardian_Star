@@ -2102,7 +2102,7 @@ def test_haor_websocket_stream_message_turn_emits_deltas(monkeypatch) -> None:  
     assert done_event["message"]["message_type"] == "text"
 
 
-def test_haor_websocket_stream_message_turn_uses_provider_stream_reply(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_haor_websocket_stream_message_turn_uses_draft_reply_by_default(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, user_id = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "custom_proxy")
 
@@ -2115,21 +2115,12 @@ def test_haor_websocket_stream_message_turn_uses_provider_stream_reply(monkeypat
             [],
         )
 
-    class _FakeProvider:
-        def stream_generate(self, request):  # type: ignore[no-untyped-def]
-            yield "原生"
-            yield "流式"
-            yield "回复"
-
-        def generate(self, request):  # type: ignore[no-untyped-def]
-            return "原生流式回复"
-
     monkeypatch.setattr(haor_agent_service, "_run_agent_loop", _fake_run_loop)
-    monkeypatch.setattr(
-        haor_agent_service,
-        "_build_runtime_provider",
-        lambda: SimpleNamespace(provider=_FakeProvider()),
-    )
+
+    def _unexpected_provider():
+        raise AssertionError("reply rewrite provider should stay disabled by default")
+
+    monkeypatch.setattr(haor_agent_service, "_build_runtime_provider", _unexpected_provider)
     token = _build_ws_token(user_id, UserRole.ADMIN)
 
     with client.websocket_connect(f"/api/v1/agent/haor/session/stream?token={token}") as websocket:
@@ -2147,8 +2138,8 @@ def test_haor_websocket_stream_message_turn_uses_provider_stream_reply(monkeypat
 
     deltas = [item["delta"] for item in events if item["type"] == "assistant_message_delta"]
     done_event = next(item for item in events if item["type"] == "assistant_message_done")
-    assert deltas == ["原生流式回复"]
-    assert done_event["message"]["content"] == "原生流式回复"
+    assert deltas == ["这是同步草稿，不应该直接按切块回放。"]
+    assert done_event["message"]["content"] == "这是同步草稿，不应该直接按切块回放。"
 
 
 def test_haor_websocket_ui_step_continues_turn_flow(monkeypatch) -> None:  # type: ignore[no-untyped-def]

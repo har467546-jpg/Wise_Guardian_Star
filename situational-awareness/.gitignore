@@ -15,6 +15,9 @@ node_modules/
 # Env
 .env
 *.env.local
+backend/.env.runtime
+backend/.env.runtime.lock
+backend/.env.runtime.bootstrap
 
 # Misc
 .DS_Store

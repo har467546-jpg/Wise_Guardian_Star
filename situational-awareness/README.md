@@ -39,11 +39,18 @@ vi backend/.env.example
 vi frontend/.env.example
 ```
 > 当前 `docker compose` 默认直接读取 `backend/.env.example` 和 `frontend/.env.example`。
+> `backend/.env.runtime` 仅作为本地运行时覆盖文件使用，不再作为仓库默认配置的一部分提交。
 
-2. 启动开发环境
+2. 启动默认生产式环境
 ```bash
 cd infra
 docker compose up -d --build
+```
+
+如需显式启动开发环境：
+```bash
+cd infra
+docker compose --profile dev up -d --build backend-dev worker-dev frontend-dev
 ```
 
 3. 首次访问初始化管理员
@@ -51,17 +58,24 @@ docker compose up -d --build
 - 初始化成功后会自动登录进入总览页
 
 4. 访问入口
-- 前端：http://localhost:3000
-- 后端：http://localhost:8000/docs
-- PostgreSQL：`localhost:5432`
-- Redis：`localhost:6379`
+- 默认生产式前端：http://localhost:3000
+- 默认生产式后端：http://localhost:8000/docs
+- 开发前端：http://localhost:3001
+- 开发后端：http://localhost:8001/docs
+- PostgreSQL：`localhost:5433`
+- Redis：`localhost:6380`
 - 前端默认通过 Next.js 代理把 `/api/v1/*` 转发到后端容器，无需手工填写 `NEXT_PUBLIC_API_BASE`
 
 ## 常用开发命令
-- 启动全部服务：
+- 启动默认生产式服务：
 ```bash
 cd infra
 docker compose up -d --build
+```
+- 启动显式开发环境：
+```bash
+cd infra
+docker compose --profile dev up -d --build backend-dev worker-dev frontend-dev
 ```
 - 查看容器状态：
 ```bash
@@ -76,32 +90,49 @@ docker logs -f sa-backend
 ```bash
 docker logs -f sa-worker
 ```
+- 查看开发态后端日志：
+```bash
+docker logs -f sa-backend-dev
+```
+- 查看开发态前端日志：
+```bash
+docker logs -f sa-frontend-dev
+```
 - 停止并移除容器：
 ```bash
 cd infra
 docker compose down
 ```
 
-## Docker 开发模式
-- Docker Compose 默认以开发模式启动：
-  - 前端服务使用 `next dev`
-  - 后端服务使用 `uvicorn --reload`
-  - 前后端源码目录都会挂载到容器内，适合本地联调
-- 前端开发容器启动时会自动安装依赖到容器卷，避免宿主机残留的 `node_modules` 污染运行环境
+## Docker 默认生产式运行
+- Docker Compose 默认启动生产式服务：
+  - 前端服务使用 `next start`
+  - 后端服务使用不带 `--reload` 的 `uvicorn`
+  - 默认前后端容器不挂载源码目录，重启后仍按镜像内构建结果运行
 - 默认访问地址：
-  - 前端开发入口：`http://localhost:3000`
+  - 前端入口：`http://localhost:3000`
   - 后端文档：`http://localhost:8000/docs`
-- 前端开发模式会把 `node_modules` 与 `.next` 缓存留在容器卷内，不污染项目目录。
+- 这套默认入口更适合日常演示、联调验收和接近真实部署方式的验证。
+
+## Docker 开发模式
+- 开发模式改为显式 `dev` profile：
+  - 前端服务为 `frontend-dev`，使用 `next dev`
+  - 后端服务为 `backend-dev`，使用 `uvicorn --reload`
+  - worker 服务为 `worker-dev`
+  - 前后端源码目录会挂载到容器内，适合本地改代码联调
+- 启动命令：
+```bash
+cd infra
+docker compose --profile dev up -d --build backend-dev worker-dev frontend-dev
+```
+- 开发访问地址：
+  - 前端开发入口：`http://localhost:3001`
+  - 后端开发文档：`http://localhost:8001/docs`
+- 前端开发模式会把 `node_modules`、`.next` 与 `.next-dev` 缓存留在容器卷内，不污染项目目录。
 - 若需要从局域网访问前端开发入口，请在前端环境变量中设置 `NEXT_ALLOWED_DEV_ORIGINS`，可直接使用私网通配规则，例如：
 ```bash
 NEXT_ALLOWED_DEV_ORIGINS=localhost,127.0.0.1,192.168.*.*,10.*.*.*,172.*.*.*
 ```
-- 如需临时验证生产式前端构建，可额外启动预览入口：
-```bash
-cd infra
-docker compose --profile prod up -d --build frontend-prod
-```
-- 生产式前端预览地址为 `http://localhost:3001`。
 
 ## Haor 说明
 - Haor 不是普通聊天机器人，而是站内自治助手
@@ -172,9 +203,16 @@ docker exec sa-backend sh -lc 'cd /app && alembic upgrade head'
 ```
 - 现有应用启动仍会保留 `create_all()` 兜底，但推荐把结构变更收敛到 Alembic。
 - 当前迁移链已补齐对现有 schema 的幂等保护，适用于已由应用初始化过的数据库和全新数据库。
+- 如果代码已升级、但仍沿用旧的 Docker 数据卷，必须显式执行一次 `alembic upgrade head`；`create_all()` 不能替代已有库的列升级。
+- 漏洞情报同步排障建议按下面顺序检查：
+  1. 先访问 `/api/v1/vuln-library/status`，确认 `schema_ready` 是否为 `true`
+  2. 若为 `false`，执行 `docker exec sa-backend sh -lc 'cd /app && alembic upgrade head'`
+  3. 重启 `sa-backend` 与 `sa-worker`
+  4. 重新点击“同步情报”
+  5. 仅当 schema 已就绪后，再继续检查外网连通性、上游 NVD / KEV / EPSS 超时等问题
 
 ## CORS 预检排查
-- 开发环境默认 `CORS_ALLOW_ALL=true`，允许 `localhost/127.0.0.1/局域网IP` 访问后端 API。
+- 默认环境建议使用 `CORS_ALLOW_ALL=false`，并通过 `CORS_ALLOW_ORIGINS` 维护允许访问的来源白名单。
 - 若前端出现 `NetworkError when attempting to fetch resource` 且后端有 `OPTIONS ... 400`，优先检查后端容器读取的环境变量：
   - `CORS_ALLOW_ALL=true`，或
   - `CORS_ALLOW_ALL=false` 且 `CORS_ALLOW_ORIGINS` 包含当前前端实际来源（完整协议+主机+端口）。

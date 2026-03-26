@@ -86,6 +86,10 @@ def test_samba_remove_exposure_step_is_renderable_with_default_config_path() -> 
     assert "/etc/samba/smb.conf" in (step.generated_command or "")
     assert "'map to guest': 'Never'" in (step.generated_command or "")
     assert "managed-by-sa" in (step.generated_command or "")
+    assert step.risk_level == "medium"
+    assert step.dry_run_supported is True
+    assert step.rollback_supported is True
+    assert step.adapter_id == "linux.exposure.remove"
 
 
 def test_samba_guest_access_remove_exposure_step_is_renderable() -> None:
@@ -115,6 +119,34 @@ def test_samba_guest_access_remove_exposure_step_is_renderable() -> None:
     assert "/etc/samba/smb.conf" in (step.generated_command or "")
     assert "'map to guest': 'Never'" in (step.generated_command or "")
     assert "for svc in smbd samba nmbd; do" in (step.generated_command or "")
+
+
+def test_tomcat_remove_path_without_backup_target_is_blocked_for_enterprise_execution() -> None:
+    planner = RemediationCommandPlanner(
+        finding=_build_finding(rule_id="tomcat.manager.exposed", service_name="tomcat"),
+        rendered_template={
+            "actions": [
+                {
+                    "action_type": "remove_exposure",
+                    "title": "移除 Tomcat manager 暴露入口",
+                    "params": {
+                        "service_name": "tomcat",
+                        "config_key": "manager_exposed",
+                        "rule_id": "tomcat.manager.exposed",
+                    },
+                }
+            ]
+        },
+        snapshot=None,
+        credential=None,
+        snapshot_context={"config_by_service": {}, "host_checks": {}, "packages": []},
+    )
+
+    step = planner.build_steps()[0]
+
+    assert step.execution_state == "blocked"
+    assert "备份目标" in (step.blocked_reason or "")
+    assert step.rollback_supported is False
 
 
 def test_samba_restrict_network_step_is_renderable() -> None:

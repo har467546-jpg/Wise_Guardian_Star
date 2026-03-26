@@ -56,7 +56,7 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
   const [task, setTask] = useState<RemediationTask | null>(null);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [planLoading, setPlanLoading] = useState(false);
-  const [executeLoading, setExecuteLoading] = useState(false);
+  const [executeModeLoading, setExecuteModeLoading] = useState<"dry_run" | "apply" | null>(null);
   const [taskLoading, setTaskLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [streamLines, setStreamLines] = useState<string[]>([]);
@@ -216,25 +216,26 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
     navigateToAssetWorkspace(nextFindingId, null);
   };
 
-  const onExecute = async () => {
+  const onExecute = async (executionMode: "dry_run" | "apply") => {
     if (!plan) {
       return;
     }
     try {
-      setExecuteLoading(true);
+      setExecuteModeLoading(executionMode);
       const response = await executeRemediationPlan(plan.finding_id, {
         steps: plan.steps
           .filter((step) => step.execution_state === "ready")
           .map((step) => ({ step_id: step.step_id })),
+        execution_mode: executionMode,
       });
-      message.success(`修复任务已提交：${response.task_id}`);
+      message.success(executionMode === "dry_run" ? `修复预演已生成：${response.task_id}` : `修复任务已提交：${response.task_id}`);
       setStreamLines([]);
       setActiveTaskId(response.task_id);
       navigateToAssetWorkspace(plan.finding_id, response.task_id);
     } catch (err) {
       message.error((err as Error).message);
     } finally {
-      setExecuteLoading(false);
+      setExecuteModeLoading(null);
     }
   };
 
@@ -364,14 +365,23 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
               loading={planLoading}
               title="修复模板与命令"
               extra={(
-                <Button
-                  type="primary"
-                  onClick={() => void onExecute()}
-                  loading={executeLoading}
-                  disabled={!plan || !plan.execution_ready || supportedStepCount === 0}
-                >
-                  执行整模板修复
-                </Button>
+                <Space wrap>
+                  <Button
+                    type="primary"
+                    onClick={() => void onExecute("dry_run")}
+                    loading={executeModeLoading === "dry_run"}
+                    disabled={!plan || !plan.execution_ready || supportedStepCount === 0}
+                  >
+                    生成修复预演
+                  </Button>
+                  <Button
+                    onClick={() => void onExecute("apply")}
+                    loading={executeModeLoading === "apply"}
+                    disabled={!plan || !plan.execution_ready || supportedStepCount === 0}
+                  >
+                    正式执行
+                  </Button>
+                </Space>
               )}
             >
               {!plan ? (
@@ -384,6 +394,12 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                     <Typography.Text strong>{plan.rule_name}</Typography.Text>
                   </Space>
                   <Typography.Paragraph style={{ marginBottom: 0 }}>{plan.summary}</Typography.Paragraph>
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="默认先预演，再决定是否正式执行"
+                    description="预演只生成命令、证据项与执行边界，不会修改主机；正式执行才会真正写入目标主机。"
+                  />
                   {plan.blocked_reasons.length ? <Alert type="warning" showIcon message={plan.blocked_reasons.join("；")} /> : null}
                   <List
                     dataSource={plan.steps}
@@ -396,6 +412,14 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                               <Tag color={step.execution_state === "ready" ? "green" : "orange"}>
                                 {step.execution_state === "ready" ? "自动执行" : "阻塞"}
                               </Tag>
+                              <Tag color={step.risk_level === "high" ? "red" : step.risk_level === "medium" ? "orange" : "green"}>
+                                风险 {step.risk_level}
+                              </Tag>
+                              {step.dry_run_supported ? <Tag color="blue">支持预演</Tag> : null}
+                              <Tag color={step.rollback_supported ? "green" : "default"}>
+                                {step.rollback_supported ? "支持回滚" : "回滚受限"}
+                              </Tag>
+                              {step.requires_maintenance_window ? <Tag color="magenta">需维护窗口</Tag> : null}
                               {step.fallback_strategy === "legacy_debian_auto_guess" ? <Tag color="gold">旧版 Debian 自动解析</Tag> : null}
                             </Space>
                             <Typography.Text type="secondary">{step.render_reason}</Typography.Text>
@@ -408,6 +432,14 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                             {step.backup_plan ? (
                               <Typography.Text type="secondary">
                                 备份: {step.backup_plan.kind} / {step.backup_plan.targets.join("、") || "-"}
+                              </Typography.Text>
+                            ) : null}
+                            <Typography.Text type="secondary">
+                              适配器: {step.adapter_id || "-"} / {step.adapter_version || "-"}
+                            </Typography.Text>
+                            {step.evidence_items.length ? (
+                              <Typography.Text type="secondary">
+                                证据项: {step.evidence_items.join("、")}
                               </Typography.Text>
                             ) : null}
                             <Input.TextArea
@@ -434,6 +466,7 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                       <Space wrap>
                         <StatusTag value={task.status} />
                         <Typography.Text>{task.execution_boundary || "-"}</Typography.Text>
+                        <Tag>{task.execution_mode || "-"}</Tag>
                       </Space>
                     </Descriptions.Item>
                     <Descriptions.Item label="进度">{task.progress}%</Descriptions.Item>

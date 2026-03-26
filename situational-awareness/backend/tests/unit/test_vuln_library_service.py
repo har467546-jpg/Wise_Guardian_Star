@@ -1,28 +1,57 @@
 import json
 
-from sqlalchemy import delete, select, text
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
 from app.db.models.vuln_rule_index import VulnRuleIndex
-from app.db.session import SessionLocal, engine
 from app.rules.rule_store import RuleStore
-from app.services.vuln_library_service import VulnLibraryService
+from app.services.vuln_library_service import (
+    VulnLibrarySchemaNotReadyError,
+    VulnLibrarySchemaStatus,
+    VulnLibraryService,
+)
+
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "JSON"
+
+
+@compiles(INET, "sqlite")
+def _compile_inet_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "TEXT"
+
+
+@compiles(CIDR, "sqlite")
+def _compile_cidr_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "TEXT"
+
+
+engine = create_engine(
+    "sqlite+pysqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+    class_=Session,
+)
 
 
 def _reset_index_table() -> None:
+    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS has_active_check BOOLEAN NOT NULL DEFAULT false"))
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS active_detector VARCHAR(64)"))
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS active_trigger VARCHAR(32)"))
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS has_nse_match BOOLEAN NOT NULL DEFAULT false"))
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS nse_scripts JSONB NOT NULL DEFAULT '[]'::jsonb"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_rule_index_has_active_check ON vuln_rule_index (has_active_check)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_rule_index_active_detector ON vuln_rule_index (active_detector)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_rule_index_has_nse_match ON vuln_rule_index (has_nse_match)"))
     with SessionLocal() as db:
-        db.execute(delete(VulnRuleIndex))
+        db.query(VulnRuleIndex).delete()
         db.commit()
 
 
@@ -106,6 +135,74 @@ def test_vuln_library_service_write_operations_refresh_index(tmp_path) -> None:
     assert status.indexed_rule_count == 0
     assert status.index_in_sync is True
     assert rows == []
+
+
+def test_vuln_library_service_get_status_reports_schema_not_ready_without_touching_index(tmp_path, monkeypatch) -> None:
+    _reset_index_table()
+    service = _build_service(
+        tmp_path,
+        """rules:
+  - id: apache.httpd.lt_2_2_9
+    name: Apache legacy exposure
+    enabled: true
+    service: apache
+    severity: high
+    description: Apache version is older than 2.2.9
+    match:
+      version: <2.2.9
+""",
+    )
+    monkeypatch.setattr(
+        service,
+        "_get_schema_status",
+        lambda: VulnLibrarySchemaStatus(
+            ready=False,
+            error="数据库结构未升级，请先执行 alembic upgrade head",
+        ),
+    )
+
+    def _unexpected_index_refresh(*args, **kwargs):
+        raise AssertionError("schema 未就绪时不应刷新索引")
+
+    monkeypatch.setattr(service, "_ensure_index_current", _unexpected_index_refresh)
+
+    status = service.get_status()
+
+    assert status.rule_count == 1
+    assert status.schema_ready is False
+    assert status.schema_error == "数据库结构未升级，请先执行 alembic upgrade head"
+    assert status.index_in_sync is False
+    assert status.index_last_error == "数据库结构未升级，请先执行 alembic upgrade head"
+
+
+def test_vuln_library_service_sync_intel_fails_fast_when_schema_not_ready(tmp_path, monkeypatch) -> None:
+    _reset_index_table()
+    service = _build_service(
+        tmp_path,
+        """rules:
+  - id: apache.httpd.lt_2_2_9
+    name: Apache legacy exposure
+    enabled: true
+    service: apache
+    severity: high
+    description: Apache version is older than 2.2.9
+    match:
+      version: <2.2.9
+    cve_ids:
+      - CVE-2007-6388
+""",
+    )
+    monkeypatch.setattr(
+        service,
+        "_get_schema_status",
+        lambda: VulnLibrarySchemaStatus(
+            ready=False,
+            error="数据库结构未升级，请先执行 alembic upgrade head",
+        ),
+    )
+
+    with pytest.raises(VulnLibrarySchemaNotReadyError, match="alembic upgrade head"):
+        service.sync_intel()
 
 
 def test_vuln_library_service_indexes_active_check_metadata(tmp_path) -> None:

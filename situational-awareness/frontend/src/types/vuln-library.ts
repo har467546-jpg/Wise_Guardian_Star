@@ -69,6 +69,25 @@ export type VulnRuleActiveCheck = {
   params: Record<string, unknown>;
 };
 
+export type VulnIntelSummary = {
+  cve_count: number;
+  max_cvss: number | null;
+  max_epss: number | null;
+  kev_flag: boolean;
+  exploit_maturity: string | null;
+  intel_synced_at: string | null;
+  stale: boolean;
+};
+
+export type VulnRuleGovernance = {
+  owner_id: string | null;
+  review_status: string;
+  change_ticket: string | null;
+  last_validated_at: string | null;
+  last_preview_at: string | null;
+  updated_at: string | null;
+};
+
 export type VulnRule = {
   id: string;
   name: string;
@@ -90,6 +109,9 @@ export type VulnRule = {
   active_check: VulnRuleActiveCheck | null;
   created_at: string | null;
   updated_at: string | null;
+  intel_summary: VulnIntelSummary;
+  governance: VulnRuleGovernance;
+  affected_open_finding_count: number;
 };
 
 export type VulnRuleInput = {
@@ -128,6 +150,8 @@ export type VulnLibraryStatus = {
   source_mtime: number | null;
   rule_count: number;
   last_error: string | null;
+  schema_ready: boolean;
+  schema_error: string | null;
   indexed_rule_count: number;
   index_synced_at: string | null;
   index_in_sync: boolean;
@@ -143,6 +167,23 @@ export type VulnRuleImportError = {
   message: string;
 };
 
+export type RuleImportImpactChange = {
+  rule_id: string;
+  operation: string;
+  changed_fields: string[];
+  high_risk_flags: string[];
+  affected_open_findings: number;
+};
+
+export type RuleImportImpactPreview = {
+  created_rule_ids: string[];
+  updated_rule_ids: string[];
+  skipped_rule_ids: string[];
+  total_affected_open_findings: number;
+  high_risk_rule_ids: string[];
+  changes: RuleImportImpactChange[];
+};
+
 export type VulnRuleImportResponse = {
   dry_run: boolean;
   mode: VulnRuleImportMode;
@@ -156,6 +197,7 @@ export type VulnRuleImportResponse = {
   updated_ids: string[];
   skipped_ids: string[];
   errors: VulnRuleImportError[];
+  impact_preview: RuleImportImpactPreview | null;
 };
 
 export type VulnRuleBatchStatusResponse = {
@@ -174,6 +216,17 @@ export type VulnRuleIndexRebuildResponse = {
   index_in_sync: boolean;
   source_hash: string | null;
   index_last_error: string | null;
+};
+
+export type VulnIntelStatus = {
+  total_cves: number;
+  tracked_rule_cves: number;
+  synced_cves: number;
+  stale: boolean;
+  stale_count: number;
+  last_synced_at: string | null;
+  sources: string[];
+  updated_cves: number;
 };
 
 export type VulnRuleCatalogView = "default" | "all" | "legacy";

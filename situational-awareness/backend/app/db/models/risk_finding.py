@@ -28,3 +28,5 @@ class RiskFinding(Base):
     asset = relationship("Asset", back_populates="findings")
     rule = relationship("RiskRule", back_populates="findings")
     asset_port = relationship("AssetPort")
+    governance = relationship("FindingGovernance", back_populates="finding", uselist=False, cascade="all, delete-orphan")
+    waivers = relationship("FindingWaiver", back_populates="finding", cascade="all, delete-orphan")

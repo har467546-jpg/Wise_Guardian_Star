@@ -29,6 +29,10 @@ function isInsideAgentUI(element: Element | null) {
   return Boolean(element?.closest("[data-haor-agent-root='true']"));
 }
 
+function isInsideSensitiveInput(element: Element | null) {
+  return Boolean(element?.closest("[data-haor-sensitive-input='true']"));
+}
+
 function truncate(value: string | null | undefined, maxLength: number) {
   const normalized = String(value || "").replace(/\s+/g, " ").trim();
   if (!normalized) {
@@ -78,7 +82,7 @@ function isElementVisible(element: Element | null): element is HTMLElement {
   if (!(element instanceof HTMLElement)) {
     return false;
   }
-  if (isInsideAgentUI(element)) {
+  if (isInsideAgentUI(element) || isInsideSensitiveInput(element)) {
     return false;
   }
   const style = window.getComputedStyle(element);
@@ -453,9 +457,16 @@ function collectSelectedRows() {
     if (!isElementVisible(element)) {
       return;
     }
+    const rowKey = truncate(element.getAttribute("data-row-key"), 120);
+    const assetLink = element.querySelector<HTMLAnchorElement>("a[href^='/assets/'], a[href^='/remediation/']");
+    const href = assetLink?.getAttribute("href") || "";
+    const hrefMatch = href.match(/^\/(?:assets|remediation)\/([^/?#]+)/);
+    const assetId = truncate(rowKey || hrefMatch?.[1] || "", 120);
     rows.push({
       node_id: ensureNodeId(element),
+      asset_id: assetId || null,
       label: truncate(element.textContent, 160) || "当前选中行",
+      meta: assetId ? { asset_id: assetId } : {},
     });
   });
   return rows.slice(0, 6);

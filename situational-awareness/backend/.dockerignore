@@ -1,0 +1,8 @@
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+dev.db
+.env.runtime
+.env.runtime.lock
+.env.runtime.bootstrap

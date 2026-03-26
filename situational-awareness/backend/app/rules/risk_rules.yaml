@@ -1312,7 +1312,7 @@ rules:
   match:
     version: <2.11.4
   cve_ids:
-  - CVE-2007-3766
+  - CVE-2008-1149
   affected_versions_text: phpMyAdmin 2.11.4 以下版本
   preconditions:
   - 应用指纹识别为低于 2.11.4 的 phpMyAdmin

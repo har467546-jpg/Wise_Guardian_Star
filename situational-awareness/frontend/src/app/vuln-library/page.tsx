@@ -37,14 +37,17 @@ import {
   deleteVulnRule,
   exportVulnRules,
   getVulnLibraryStatus,
+  getVulnIntelStatus,
   getVulnRule,
   importVulnRules,
   listVulnRules,
   rebuildVulnLibraryIndex,
+  syncVulnIntel,
   updateVulnRule,
 } from "@/services/api";
 import {
   VulnLibraryStatus,
+  VulnIntelStatus,
   VulnRule,
   VulnRuleActiveCheckDetector,
   VulnRuleActiveCheckTrigger,
@@ -125,6 +128,25 @@ const governanceTagLabelMap: Record<string, string> = {
 const remediationLevelLabelMap: Record<NonNullable<VulnRuleRemediation["automation_level"]>, string> = {
   callable: "自动处理",
 };
+
+const reviewStatusLabelMap: Record<string, string> = {
+  draft: "草稿",
+  reviewed: "已评审",
+  published: "已发布",
+  deprecated: "已废弃",
+};
+
+function formatReviewStatus(reviewStatus?: string | null): string {
+  const normalized = String(reviewStatus || "").trim().toLowerCase();
+  return reviewStatusLabelMap[normalized] || (reviewStatus || "已发布");
+}
+
+function formatNullableScore(value?: number | null, digits = 2): string {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "未同步";
+  }
+  return value.toFixed(digits);
+}
 
 function getRuleCatalogType(rule: VulnRule): "high-value" | "legacy-exposure" | "standard" {
   if (rule.tags.includes("legacy-exposure")) {
@@ -363,15 +385,38 @@ function importResultSummary(result: VulnRuleImportResponse) {
   return `新增 ${result.created} 条，更新 ${result.updated} 条，跳过 ${result.skipped} 条，错误 ${result.error_count} 条`;
 }
 
+function getIntelState(
+  status: VulnLibraryStatus | null,
+  intelStatus: VulnIntelStatus | null,
+): { label: string; tone: "success" | "warning" | "neutral" } {
+  if (status && !status.schema_ready) {
+    return { label: "不可同步", tone: "warning" };
+  }
+  if (!intelStatus) {
+    return { label: "未知", tone: "neutral" };
+  }
+  if (!intelStatus.last_synced_at) {
+    return { label: "未同步", tone: "warning" };
+  }
+  if (intelStatus.stale_count > 0) {
+    return { label: "部分缺失/过期", tone: "warning" };
+  }
+  return { label: "新鲜", tone: "success" };
+}
+
 export default function VulnLibraryPage() {
   const screens = Grid.useBreakpoint();
   const [rules, setRules] = useState<VulnRule[]>([]);
   const [status, setStatus] = useState<VulnLibraryStatus | null>(null);
+  const [intelStatus, setIntelStatus] = useState<VulnIntelStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [intelStatusError, setIntelStatusError] = useState<string | null>(null);
+  const [intelSyncError, setIntelSyncError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [rebuildLoading, setRebuildLoading] = useState(false);
+  const [intelSyncLoading, setIntelSyncLoading] = useState(false);
   const [batchLoading, setBatchLoading] = useState<"enable" | "disable" | null>(null);
   const [exportLoading, setExportLoading] = useState(false);
   const [keyword, setKeyword] = useState("");
@@ -452,20 +497,42 @@ export default function VulnLibraryPage() {
         }
       });
 
-    getVulnLibraryStatus()
-      .then((statusResponse) => {
+    const loadStatusAndIntel = async () => {
+      try {
+        const statusResponse = await getVulnLibraryStatus();
         if (cancelled) {
           return;
         }
         setStatus(statusResponse);
         setStatusError(null);
-      })
-      .catch((err) => {
+        if (!statusResponse.schema_ready) {
+          setIntelStatus(null);
+          setIntelStatusError(null);
+          return;
+        }
+        try {
+          const intelResponse = await getVulnIntelStatus();
+          if (cancelled) {
+            return;
+          }
+          setIntelStatus(intelResponse);
+          setIntelStatusError(null);
+        } catch (err) {
+          if (!cancelled) {
+            setIntelStatus(null);
+            setIntelStatusError((err as Error).message);
+          }
+        }
+      } catch (err) {
         if (!cancelled) {
           setStatus(null);
           setStatusError((err as Error).message);
+          setIntelStatus(null);
+          setIntelStatusError(null);
         }
-      });
+      }
+    };
+    void loadStatusAndIntel();
 
     return () => {
       cancelled = true;
@@ -481,7 +548,8 @@ export default function VulnLibraryPage() {
   );
 
   const selectedCount = selectedRowKeys.length;
-  const indexHealthy = Boolean(status?.index_in_sync && !status?.last_error && !status?.index_last_error);
+  const indexHealthy = Boolean(status?.schema_ready && status?.index_in_sync && !status?.last_error && !status?.index_last_error);
+  const intelState = getIntelState(status, intelStatus);
   const importFileList = useMemo<UploadFile[]>(
     () =>
       importFile
@@ -516,6 +584,9 @@ export default function VulnLibraryPage() {
               </Tag>
             ))}
             {record.cve_ids.length > 1 ? <Tag>+{record.cve_ids.length - 1}</Tag> : null}
+            {record.intel_summary.kev_flag ? <Tag color="red">KEV</Tag> : null}
+            {record.intel_summary.max_epss !== null ? <Tag color="volcano">EPSS {formatNullableScore(record.intel_summary.max_epss, 3)}</Tag> : null}
+            {record.intel_summary.max_cvss !== null ? <Tag color="purple">CVSS {formatNullableScore(record.intel_summary.max_cvss)}</Tag> : null}
           </div>
         </div>
       ),
@@ -563,6 +634,12 @@ export default function VulnLibraryPage() {
         <div className="ui-cell-stack">
           <StatusTag value={record.severity} />
           <StatusTag value={record.enabled ? "enabled" : "disabled"} />
+          <Typography.Text type="secondary">
+            评审：{formatReviewStatus(record.governance.review_status)}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            影响发现：{record.affected_open_finding_count}
+          </Typography.Text>
         </div>
       ),
     },
@@ -724,6 +801,34 @@ export default function VulnLibraryPage() {
     }
   };
 
+  const handleSyncIntel = async () => {
+    if (status && !status.schema_ready) {
+      const schemaMessage = status.schema_error || "数据库结构未升级，请先执行 alembic upgrade head";
+      setIntelSyncError(schemaMessage);
+      message.warning(schemaMessage);
+      return;
+    }
+    try {
+      setIntelSyncLoading(true);
+      setIntelSyncError(null);
+      const response = await syncVulnIntel();
+      setIntelStatus(response);
+      setIntelStatusError(null);
+      message.success(
+        response.updated_cves
+          ? `情报同步完成，本轮更新 ${response.updated_cves} 个 CVE`
+          : "情报同步完成，本轮无新增更新",
+      );
+      refreshPage();
+    } catch (err) {
+      const errorMessage = (err as Error).message;
+      setIntelSyncError(errorMessage);
+      message.error(errorMessage);
+    } finally {
+      setIntelSyncLoading(false);
+    }
+  };
+
   const closeImportModal = () => {
     setImportOpen(false);
     setImportFile(null);
@@ -793,7 +898,7 @@ export default function VulnLibraryPage() {
       <DesktopPageHeader
         eyebrow="规则治理"
         title="漏洞规则工作台"
-        description="规则运行真源保持为 YAML；当前桌面工作台聚焦索引健康、批量启停、导入导出与规则维护。"
+        description="规则运行真源保持为 YAML；当前桌面工作台聚焦索引健康、情报同步、导入预检和规则运营。"
         meta={[
           { label: "规则总数", value: status?.rule_count ?? 0, tone: "accent" },
           { label: "当前筛选", value: total, tone: "neutral" },
@@ -804,22 +909,50 @@ export default function VulnLibraryPage() {
           },
           { label: "批量选择", value: selectedCount, tone: selectedCount ? "accent" : "neutral" },
           { label: "索引状态", value: indexHealthy ? "已同步" : "待修复", tone: indexHealthy ? "success" : "warning" },
+          { label: "情报状态", value: intelState.label, tone: intelState.tone },
         ]}
       />
 
       {statusError ? <Alert type="warning" showIcon message={`状态读取失败：${statusError}`} /> : null}
+      {intelStatusError ? <Alert type="warning" showIcon message={`情报状态读取失败：${intelStatusError}`} /> : null}
+      {intelSyncError ? <Alert type="error" showIcon message={`情报同步失败：${intelSyncError}`} /> : null}
       {status ? (
+        status.schema_ready ? (
+          <Alert
+            type={status.last_error || status.index_last_error || !status.index_in_sync ? "warning" : "success"}
+            showIcon
+            message={
+              status.last_error
+                ? `规则加载存在告警：${status.last_error}`
+                : status.index_last_error
+                  ? `索引同步存在告警：${status.index_last_error}`
+                  : status.index_in_sync
+                    ? `规则引擎与索引已同步，共 ${status.rule_count} 条规则`
+                    : "规则索引与 YAML 不一致，建议重建索引"
+            }
+          />
+        ) : (
+          <Alert
+            type="error"
+            showIcon
+            message="数据库结构落后，当前无法同步漏洞情报"
+            description={status.schema_error || "请先执行 alembic upgrade head，并重启后端服务后重试。"}
+          />
+        )
+      ) : null}
+      {status?.schema_ready && intelStatus ? (
         <Alert
-          type={status.last_error || status.index_last_error || !status.index_in_sync ? "warning" : "success"}
+          type={!intelStatus.last_synced_at || intelStatus.stale_count > 0 ? "warning" : "info"}
           showIcon
           message={
-            status.last_error
-              ? `规则加载存在告警：${status.last_error}`
-              : status.index_last_error
-                ? `索引同步存在告警：${status.index_last_error}`
-                : status.index_in_sync
-                  ? `规则引擎与索引已同步，共 ${status.rule_count} 条规则`
-                  : "规则索引与 YAML 不一致，建议重建索引"
+            !intelStatus.last_synced_at
+              ? `漏洞情报尚未同步，当前跟踪 ${intelStatus.tracked_rule_cves} 个规则 CVE`
+              : intelStatus.stale_count > 0
+                ? `漏洞情报已同步，但仍有 ${intelStatus.stale_count} 条缺失或过期关联`
+                : `漏洞情报已同步，覆盖 ${intelStatus.synced_cves}/${intelStatus.tracked_rule_cves} 个规则 CVE`
+          }
+          description={
+            `来源：${intelStatus.sources.join(" / ")}；最近同步：${intelStatus.last_synced_at ? new Date(intelStatus.last_synced_at).toLocaleString() : "未同步"}`
           }
         />
       ) : null}
@@ -894,8 +1027,13 @@ export default function VulnLibraryPage() {
               />
               <Button onClick={refreshPage}>刷新</Button>
               {isAdmin ? (
-                <Button loading={rebuildLoading} onClick={() => void handleRebuildIndex()}>
+                <Button disabled={status ? !status.schema_ready : true} loading={rebuildLoading} onClick={() => void handleRebuildIndex()}>
                   重建索引
+                </Button>
+              ) : null}
+              {isAdmin ? (
+                <Button disabled={status ? !status.schema_ready : true} loading={intelSyncLoading} onClick={() => void handleSyncIntel()}>
+                  同步情报
                 </Button>
               ) : null}
               {isAdmin ? (
@@ -1045,6 +1183,49 @@ export default function VulnLibraryPage() {
                 },
               ]}
             />
+
+            <Card size="small" title="情报摘要">
+              <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                <div className="ui-chip-wrap">
+                  <span className="console-inline-chip">CVE 数：{selectedRule.intel_summary.cve_count}</span>
+                  <span className="console-inline-chip">CVSS：{formatNullableScore(selectedRule.intel_summary.max_cvss)}</span>
+                  <span className="console-inline-chip">EPSS：{formatNullableScore(selectedRule.intel_summary.max_epss, 3)}</span>
+                  {selectedRule.intel_summary.kev_flag ? (
+                    <span className="console-inline-chip console-inline-chip-danger">KEV</span>
+                  ) : null}
+                  {selectedRule.intel_summary.stale ? (
+                    <span className="console-inline-chip console-inline-chip-warning">情报过期</span>
+                  ) : (
+                    <span className="console-inline-chip console-inline-chip-success">情报有效</span>
+                  )}
+                </div>
+                <Typography.Text className="ui-detail-wrap">
+                  利用成熟度：{selectedRule.intel_summary.exploit_maturity || "未同步"}
+                </Typography.Text>
+                <Typography.Text type="secondary">
+                  最近同步：{selectedRule.intel_summary.intel_synced_at ? new Date(selectedRule.intel_summary.intel_synced_at).toLocaleString() : "未同步"}
+                </Typography.Text>
+              </Space>
+            </Card>
+
+            <Card size="small" title="规则运营">
+              <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                <div className="ui-chip-wrap">
+                  <span className="console-inline-chip">评审状态：{formatReviewStatus(selectedRule.governance.review_status)}</span>
+                  <span className="console-inline-chip">影响开放发现：{selectedRule.affected_open_finding_count}</span>
+                  <span className="console-inline-chip">责任人：{selectedRule.governance.owner_id || "未分配"}</span>
+                </div>
+                <Typography.Text className="ui-detail-wrap">
+                  变更单：{selectedRule.governance.change_ticket || "未填写"}
+                </Typography.Text>
+                <Typography.Text type="secondary">
+                  最近预检：{selectedRule.governance.last_preview_at ? new Date(selectedRule.governance.last_preview_at).toLocaleString() : "未记录"}
+                </Typography.Text>
+                <Typography.Text type="secondary">
+                  最近校验：{selectedRule.governance.last_validated_at ? new Date(selectedRule.governance.last_validated_at).toLocaleString() : "未记录"}
+                </Typography.Text>
+              </Space>
+            </Card>
 
             <Card size="small" title="漏洞描述">
               <Typography.Paragraph style={{ marginBottom: 0 }}>{selectedRule.description}</Typography.Paragraph>
@@ -1513,6 +1694,38 @@ export default function VulnLibraryPage() {
                 ) : (
                   <Alert type="success" showIcon message={importResultSummary(importPreview)} />
                 )}
+                {importPreview.impact_preview ? (
+                  <Card size="small" title="影响预览">
+                    <Space direction="vertical" size={10} style={{ width: "100%" }}>
+                      <div className="ui-chip-wrap">
+                        <span className="console-inline-chip">影响开放发现：{importPreview.impact_preview.total_affected_open_findings}</span>
+                        <span className="console-inline-chip console-inline-chip-warning">高风险变更：{importPreview.impact_preview.high_risk_rule_ids.length}</span>
+                      </div>
+                      {importPreview.impact_preview.changes.length ? (
+                        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                          {importPreview.impact_preview.changes.slice(0, 6).map((item) => (
+                            <Card key={`${item.rule_id}-${item.operation}`} size="small" type="inner" title={`${item.rule_id} · ${item.operation}`}>
+                              <Space direction="vertical" size={4} style={{ width: "100%" }}>
+                                <Typography.Text>字段变化：{item.changed_fields.length ? item.changed_fields.join("、") : "无"}</Typography.Text>
+                                <Typography.Text>影响发现：{item.affected_open_findings}</Typography.Text>
+                                <Typography.Text type={item.high_risk_flags.length ? "warning" : "secondary"}>
+                                  高风险标记：{item.high_risk_flags.length ? item.high_risk_flags.join("、") : "无"}
+                                </Typography.Text>
+                              </Space>
+                            </Card>
+                          ))}
+                          {importPreview.impact_preview.changes.length > 6 ? (
+                            <Typography.Text type="secondary">
+                              其余 {importPreview.impact_preview.changes.length - 6} 条变化请按正式导入前再确认。
+                            </Typography.Text>
+                          ) : null}
+                        </Space>
+                      ) : (
+                        <Typography.Text type="secondary">本次导入没有命中需要变更的现有规则。</Typography.Text>
+                      )}
+                    </Space>
+                  </Card>
+                ) : null}
               </Space>
             </Card>
           ) : null}

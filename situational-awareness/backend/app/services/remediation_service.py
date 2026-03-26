@@ -163,6 +163,132 @@ _SEVERITY_RANK = {
     RiskSeverity.MEDIUM: 2,
     RiskSeverity.LOW: 1,
 }
+REMEDIATION_ADAPTER_VERSION = "2026-03-26-enterprise-p0"
+_BACKUP_REQUIRED_ACTION_TYPES = {
+    "set_config",
+    "remove_config",
+    "permission_set",
+    "set_path_permission",
+    "remove_path",
+    "remove_exposure",
+    "restrict_network",
+    "set_bind_scope",
+    "set_access_policy",
+}
+_ACTION_ADAPTER_CONTRACTS: dict[str, dict[str, Any]] = {
+    "upgrade_package": {
+        "risk_level": "high",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": True,
+        "adapter_id": "linux.package.upgrade",
+        "evidence_items": ["package_version_before", "command_preview", "package_version_after", "reverify_result"],
+    },
+    "reload_service": {
+        "risk_level": "medium",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": False,
+        "adapter_id": "linux.service.reload",
+        "evidence_items": ["service_state_before", "command_preview", "service_state_after", "reverify_result"],
+    },
+    "restart_service": {
+        "risk_level": "high",
+        "idempotent": False,
+        "dry_run_supported": True,
+        "requires_maintenance_window": True,
+        "adapter_id": "linux.service.restart",
+        "evidence_items": ["service_state_before", "command_preview", "service_state_after", "reverify_result"],
+    },
+    "disable_service": {
+        "risk_level": "high",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": True,
+        "adapter_id": "linux.service.disable",
+        "evidence_items": ["service_state_before", "command_preview", "service_state_after", "reverify_result"],
+    },
+    "set_config": {
+        "risk_level": "medium",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": False,
+        "adapter_id": "linux.config.set",
+        "evidence_items": ["config_snapshot_before", "command_preview", "config_snapshot_after", "reverify_result"],
+    },
+    "remove_config": {
+        "risk_level": "medium",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": False,
+        "adapter_id": "linux.config.remove",
+        "evidence_items": ["config_snapshot_before", "command_preview", "config_snapshot_after", "reverify_result"],
+    },
+    "permission_set": {
+        "risk_level": "medium",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": False,
+        "adapter_id": "linux.path.permission_set",
+        "evidence_items": ["permission_snapshot_before", "command_preview", "permission_snapshot_after", "reverify_result"],
+    },
+    "remove_exposure": {
+        "risk_level": "medium",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": False,
+        "adapter_id": "linux.exposure.remove",
+        "evidence_items": ["target_snapshot_before", "command_preview", "target_snapshot_after", "reverify_result"],
+    },
+    "restrict_network": {
+        "risk_level": "high",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": True,
+        "adapter_id": "linux.network.restrict",
+        "evidence_items": ["bind_snapshot_before", "command_preview", "bind_snapshot_after", "reverify_result"],
+    },
+    "toggle_feature": {
+        "risk_level": "medium",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": False,
+        "adapter_id": "linux.feature.toggle",
+        "evidence_items": ["config_snapshot_before", "command_preview", "config_snapshot_after", "reverify_result"],
+    },
+    "set_bind_scope": {
+        "risk_level": "high",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": True,
+        "adapter_id": "linux.network.bind_scope",
+        "evidence_items": ["bind_snapshot_before", "command_preview", "bind_snapshot_after", "reverify_result"],
+    },
+    "set_access_policy": {
+        "risk_level": "medium",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": False,
+        "adapter_id": "linux.access.policy",
+        "evidence_items": ["policy_snapshot_before", "command_preview", "policy_snapshot_after", "reverify_result"],
+    },
+    "remove_path": {
+        "risk_level": "high",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": True,
+        "adapter_id": "linux.path.remove",
+        "evidence_items": ["path_snapshot_before", "command_preview", "path_snapshot_after", "reverify_result"],
+    },
+    "set_path_permission": {
+        "risk_level": "medium",
+        "idempotent": True,
+        "dry_run_supported": True,
+        "requires_maintenance_window": False,
+        "adapter_id": "linux.path.permission_set",
+        "evidence_items": ["permission_snapshot_before", "command_preview", "permission_snapshot_after", "reverify_result"],
+    },
+}
 
 
 def get_manual_credential(db: Session, asset_id: str) -> SSHCredential | None:
@@ -487,10 +613,16 @@ def _build_plan_from_finding(
     filtered_due_to_login_user_required_suid = bool(excluded_suid_binaries) and not steps and bool(
         remediation.actions
     )
+    contract_gap_reasons = [
+        f"步骤“{step.title}”缺少完整的企业执行元数据"
+        for step in steps
+        if step.execution_state == "ready" and not _step_has_enterprise_contract(step)
+    ]
     plan_blocked_reasons = list(
         dict.fromkeys(
             [
                 *blocked_reasons,
+                *contract_gap_reasons,
                 *[
                     step.blocked_reason
                     for step in steps
@@ -514,7 +646,9 @@ def _build_plan_from_finding(
         precheck_items=[str(item).strip() for item in (rendered.get("precheck_items") or []) if str(item).strip()],
         verify_items=[str(item).strip() for item in (rendered.get("verify_items") or []) if str(item).strip()],
         rollback_notes=[str(item).strip() for item in (rendered.get("rollback_notes") or []) if str(item).strip()],
-        execution_ready=bool(steps) and not plan_blocked_reasons and all(step.execution_state == "ready" for step in steps),
+        execution_ready=bool(steps) and not plan_blocked_reasons and all(
+            step.execution_state == "ready" and _step_has_enterprise_contract(step) for step in steps
+        ),
         blocked_reasons=plan_blocked_reasons,
         steps=steps,
         source_refs={
@@ -689,7 +823,9 @@ class RemediationCommandPlanner:
         requires_confirmation = bool(action.get("requires_confirmation", True))
         renderer = getattr(self, f"_render_{action_type}", None)
         if renderer is None:
-            return self._blocked_step(step_id, action_type, title, requires_confirmation, "当前动作类型不在自动执行白名单内")
+            return _decorate_step_with_enterprise_contract(
+                self._blocked_step(step_id, action_type, title, requires_confirmation, "当前动作类型不在自动执行白名单内")
+            )
         rendered = renderer(
             step_id=step_id,
             action_type=action_type,
@@ -719,8 +855,8 @@ class RemediationCommandPlanner:
             step=updated,
             credential=self.credential,
         ):
-            return _block_self_lock_step(updated)
-        return updated
+            updated = _block_self_lock_step(updated)
+        return _decorate_step_with_enterprise_contract(updated)
 
     def _render_upgrade_package(self, *, step_id: str, action_type: str, title: str, params: dict[str, Any], requires_confirmation: bool) -> RemediationPlanStepRead:
         package_name = str(params.get("package_name") or params.get("service_name") or "").strip()
@@ -1265,6 +1401,10 @@ def select_executable_plan_steps(steps: list[Any], *, submitted_step_ids: list[s
     return selected_steps
 
 
+def selected_steps_require_maintenance_window(steps: list[Any]) -> bool:
+    return any(bool(_step_field(step, "requires_maintenance_window")) for step in steps)
+
+
 def _open_asset_port_id_set(db: Session, findings: list[RiskFinding]) -> set[str]:
     port_ids = sorted({finding.asset_port_id for finding in findings if finding.asset_port_id})
     if not port_ids:
@@ -1499,6 +1639,50 @@ def _block_self_lock_step(step: RemediationPlanStepRead) -> RemediationPlanStepR
             "render_reason": _SELF_LOCK_SUDO_MESSAGE,
         }
     )
+
+
+def _step_has_real_backup_target(step: RemediationPlanStepRead) -> bool:
+    backup_plan = step.backup_plan
+    return bool(backup_plan and backup_plan.targets)
+
+
+def _step_has_enterprise_contract(step: RemediationPlanStepRead) -> bool:
+    return bool(
+        step.adapter_id
+        and step.adapter_version
+        and step.dry_run_supported
+        and step.evidence_items
+    )
+
+
+def _decorate_step_with_enterprise_contract(step: RemediationPlanStepRead) -> RemediationPlanStepRead:
+    contract = dict(_ACTION_ADAPTER_CONTRACTS.get(step.action_type, {}))
+    backup_required = step.action_type in _BACKUP_REQUIRED_ACTION_TYPES
+    backup_ready = _step_has_real_backup_target(step)
+    rollback_supported = backup_ready and step.action_type != "upgrade_package"
+    updates: dict[str, Any] = {
+        "risk_level": contract.get("risk_level", "medium"),
+        "idempotent": bool(contract.get("idempotent", False)),
+        "dry_run_supported": bool(contract.get("dry_run_supported", False)),
+        "rollback_supported": rollback_supported,
+        "evidence_items": list(contract.get("evidence_items", [])),
+        "requires_maintenance_window": bool(contract.get("requires_maintenance_window", False)),
+        "adapter_id": contract.get("adapter_id"),
+        "adapter_version": REMEDIATION_ADAPTER_VERSION if contract else None,
+    }
+    if backup_required and not backup_ready and step.execution_state == "ready":
+        blocked_reason = "当前步骤缺少可验证的备份目标，已阻止自动执行"
+        updates.update(
+            {
+                "supported": False,
+                "execution_state": "blocked",
+                "blocked_reason": blocked_reason,
+                "generated_command": None,
+                "render_reason": blocked_reason,
+                "rollback_supported": False,
+            }
+        )
+    return step.model_copy(update=updates)
 
 
 def _is_self_locking_sudo_step(

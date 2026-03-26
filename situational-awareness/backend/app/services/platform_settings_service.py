@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import os
 from time import perf_counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -205,8 +206,16 @@ def _runtime_env_snapshot() -> dict[str, str]:
     runtime_path = ensure_runtime_env_file()
     env_map = _parse_env_file(runtime_path)
     if env_map:
-        return env_map
-    return _parse_env_file(EXAMPLE_ENV_PATH)
+        overlay_keys = set(env_map)
+    else:
+        env_map = _parse_env_file(EXAMPLE_ENV_PATH)
+        overlay_keys = set(env_map)
+    overlay_keys.update(_parse_env_file(EXAMPLE_ENV_PATH))
+    for key in overlay_keys:
+        env_value = os.getenv(key)
+        if env_value is not None:
+            env_map[key] = env_value.strip()
+    return env_map
 
 
 def _runtime_env_value(key: str, fallback: str = "") -> str:

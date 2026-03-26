@@ -82,6 +82,14 @@ export type RemediationPlanStep = {
   fallback_candidates: string[];
   verify_items: string[];
   rollback_hint: string | null;
+  risk_level: "low" | "medium" | "high";
+  idempotent: boolean;
+  dry_run_supported: boolean;
+  rollback_supported: boolean;
+  evidence_items: string[];
+  requires_maintenance_window: boolean;
+  adapter_id: string | null;
+  adapter_version: string | null;
 };
 
 export type RemediationPlan = {
@@ -107,12 +115,16 @@ export type RemediationExecuteRequest = {
   steps: Array<{
     step_id: string;
   }>;
+  execution_mode?: "dry_run" | "apply";
+  change_ticket?: string | null;
+  maintenance_window_id?: string | null;
 };
 
 export type RemediationExecuteResponse = {
   task_id: string;
   status: "pending" | "running" | "retry" | "success" | "failure" | "canceled";
   stream_url: string;
+  execution_mode: "dry_run" | "apply";
 };
 
 export type RemediationTask = {
@@ -127,12 +139,34 @@ export type RemediationTask = {
   finished_at: string | null;
   event_count: number;
   last_event_at: string | null;
-  execution_boundary: "template_generated" | "runner_dispatch" | null;
+  execution_boundary: "template_generated" | "runner_dispatch" | "dry_run_preview" | null;
+  execution_mode: "dry_run" | "apply" | null;
   context: Record<string, unknown>;
   plan: Record<string, unknown>;
   execution: Record<string, unknown>;
   backups: Record<string, unknown>;
   reverify: Record<string, unknown>;
+};
+
+export type RemediationTaskEvidenceItem = {
+  item_id: string;
+  item_type: string;
+  step_id: string | null;
+  title: string;
+  status: string;
+  summary: string;
+  payload_json: Record<string, unknown>;
+  collected_at: string | null;
+};
+
+export type RemediationTaskEvidence = {
+  task_id: string;
+  execution_mode: "dry_run" | "apply" | null;
+  execution_boundary: "template_generated" | "runner_dispatch" | "dry_run_preview" | null;
+  generated_at: string | null;
+  item_count: number;
+  items: RemediationTaskEvidenceItem[];
+  summary: Record<string, unknown>;
 };
 
 export type HostRunner = {
@@ -187,6 +221,14 @@ export type HostRemediationPlanStep = {
   fallback_candidates: string[];
   verify_items: string[];
   rollback_hint: string | null;
+  risk_level: "low" | "medium" | "high";
+  idempotent: boolean;
+  dry_run_supported: boolean;
+  rollback_supported: boolean;
+  evidence_items: string[];
+  requires_maintenance_window: boolean;
+  adapter_id: string | null;
+  adapter_version: string | null;
   blockers: RemediationBlocker[];
   related_findings: HostRemediationRelatedFinding[];
   related_rules: string[];
@@ -304,10 +346,14 @@ export type RemediationSessionApproveResponse = {
   task_id: string;
   status: "pending" | "running" | "retry" | "success" | "failure" | "canceled";
   stream_url: string;
+  execution_mode: "dry_run" | "apply";
 };
 
 export type RemediationSessionApproveRequest = {
   stage_code?: string | null;
+  execution_mode?: "dry_run" | "apply";
+  change_ticket?: string | null;
+  maintenance_window_id?: string | null;
 };
 
 export type HostRunnerInstallResponse = {

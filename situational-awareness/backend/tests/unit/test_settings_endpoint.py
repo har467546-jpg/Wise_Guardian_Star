@@ -122,6 +122,15 @@ def _build_client(monkeypatch, tmp_path, role: UserRole = UserRole.ADMIN) -> Tes
         encoding="utf-8",
     )
     runtime_env.write_text(example_env.read_text(encoding="utf-8"), encoding="utf-8")
+    for key in (
+        "LLM_PROVIDER",
+        "LLM_MODEL",
+        "LLM_BASE_URL",
+        "LLM_WIRE_API",
+        "LLM_TIMEOUT_SECONDS",
+        "LLM_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(platform_settings_service, "RUNTIME_ENV_PATH", runtime_env)
     monkeypatch.setattr(platform_settings_service, "EXAMPLE_ENV_PATH", example_env)
     monkeypatch.setattr(platform_settings_service.settings, "SETTINGS_HELPER_URL", "http://settings-helper.test/internal/apply")
@@ -167,6 +176,24 @@ def test_get_settings_returns_secret_state(monkeypatch, tmp_path) -> None:  # ty
     assert body["llm_timeout_seconds"] == 60
     assert body["llm_api_key"]["configured"] is False
     assert body["llm_api_key"]["editable"] is True
+
+
+def test_get_settings_prefers_process_env_over_stale_runtime_file(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    client = _build_client(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_PROVIDER", "custom_proxy")
+    monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
+    monkeypatch.setenv("LLM_BASE_URL", "https://gmncode.cn/v1")
+    monkeypatch.setenv("LLM_WIRE_API", "auto")
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "60")
+
+    response = client.get("/api/v1/settings")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["llm_provider"] == "custom_proxy"
+    assert body["llm_model"] == "gpt-5.4"
+    assert body["llm_base_url"] == "https://gmncode.cn/v1"
+    assert body["llm_wire_api"] == "auto"
 
 
 def test_get_settings_rejects_legacy_openai_compatible_provider(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]

@@ -2,17 +2,49 @@ import json
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, text
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.api.deps import get_current_user
 from app.api.v1.endpoints import vuln_library
 from app.db.base import Base
 from app.db.models.enums import UserRole
 from app.db.models.vuln_rule_index import VulnRuleIndex
-from app.db.session import SessionLocal, engine
 from app.main import create_app
 from app.rules.rule_store import RuleStore
-from app.services.vuln_library_service import VulnLibraryService
+from app.services.vuln_library_service import VulnLibrarySchemaNotReadyError, VulnLibraryService
+
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "JSON"
+
+
+@compiles(INET, "sqlite")
+def _compile_inet_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "TEXT"
+
+
+@compiles(CIDR, "sqlite")
+def _compile_cidr_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "TEXT"
+
+
+engine = create_engine(
+    "sqlite+pysqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+    class_=Session,
+)
 
 
 def _override_user(role: UserRole):
@@ -23,18 +55,10 @@ def _override_user(role: UserRole):
 
 
 def _reset_index_table() -> None:
+    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS has_active_check BOOLEAN NOT NULL DEFAULT false"))
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS active_detector VARCHAR(64)"))
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS active_trigger VARCHAR(32)"))
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS has_nse_match BOOLEAN NOT NULL DEFAULT false"))
-        conn.execute(text("ALTER TABLE vuln_rule_index ADD COLUMN IF NOT EXISTS nse_scripts JSONB NOT NULL DEFAULT '[]'::jsonb"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_rule_index_has_active_check ON vuln_rule_index (has_active_check)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_rule_index_active_detector ON vuln_rule_index (active_detector)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_rule_index_has_nse_match ON vuln_rule_index (has_nse_match)"))
     with SessionLocal() as db:
-        db.execute(delete(VulnRuleIndex))
+        db.query(VulnRuleIndex).delete()
         db.commit()
 
 
@@ -145,8 +169,52 @@ def test_vuln_library_status_returns_index_health(tmp_path) -> None:
 
     assert response.status_code == 200
     assert response.json()["rule_count"] == 1
+    assert response.json()["schema_ready"] is True
+    assert response.json()["schema_error"] is None
     assert response.json()["indexed_rule_count"] == 1
     assert response.json()["index_in_sync"] is True
+
+
+def test_vuln_library_intel_status_endpoint_returns_summary(tmp_path) -> None:
+    client, _ = _build_client(
+        tmp_path,
+        UserRole.ADMIN,
+        """rules:
+  - id: apache.httpd.lt_2_2_9
+    name: Apache legacy exposure
+    enabled: true
+    service: apache
+    severity: high
+    description: Apache version is older than 2.2.9
+    match:
+      version: <2.2.9
+    cve_ids:
+      - CVE-2007-6388
+""",
+    )
+
+    response = client.get("/api/v1/vuln-library/intel/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tracked_rule_cves"] == 1
+    assert body["synced_cves"] == 0
+    assert body["stale"] is True
+    assert body["updated_cves"] == 0
+
+
+def test_vuln_library_intel_sync_returns_409_when_schema_not_ready(tmp_path, monkeypatch) -> None:
+    client, service = _build_client(tmp_path, UserRole.ADMIN)
+
+    def _raise_schema_error():
+        raise VulnLibrarySchemaNotReadyError("数据库结构未升级，请先执行 alembic upgrade head")
+
+    monkeypatch.setattr(service, "sync_intel", _raise_schema_error)
+
+    response = client.post("/api/v1/vuln-library/intel/sync")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "数据库结构未升级，请先执行 alembic upgrade head"
 
 
 def test_vuln_library_export_supports_selected_ids_and_filters(tmp_path) -> None:
