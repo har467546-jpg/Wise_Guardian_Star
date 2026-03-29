@@ -171,11 +171,16 @@ class RemediationTaskRead(BaseModel):
     last_event_at: datetime | None = None
     execution_boundary: Literal["template_generated", "runner_dispatch", "dry_run_preview"] | None = None
     execution_mode: Literal["dry_run", "apply"] | None = None
+    execution_status: Literal["pending", "succeeded", "failed", "preview_only"] | None = None
+    business_status: Literal["pending_reverify", "verified_closed", "verified_partial", "verified_failed"] | None = None
     context: dict[str, Any] = Field(default_factory=dict)
     plan: dict[str, Any] = Field(default_factory=dict)
     execution: dict[str, Any] = Field(default_factory=dict)
     backups: dict[str, Any] = Field(default_factory=dict)
     reverify: dict[str, Any] = Field(default_factory=dict)
+    targeted_finding_outcomes: list[dict[str, Any]] = Field(default_factory=list)
+    reverify_task_id: str | None = None
+    reverify_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class RemediationTaskEvidenceItemRead(BaseModel):
@@ -311,7 +316,11 @@ class HostRemediationStageRead(BaseModel):
     global_blockers: list[RemediationBlockerRead] = Field(default_factory=list)
     related_finding_ids: list[str] = Field(default_factory=list)
     related_rule_ids: list[str] = Field(default_factory=list)
+    targeted_rule_ids: list[str] = Field(default_factory=list)
     related_services: list[str] = Field(default_factory=list)
+    business_status: Literal["pending_reverify", "verified_closed", "verified_partial", "verified_failed"] | None = None
+    closed_target_count: int = 0
+    open_target_count: int = 0
     steps: list[HostRemediationPlanStepRead] = Field(default_factory=list)
 
 

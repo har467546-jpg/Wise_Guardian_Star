@@ -141,11 +141,16 @@ export type RemediationTask = {
   last_event_at: string | null;
   execution_boundary: "template_generated" | "runner_dispatch" | "dry_run_preview" | null;
   execution_mode: "dry_run" | "apply" | null;
+  execution_status: "pending" | "succeeded" | "failed" | "preview_only" | null;
+  business_status: "pending_reverify" | "verified_closed" | "verified_partial" | "verified_failed" | null;
   context: Record<string, unknown>;
   plan: Record<string, unknown>;
   execution: Record<string, unknown>;
   backups: Record<string, unknown>;
   reverify: Record<string, unknown>;
+  targeted_finding_outcomes: Array<Record<string, unknown>>;
+  reverify_task_id: string | null;
+  reverify_summary: Record<string, unknown>;
 };
 
 export type RemediationTaskEvidenceItem = {
@@ -271,7 +276,11 @@ export type HostRemediationStage = {
   global_blockers: RemediationBlocker[];
   related_finding_ids: string[];
   related_rule_ids: string[];
+  targeted_rule_ids: string[];
   related_services: string[];
+  business_status: "pending_reverify" | "verified_closed" | "verified_partial" | "verified_failed" | null;
+  closed_target_count: number;
+  open_target_count: number;
   steps: HostRemediationPlanStep[];
 };
 

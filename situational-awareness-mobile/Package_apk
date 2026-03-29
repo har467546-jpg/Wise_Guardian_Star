@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UPDATE_SCRIPT="$ROOT_DIR/tools/update_ldplayer.sh"
+
+MODE="debug"
+SKIP_BUILD=0
+NO_LAUNCH=0
+ADB_BIN="${ADB_PATH:-}"
+DEVICE_ENDPOINT=""
+BACKEND_ENDPOINT=""
+
+usage() {
+  cat <<'EOF'
+用法:
+  ./Package_apk <雷电IP:端口> <后端IP:端口> [选项]
+
+示例:
+  ./Package_apk 192.168.130.1:5555 192.168.130.137:8000
+  ./Package_apk 192.168.130.1:5555 http://192.168.130.137:8000 --release
+
+说明:
+  - 第一个参数填写雷电模拟器的 ADB 地址，例如 192.168.130.1:5555
+  - 第二个参数填写后端地址，支持：
+      1. 纯 IP:端口，例如 192.168.130.137:8000
+      2. 完整 URL，例如 http://192.168.130.137:8000
+      3. 已带 /api/v1 的完整 URL
+
+选项:
+  --release     构建并安装 release APK
+  --skip-build  跳过构建，直接安装现有 APK
+  --no-launch   安装后不自动启动应用
+  --adb PATH    指定 adb 可执行文件
+  --help        显示帮助
+EOF
+}
+
+normalize_backend_api_url() {
+  local raw="$1"
+  local trimmed="${raw%/}"
+
+  if [[ -z "$trimmed" ]]; then
+    echo "后端地址不能为空" >&2
+    exit 1
+  fi
+
+  if [[ "$trimmed" =~ ^https?:// ]]; then
+    if [[ "$trimmed" =~ /api/v1$ ]]; then
+      printf '%s\n' "$trimmed"
+      return
+    fi
+    printf '%s/api/v1\n' "$trimmed"
+    return
+  fi
+
+  if [[ "$trimmed" == */api/v1 ]]; then
+    printf 'http://%s\n' "$trimmed"
+    return
+  fi
+
+  printf 'http://%s/api/v1\n' "$trimmed"
+}
+
+ensure_device_endpoint() {
+  local raw="$1"
+  if [[ ! "$raw" =~ :[0-9]+$ ]]; then
+    echo "雷电地址格式不正确，应为 IP:端口，例如 192.168.130.1:5555" >&2
+    exit 1
+  fi
+  printf '%s\n' "$raw"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --release)
+      MODE="release"
+      shift
+      ;;
+    --skip-build)
+      SKIP_BUILD=1
+      shift
+      ;;
+    --no-launch)
+      NO_LAUNCH=1
+      shift
+      ;;
+    --adb=*)
+      ADB_BIN="${1#*=}"
+      shift
+      ;;
+    --adb)
+      ADB_BIN="${2:-}"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "未知参数: $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      if [[ -z "$DEVICE_ENDPOINT" ]]; then
+        DEVICE_ENDPOINT="$1"
+      elif [[ -z "$BACKEND_ENDPOINT" ]]; then
+        BACKEND_ENDPOINT="$1"
+      else
+        echo "参数过多: $1" >&2
+        usage
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$DEVICE_ENDPOINT" || -z "$BACKEND_ENDPOINT" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ ! -f "$UPDATE_SCRIPT" ]]; then
+  echo "未找到更新脚本: $UPDATE_SCRIPT" >&2
+  exit 1
+fi
+
+DEVICE_ENDPOINT="$(ensure_device_endpoint "$DEVICE_ENDPOINT")"
+API_BASE_URL="$(normalize_backend_api_url "$BACKEND_ENDPOINT")"
+
+declare -a CONNECT_CMD
+if [[ -n "$ADB_BIN" ]]; then
+  CONNECT_CMD=("$ADB_BIN")
+else
+  CONNECT_CMD=(adb)
+fi
+
+echo "连接雷电设备: $DEVICE_ENDPOINT"
+"${CONNECT_CMD[@]}" connect "$DEVICE_ENDPOINT" >/dev/null || true
+
+declare -a UPDATE_CMD
+UPDATE_CMD=(
+  bash
+  "$UPDATE_SCRIPT"
+  --device "$DEVICE_ENDPOINT"
+  --api-base-url "$API_BASE_URL"
+)
+
+if [[ -n "$ADB_BIN" ]]; then
+  UPDATE_CMD+=(--adb "$ADB_BIN")
+fi
+if [[ "$MODE" == "release" ]]; then
+  UPDATE_CMD+=(--release)
+fi
+if [[ "$SKIP_BUILD" -eq 1 ]]; then
+  UPDATE_CMD+=(--skip-build)
+fi
+if [[ "$NO_LAUNCH" -eq 1 ]]; then
+  UPDATE_CMD+=(--no-launch)
+fi
+
+echo "开始执行: ${UPDATE_CMD[*]}"
+"${UPDATE_CMD[@]}"

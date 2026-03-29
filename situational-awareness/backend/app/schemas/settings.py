@@ -120,6 +120,7 @@ class PlatformSettingsRead(BaseModel):
     cors_allow_all: bool
     cors_allow_origins: str
     local_asset_ips: str
+    security_admin_cidrs: str = ""
     access_token_expire_minutes: int
 
 
@@ -165,6 +166,7 @@ class PlatformSettingsUpdate(BaseModel):
     cors_allow_all: bool
     cors_allow_origins: str
     local_asset_ips: str
+    security_admin_cidrs: str = ""
     access_token_expire_minutes: int = Field(ge=5, le=10080)
 
     @field_validator("discovery_liveness_ports", "discovery_service_ports")
@@ -177,7 +179,7 @@ class PlatformSettingsUpdate(BaseModel):
     def _normalize_optional_port_csv(cls, value: str) -> str:
         return _normalize_port_csv(value, allow_empty=True)
 
-    @field_validator("cors_allow_origins", "local_asset_ips")
+    @field_validator("cors_allow_origins", "local_asset_ips", "security_admin_cidrs")
     @classmethod
     def _normalize_csv(cls, value: str) -> str:
         return _normalize_csv_text(value, allow_empty=True)

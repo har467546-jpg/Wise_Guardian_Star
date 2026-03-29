@@ -54,6 +54,7 @@ export type PlatformSettings = {
   cors_allow_all: boolean;
   cors_allow_origins: string;
   local_asset_ips: string;
+  security_admin_cidrs: string;
   access_token_expire_minutes: number;
 };
 
@@ -96,6 +97,7 @@ export type PlatformSettingsInput = {
   cors_allow_all: boolean;
   cors_allow_origins: string;
   local_asset_ips: string;
+  security_admin_cidrs: string;
   access_token_expire_minutes: number;
 };
 

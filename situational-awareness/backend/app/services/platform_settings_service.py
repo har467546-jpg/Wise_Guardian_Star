@@ -98,7 +98,7 @@ SETTINGS_SECTIONS = [
     PlatformSettingsSectionRead(
         key="platform_security",
         title="平台与安全",
-        fields=["cors_allow_all", "cors_allow_origins", "local_asset_ips", "access_token_expire_minutes"],
+        fields=["cors_allow_all", "cors_allow_origins", "local_asset_ips", "security_admin_cidrs", "access_token_expire_minutes"],
     ),
 ]
 
@@ -139,6 +139,7 @@ FIELD_TO_ENV_KEY = {
     "cors_allow_all": "CORS_ALLOW_ALL",
     "cors_allow_origins": "CORS_ALLOW_ORIGINS",
     "local_asset_ips": "LOCAL_ASSET_IPS",
+    "security_admin_cidrs": "SECURITY_ADMIN_CIDRS",
     "access_token_expire_minutes": "ACCESS_TOKEN_EXPIRE_MINUTES",
 }
 
@@ -337,6 +338,7 @@ def get_platform_settings_read() -> PlatformSettingsRead:
         cors_allow_all=bool(settings.CORS_ALLOW_ALL),
         cors_allow_origins=str(settings.CORS_ALLOW_ORIGINS or ""),
         local_asset_ips=str(settings.LOCAL_ASSET_IPS or ""),
+        security_admin_cidrs=str(settings.SECURITY_ADMIN_CIDRS or ""),
         access_token_expire_minutes=int(settings.ACCESS_TOKEN_EXPIRE_MINUTES),
     )
 

@@ -230,6 +230,7 @@ class Settings(BaseSettings):
     CORS_ALLOW_ALL: bool = False
     CORS_ALLOW_ORIGINS: str = DEFAULT_PRIVATE_NETWORK_CORS_ORIGINS
     LOCAL_ASSET_IPS: str = "127.0.0.1,::1"
+    SECURITY_ADMIN_CIDRS: str = ""
 
     ENCRYPTION_KEY: str = ""
     SETTINGS_HELPER_URL: str = "http://settings-helper:8091/internal/apply"

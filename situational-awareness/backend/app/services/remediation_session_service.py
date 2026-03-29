@@ -31,6 +31,13 @@ from app.schemas.remediation import (
     RemediationSessionMessageCreateRequest,
     RemediationSessionRead,
 )
+from app.services.remediation_business_service import (
+    BUSINESS_STATUS_PENDING_REVERIFY,
+    BUSINESS_STATUS_VERIFIED_CLOSED,
+    BUSINESS_STATUS_VERIFIED_FAILED,
+    BUSINESS_STATUS_VERIFIED_PARTIAL,
+    EXECUTION_STATUS_PENDING,
+)
 from app.services.remediation_service import (
     _compute_blocked_reasons,
     build_asset_plans,
@@ -299,9 +306,15 @@ def approve_remediation_session(
             "execution_mode": normalized_execution_mode,
             "change_ticket": normalized_change_ticket,
             "maintenance_window_id": normalized_maintenance_window_id,
+            "execution_status": EXECUTION_STATUS_PENDING if normalized_execution_mode == "apply" else "preview_only",
         },
+        "execution_status": EXECUTION_STATUS_PENDING if normalized_execution_mode == "apply" else "preview_only",
+        "business_status": None,
         "backups": {},
         "reverify": {},
+        "reverify_task_id": None,
+        "reverify_summary": {},
+        "targeted_finding_outcomes": [],
     }
     if normalized_execution_mode == "dry_run":
         result_json = build_remediation_preview_result(
@@ -819,6 +832,7 @@ def _reconcile_session_task_progress(db: Session, session: RemediationSession) -
     summary_state = _summary_state(session)
     task_context = task.result_json.get("context") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("context"), dict) else {}
     task_execution = task.result_json.get("execution") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("execution"), dict) else {}
+    task_business_status = str((task.result_json or {}).get("business_status") or task_execution.get("business_status") or "").strip().lower()
     stage_code = str(task_context.get("stage_code") or "").strip()
     running_stage_code = str(summary_state.get("running_stage_code") or "").strip()
     execution_mode = str(task_execution.get("execution_mode") or "").strip().lower()
@@ -828,13 +842,17 @@ def _reconcile_session_task_progress(db: Session, session: RemediationSession) -
         summary_state["running_stage_code"] = stage_code
         changed = True
     elif task.status == TaskExecutionStatus.SUCCESS:
-        if execution_mode != "dry_run":
+        if execution_mode != "dry_run" and task_business_status == BUSINESS_STATUS_VERIFIED_CLOSED:
             completed_stage_codes = _completed_stage_codes(session)
             if stage_code and stage_code not in completed_stage_codes:
                 completed_stage_codes.append(stage_code)
                 summary_state["completed_stage_codes"] = completed_stage_codes
                 changed = True
-        if running_stage_code and (not stage_code or running_stage_code == stage_code):
+        if task_business_status == BUSINESS_STATUS_PENDING_REVERIFY:
+            if stage_code and running_stage_code != stage_code:
+                summary_state["running_stage_code"] = stage_code
+                changed = True
+        elif running_stage_code and (not stage_code or running_stage_code == stage_code):
             summary_state["running_stage_code"] = None
             changed = True
     elif task.status in {TaskExecutionStatus.FAILURE, TaskExecutionStatus.CANCELED}:
@@ -889,6 +907,18 @@ def _completed_stage_codes(session: RemediationSession) -> list[str]:
 def _running_stage_code(session: RemediationSession) -> str | None:
     value = str(_summary_state(session).get("running_stage_code") or "").strip()
     return value or None
+
+
+def _stage_business_outcomes(session: RemediationSession) -> dict[str, dict[str, Any]]:
+    summary_state = _summary_state(session)
+    raw = summary_state.get("stage_business_outcomes")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key).strip(): dict(value)
+        for key, value in raw.items()
+        if str(key).strip() and isinstance(value, dict)
+    }
 
 
 def _stage_progress_signature(session: RemediationSession) -> str:
@@ -952,6 +982,7 @@ def _synchronize_session_runtime_state_with_plan(
     if task is not None:
         task_context = task.result_json.get("context") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("context"), dict) else {}
         task_execution = task.result_json.get("execution") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("execution"), dict) else {}
+        task_business_status = str((task.result_json or {}).get("business_status") or task_execution.get("business_status") or "").strip().lower()
         running_stage_name = str(task_context.get("stage_name") or "").strip()
         task_execution_mode = str(task_execution.get("execution_mode") or "").strip().lower()
         if task.status in RUNNING_TASK_STATUSES:
@@ -967,9 +998,21 @@ def _synchronize_session_runtime_state_with_plan(
         elif task.status == TaskExecutionStatus.SUCCESS:
             if task_execution_mode == "dry_run":
                 content = f"阶段“{running_stage_name}”预演已生成，可继续审核命令、证据和维护窗口要求。" if running_stage_name else "修复预演已生成。"
-            elif plan.plan_mode == "completed":
-                next_status = "completed"
-                content = "Host Runner 已完成整机修复计划。"
+            elif task_business_status == BUSINESS_STATUS_PENDING_REVERIFY:
+                next_status = "running"
+                content = f"阶段“{running_stage_name}”执行完成，正在复验目标风险。" if running_stage_name else "当前阶段执行完成，正在复验目标风险。"
+            elif task_business_status == BUSINESS_STATUS_VERIFIED_CLOSED:
+                if plan.plan_mode == "completed":
+                    next_status = "completed"
+                    content = "目标风险已复验关闭，整机修复计划已完成。"
+                else:
+                    content = f"阶段“{running_stage_name}”目标风险已复验关闭，工作台已更新到下一阶段。" if running_stage_name else "当前阶段目标风险已复验关闭。"
+            elif task_business_status == BUSINESS_STATUS_VERIFIED_PARTIAL:
+                next_status = "ready" if plan.execution_ready else next_status
+                content = f"阶段“{running_stage_name}”已执行，但目标风险仍未关闭。" if running_stage_name else "当前阶段已执行，但目标风险仍未关闭。"
+            elif task_business_status == BUSINESS_STATUS_VERIFIED_FAILED:
+                next_status = "failed"
+                content = f"阶段“{running_stage_name}”执行后复验失败，请查看任务输出。" if running_stage_name else "当前阶段执行后复验失败，请查看任务输出。"
             else:
                 content = f"阶段“{running_stage_name}”执行完成，工作台已更新到下一阶段。" if running_stage_name else "当前阶段执行完成，工作台已更新。"
             _append_session_audit_message(
@@ -1065,6 +1108,7 @@ def _build_host_plan(db: Session, asset_detail: RemediationAssetDetailRead, sess
     step_blockers: list[RemediationBlockerRead] = []
     completed_stage_codes = set(_completed_stage_codes(session)) if session is not None else set()
     running_stage_code = _running_stage_code(session) if session is not None else None
+    stage_business_outcomes = _stage_business_outcomes(session) if session is not None else {}
     findings_covered_count = 0
 
     for finding in findings:
@@ -1246,7 +1290,14 @@ def _build_host_plan(db: Session, asset_detail: RemediationAssetDetailRead, sess
                 global_blockers=stage_global_blockers,
                 related_finding_ids=_merge_unique_strings([], row["related_finding_ids"]),
                 related_rule_ids=_merge_unique_strings([], row["related_rule_ids"]),
+                targeted_rule_ids=_merge_unique_strings(
+                    [],
+                    stage_business_outcomes.get(stage_code, {}).get("targeted_rule_ids") or row["related_rule_ids"],
+                ),
                 related_services=_merge_unique_strings([], row["related_services"]),
+                business_status=str(stage_business_outcomes.get(stage_code, {}).get("business_status") or "").strip() or None,
+                closed_target_count=int(stage_business_outcomes.get(stage_code, {}).get("closed_target_count") or 0),
+                open_target_count=int(stage_business_outcomes.get(stage_code, {}).get("open_target_count") or 0),
                 steps=row["steps"],
             )
         )

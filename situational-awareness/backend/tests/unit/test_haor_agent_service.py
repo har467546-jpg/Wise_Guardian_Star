@@ -21,6 +21,14 @@ class _FakeUnitDB:
         return None
 
 
+class _FakeLookupDB:
+    def scalar(self, *_args, **_kwargs):
+        return None
+
+    def scalars(self, *_args, **_kwargs):
+        return SimpleNamespace(unique=lambda: SimpleNamespace(all=lambda: []))
+
+
 class _FakeRecoverDB:
     def __init__(self) -> None:
         self.committed = False
@@ -713,6 +721,7 @@ def test_resolve_working_context_keeps_soft_focus_when_page_changes_without_refe
     )
 
     working_context = haor_agent_service._resolve_working_context_for_message(
+        db=_FakeLookupDB(),
         session=session,
         content="继续分析",
         page_context={"pathname": "/assets/asset-2", "query": {}, "asset_id": "asset-2", "finding_id": None, "task_id": None},
@@ -734,6 +743,7 @@ def test_resolve_working_context_switches_focus_when_message_mentions_new_target
     )
 
     working_context = haor_agent_service._resolve_working_context_for_message(
+        db=_FakeLookupDB(),
         session=session,
         content="帮我处理资产 asset-2",
         page_context={"pathname": "/assets/asset-2", "query": {}, "asset_id": "asset-2", "finding_id": None, "task_id": None},
@@ -756,6 +766,7 @@ def test_resolve_working_context_prefers_current_page_reference_over_previous_fo
     )
 
     working_context = haor_agent_service._resolve_working_context_for_message(
+        db=_FakeLookupDB(),
         session=session,
         content="继续看这个资产",
         page_context={"pathname": "/assets/asset-2", "query": {}, "asset_id": "asset-2", "finding_id": None, "task_id": None},
@@ -769,6 +780,7 @@ def test_resolve_working_context_restores_dialog_snapshot_for_affirm_followup() 
     session = SimpleNamespace(working_context_json={})
 
     working_context = haor_agent_service._resolve_working_context_for_message(
+        db=_FakeLookupDB(),
         session=session,
         content="确认",
         page_context={"pathname": "/", "query": {}, "asset_id": None, "finding_id": None, "task_id": None},
@@ -791,6 +803,7 @@ def test_resolve_working_context_uses_browser_semantic_primary_entity_for_curren
     session = SimpleNamespace(working_context_json={})
 
     working_context = haor_agent_service._resolve_working_context_for_message(
+        db=_FakeLookupDB(),
         session=session,
         content="继续看这个任务",
         page_context={"pathname": "/tasks", "query": {}, "asset_id": None, "finding_id": None, "task_id": None},
@@ -812,6 +825,7 @@ def test_resolve_working_context_ignores_dashboard_platform_primary_entity() -> 
     session = SimpleNamespace(working_context_json={})
 
     working_context = haor_agent_service._resolve_working_context_for_message(
+        db=_FakeLookupDB(),
         session=session,
         content="帮我修复这个",
         page_context={"pathname": "/", "query": {}, "asset_id": None, "finding_id": None, "task_id": None},
@@ -1167,6 +1181,41 @@ def test_run_agent_loop_persists_promoted_focus_before_model_error(monkeypatch) 
     assert session.working_context_json["asset_id"] == "asset-1"
 
 
+def test_run_agent_loop_prefers_latest_user_message_over_stale_last_user_intent(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="assistant", message_type="action_update", content="请继续"),
+            SimpleNamespace(role="user", message_type="text", content="继续验证资产 asset-1 的风险"),
+        ],
+        working_context_json={"asset_id": "asset-1"},
+    )
+    user = SimpleNamespace(role="admin")
+
+    def _unexpected_model_call(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("playbook should resolve the latest user intent before model fallback")
+
+    monkeypatch.setattr(haor_agent_service, "_run_model_once", _unexpected_model_call)
+
+    decision, tool_traces = haor_agent_service._run_agent_loop(
+        db=SimpleNamespace(),
+        session=session,
+        user=user,
+        page_context={"pathname": "/", "query": {}, "asset_id": "asset-1"},
+        browser_context={"pathname": "/", "query": {}, "asset_id": "asset-1"},
+        browser_runtime={"last_user_intent": "自动修复"},
+        working_context={"asset_id": "asset-1"},
+        dialog_state={},
+        followup_hint={},
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    assert tool_traces == []
+    assert decision.auto_execute_actions[0].action_type == "verify_asset_risks"
+    assert decision.auto_execute_actions[0].params["asset_id"] == "asset-1"
+    assert decision.proposed_write_actions == []
+
+
 def test_build_action_first_fallback_decision_prefers_semantic_ui_action() -> None:
     user = SimpleNamespace(role="admin")
 
@@ -1422,6 +1471,177 @@ def test_build_action_first_fallback_decision_resumes_from_recent_resume_hint() 
     assert decision.read_tool_calls[0].arguments["asset_id"] == "asset-1"
 
 
+def test_build_resume_hint_read_decision_prefers_review_followup_phrase() -> None:
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_remediation_review",
+                        "working_context": {"asset_id": "asset-1", "task_id": "task-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "get_remediation_asset", "arguments": {"asset_id": "asset-1"}},
+                            {"tool_name": "get_task_detail", "arguments": {"task_id": "task-1"}},
+                        ],
+                        "suggested_reply_label": "复盘修复结果",
+                    }
+                }
+            )
+        ]
+    )
+
+    decision = haor_agent_service._build_resume_hint_read_decision(
+        content="继续，复盘这次自动修复结果",
+        session=session,
+        working_context={},
+        tool_traces=[],
+        allow_extended_resume=True,
+    )
+
+    assert decision is not None
+    assert decision.stop_reason == "resume_hint_read"
+    assert [item.tool_name for item in decision.read_tool_calls] == ["get_remediation_asset", "get_task_detail"]
+
+
+def test_should_skip_preflight_clarification_for_scan_resume_followup() -> None:
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_scan_analysis",
+                        "working_context": {"task_id": "task-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "get_task_detail", "arguments": {"task_id": "task-1"}},
+                        ],
+                        "suggested_reply_label": "分析扫描结果",
+                    }
+                }
+            )
+        ]
+    )
+
+    assert (
+        haor_agent_service._should_skip_preflight_clarification(
+            "继续分析扫描结果",
+            session=session,
+        )
+        is True
+    )
+
+
+def test_resolve_effective_working_context_reuses_resume_hint_for_extended_scan_followup() -> None:
+    session = SimpleNamespace(
+        working_context_json={},
+        messages=[
+            SimpleNamespace(
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_scan_analysis",
+                        "working_context": {"task_id": "task-1", "source": "task_followup"},
+                        "preferred_read_tools": [
+                            {"tool_name": "get_task_detail", "arguments": {"task_id": "task-1"}},
+                        ],
+                        "suggested_reply_label": "分析扫描结果",
+                    }
+                }
+            )
+        ],
+    )
+
+    resolved = haor_agent_service._resolve_effective_working_context(
+        db=_FakeLookupDB(),
+        session=session,
+        content="继续分析扫描结果",
+        page_context={"pathname": "/discovery", "query": {}},
+        browser_context={"pathname": "/discovery", "query": {}},
+        dialog_state={},
+        followup_hint={"reply_kind": "unknown", "raw_user_reply": "继续分析扫描结果"},
+    )
+
+    assert resolved["task_id"] == "task-1"
+    assert resolved["primary_target"]["task_id"] == "task-1"
+
+
+def test_build_resume_hint_summary_decision_summarizes_scan_assets() -> None:
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_scan_analysis",
+                        "working_context": {"task_id": "task-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "list_assets", "arguments": {"keyword": "192.168.130.0/24", "limit": 5}},
+                            {"tool_name": "get_task_detail", "arguments": {"task_id": "task-1"}},
+                        ],
+                        "suggested_reply_label": "分析扫描结果",
+                    }
+                }
+            )
+        ]
+    )
+
+    decision = haor_agent_service._build_resume_hint_summary_decision(
+        session=session,
+        tool_traces=[
+            {
+                "tool_name": "list_assets",
+                "arguments": {"keyword": "192.168.130.0/24", "limit": 5},
+                "ok": True,
+                "result": {
+                    "items": [
+                        {"asset_id": "asset-1", "ip": "192.168.130.138", "hostname": "target-1", "os_name": "Ubuntu"},
+                        {"asset_id": "asset-2", "ip": "192.168.130.139", "hostname": "target-2", "os_name": "Debian"},
+                    ],
+                    "total": 2,
+                },
+            },
+            {
+                "tool_name": "get_task_detail",
+                "arguments": {"task_id": "task-1"},
+                "ok": True,
+                "result": {"task_id": "task-1", "status": "success", "message": "扫描流水线完成"},
+            },
+        ],
+    )
+
+    assert decision is not None
+    assert decision.stop_reason == "resume_hint_scan_summary"
+    assert decision.conversation_state == "answer"
+    assert "本次扫描共关联到 2 台资产" in decision.reply_markdown
+    assert "192.168.130.138 / target-1 / Ubuntu" in decision.reply_markdown
+
+
+def test_build_resume_hint_read_decision_does_not_hijack_maintenance_window_followup() -> None:
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_remediation_review",
+                        "working_context": {"asset_id": "asset-1", "task_id": "task-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "get_remediation_asset", "arguments": {"asset_id": "asset-1"}},
+                        ],
+                        "suggested_reply_label": "复盘修复结果",
+                    }
+                }
+            )
+        ]
+    )
+
+    decision = haor_agent_service._build_resume_hint_read_decision(
+        content="maintenance_window_id 是 mw-e2e-20260327，请继续自动修复",
+        session=session,
+        working_context={},
+        tool_traces=[],
+        allow_extended_resume=True,
+    )
+
+    assert decision is None
+
+
 def test_build_action_first_fallback_decision_clarifies_short_resume_without_context() -> None:
     user = SimpleNamespace(role="admin")
 
@@ -1442,6 +1662,72 @@ def test_build_action_first_fallback_decision_clarifies_short_resume_without_con
     assert decision is not None
     assert decision.conversation_state == "clarifying"
     assert "稳定承接上一轮" in decision.reply_markdown
+
+
+def test_run_agent_loop_prefers_resume_hint_review_before_playbook(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="assistant",
+                message_type="task_update",
+                content="修复任务已完成",
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_remediation_review",
+                        "working_context": {"asset_id": "asset-1", "task_id": "task-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "get_remediation_asset", "arguments": {"asset_id": "asset-1"}},
+                        ],
+                        "suggested_reply_label": "复盘修复结果",
+                    }
+                },
+            ),
+            SimpleNamespace(role="user", message_type="text", content="继续，复盘这次自动修复结果"),
+        ],
+        working_context_json={"asset_id": "asset-1"},
+    )
+    user = SimpleNamespace(role="admin")
+    read_calls: list[tuple[str, dict[str, object]]] = []
+    model_flags: list[tuple[bool, bool]] = []
+
+    monkeypatch.setattr(
+        haor_agent_service,
+        "match_registered_playbook",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("resume priority should bypass remediation playbook")),
+    )
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_execute_read_tool",
+        lambda db, *, tool_name, arguments: read_calls.append((tool_name, arguments)) or {"asset_id": "asset-1", "status": "ready"},
+    )
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_run_model_once",
+        lambda **kwargs: model_flags.append((kwargs["allow_write_plans"], kwargs["allow_auto_execute_actions"]))
+        or haor_agent_service._AgentModelDecision(
+            reply_markdown="我已读取修复结果。",
+            conversation_state="answer",
+        ),
+    )
+
+    decision, tool_traces = haor_agent_service._run_agent_loop(
+        _FakeUnitDB(),
+        session=session,
+        user=user,
+        page_context={"pathname": "/assets/asset-1", "asset_id": "asset-1", "query": {}},
+        browser_context={"pathname": "/assets/asset-1", "asset_id": "asset-1", "query": {}, "semantic_page_context": {"page_kind": "generic"}},
+        browser_runtime={},
+        working_context={"asset_id": "asset-1"},
+        dialog_state={},
+        followup_hint={},
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    assert decision.reply_markdown == "我已读取修复结果。"
+    assert read_calls == [("get_remediation_asset", {"asset_id": "asset-1"})]
+    assert tool_traces[0]["tool_name"] == "get_remediation_asset"
+    assert model_flags == [(False, False)]
 
 
 def test_reconcile_running_session_state_restores_active_after_canceled_task(monkeypatch) -> None:
@@ -1606,12 +1892,33 @@ def test_normalize_result_payload_blockers_recovers_ssh_code_from_unknown_blocke
         {
             "code": "missing_ssh_credential",
             "message": "当前资产未配置 SSH 管理员凭据",
+            "blocker_category": "ssh",
             "scope": "global",
             "blocking": "hard",
             "stage_code": None,
             "step_id": None,
         }
     ]
+
+
+def test_build_remediation_guidance_payload_prefers_maintenance_window_input_for_policy_blocker() -> None:
+    payload = haor_agent_service._build_remediation_guidance_payload(
+        asset_id="asset-1",
+        blockers=[
+            {
+                "code": "maintenance_window_required",
+                "message": "当前阶段包含高风险步骤，请先填写 maintenance_window_id 后再正式执行",
+                "blocker_category": "policy",
+            }
+        ],
+    )
+
+    assert payload["blocker_categories"] == ["policy"]
+    assert payload["recommended_action"]["kind"] == "open_maintenance_window_input"
+    assert payload["recommended_action"]["label"] == "填写维护窗口并继续自动修复"
+    assert payload["alternative_action"]["kind"] == "navigate"
+    assert payload["alternative_action"]["pathname"] == "/remediation/asset-1"
+    assert payload["post_verify_action"] == "maintenance_window_required"
 
 
 def test_handle_secure_input_step_reports_remaining_remediation_blockers(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1686,6 +1993,118 @@ def test_handle_secure_input_step_reports_remaining_remediation_blockers(monkeyp
             "last_user_intent": "配置 SSH 凭据",
             "pending_secure_input": {
                 "kind": "ssh_credential",
+                "mode": "same_credential_batch",
+                "asset_id": "asset-1",
+                "asset_ids": ["asset-1", "asset-2"],
+                "asset_labels": ["资产 asset-1", "资产 asset-2"],
+                "resume_goal_id": "goal-1",
+                "resume_action": {
+                    "action_type": "create_or_resume_remediation_session",
+                    "title": "继续修复会话 remediation-session-1",
+                    "reason": "SSH 凭据验证成功后继续修复",
+                    "params": {"asset_id": "asset-1", "submit_if_ready": True},
+                },
+                "auto_verify": True,
+                "auto_resume": True,
+            },
+        },
+        ui_action_results=[
+            {
+                "detail_json": {
+                    "kind": "ssh_credential_batch",
+                    "results": [
+                        {
+                            "asset_id": "asset-1",
+                            "saved": True,
+                            "verified": True,
+                        },
+                        {
+                            "asset_id": "asset-2",
+                            "saved": True,
+                            "verified": True,
+                        },
+                    ],
+                }
+            }
+        ],
+        platform_url="http://localhost:3000",
+    )
+
+    assert result is not None
+    message_objects = [item for item in db.added if getattr(item, "content", None)]
+    assert message_objects
+    content = message_objects[-1].content
+    assert "SSH 凭据批量处理完成" in content
+    assert "当前主机尚未安装 Host Runner" in content
+    assert "原修复目标仍未继续执行" in content
+    assert session.status == "active"
+    assert session.agent_state_json["execution"]["stage"] == "blocked"
+    assert synced_goal["status_override"] == "blocked"
+    assert "Host Runner" in str(synced_goal["blocked_reason"])
+    goal_blockers = synced_goal["goal_blockers"]
+    assert isinstance(goal_blockers, list)
+    assert goal_blockers[0]["code"] == "runner_not_installed"
+
+
+def test_handle_secure_input_step_refreshes_host_facts_before_resuming_remediation(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(
+        id="session-1",
+        agent_id="haor",
+        status="active",
+        route_context_json={"pathname": "/assets", "query": {}, "asset_id": "asset-1"},
+        working_context_json={"asset_id": "asset-1"},
+        dialog_state_json={},
+        pending_plan_json={},
+        browser_runtime_json={},
+        agent_state_json={},
+        current_goal=None,
+        current_goal_id="goal-1",
+        last_task_id="task-orchestrate-1",
+        messages=[],
+        created_at=datetime.now(UTC),
+        updated_at=None,
+    )
+    db = _FakeMessageDB(session)
+    synced_goal: dict[str, object] = {}
+    refresh_calls: list[str] = []
+    followup_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_execute_auto_actions",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should queue collection refresh before resuming remediation")),
+    )
+    monkeypatch.setattr(haor_agent_service, "resume_agent_goal_binding", lambda *args, **kwargs: None)
+    monkeypatch.setattr(haor_agent_service, "_emit_session_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_queue_asset_collection_refresh",
+        lambda _db, *, asset_id: refresh_calls.append(asset_id) or "task-collect-1",
+    )
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_enqueue_secure_refresh_resume_followup",
+        lambda **kwargs: followup_calls.append(kwargs),
+    )
+
+    def _fake_sync_goal(_db, _session, **kwargs):  # type: ignore[no-untyped-def]
+        synced_goal.update(kwargs)
+        return None
+
+    monkeypatch.setattr(haor_agent_service, "_sync_current_goal_state", _fake_sync_goal)
+
+    result = haor_agent_service._handle_secure_input_step(
+        db,
+        session=session,
+        user=SimpleNamespace(id="user-1"),
+        browser_context={"pathname": "/assets", "query": {}, "asset_id": "asset-1"},
+        current_browser_runtime={
+            "phase": "awaiting_secure_input",
+            "current_objective": "为资产 asset-1 配置 SSH 凭据",
+            "objective_kind": "configure_ssh_credential",
+            "last_user_intent": "配置 SSH 凭据",
+            "pending_secure_input": {
+                "kind": "ssh_credential",
                 "mode": "single_asset",
                 "asset_id": "asset-1",
                 "asset_ids": ["asset-1"],
@@ -1717,16 +2136,29 @@ def test_handle_secure_input_step_reports_remaining_remediation_blockers(monkeyp
     )
 
     assert result is not None
+    assert refresh_calls == ["asset-1"]
+    assert followup_calls == [
+        {
+            "session_id": "session-1",
+            "refresh_task_id": "task-collect-1",
+            "action": {
+                "action_type": "create_or_resume_remediation_session",
+                "title": "继续修复会话 remediation-session-1",
+                "reason": "SSH 凭据验证成功后继续修复",
+                "params": {"asset_id": "asset-1", "submit_if_ready": True},
+            },
+            "asset_id": "asset-1",
+        }
+    ]
+    assert session.status == "running"
+    assert session.agent_state_json["execution"]["stage"] == "watching_task"
+    assert session.agent_state_json["watch"]["primary_task_id"] == "task-collect-1"
     message_objects = [item for item in db.added if getattr(item, "content", None)]
     assert message_objects
     content = message_objects[-1].content
-    assert "SSH 凭据已保存并验证成功，但修复暂未继续执行" in content
-    assert "当前主机尚未安装 Host Runner" in content
-    assert "我已自动续接原目标" not in content
-    assert session.status == "active"
-    assert session.agent_state_json["execution"]["stage"] == "blocked"
-    assert synced_goal["status_override"] == "blocked"
-    assert "Host Runner" in str(synced_goal["blocked_reason"])
-    goal_blockers = synced_goal["goal_blockers"]
-    assert isinstance(goal_blockers, list)
-    assert goal_blockers[0]["code"] == "runner_not_installed"
+    assert "正在通过 SSH 刷新主机信息；刷新完成后会重新评估修复条件" in content
+    assert session.agent_state_json["execution"]["waiting_for"] == "等待主机事实刷新完成"
+    payload_json = message_objects[-1].payload_json
+    assert payload_json["secure_input_result"]["post_verify_action"] == "refresh_and_resume"
+    assert payload_json["secure_input_result"]["refresh_task_id"] == "task-collect-1"
+    assert synced_goal["status_override"] == "active"

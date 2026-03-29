@@ -253,6 +253,245 @@ def test_run_agent_auto_followup_task_formats_remediation_completion(monkeypatch
     assert any(item["tool_name"] == "get_remediation_session" for item in preferred_read_tools)
 
 
+def test_run_agent_secure_post_verify_resume_task_reports_collection_refresh_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(id="session-1", user_id="user-1", messages=[])
+    db = _FakeDB(session)
+    blocked_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        agent_tasks,
+        "wait_for_child_task",
+        lambda task_id, interval_seconds=0.5: {
+            "task_id": task_id,
+            "status": TaskExecutionStatus.FAILURE.value,
+            "message": "SSH 深度检查失败",
+            "result_json": {},
+            "error_json": {"error": "timeout"},
+        },
+    )
+    monkeypatch.setattr(agent_tasks, "SessionLocal", _SessionLocalContext(db))
+    monkeypatch.setattr(
+        agent_tasks,
+        "append_blocked_action_result_message",
+        lambda *args, **kwargs: blocked_calls.append(kwargs),
+    )
+
+    result = agent_tasks.run_agent_secure_post_verify_resume_task.run(
+        "session-1",
+        "task-collect-1",
+        {
+            "action_type": "create_or_resume_remediation_session",
+            "params": {"asset_id": "asset-1", "submit_if_ready": True},
+        },
+        "asset-1",
+    )
+
+    assert result == "task-collect-1"
+    assert db.committed is True
+    assert blocked_calls
+    assert blocked_calls[0]["task_id"] == "task-collect-1"
+    assert "主机事实刷新失败" in str(blocked_calls[0]["content"])
+    assert blocked_calls[0]["message_payload_patch"]["post_verify_action"] == "refresh_failed"
+
+
+def test_run_agent_secure_post_verify_resume_task_continues_remediation_after_refresh(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(id="session-1", user_id="user-1", messages=[])
+    db = _FakeDB(session)
+    appended_messages: list[dict[str, object]] = []
+    followup_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        agent_tasks,
+        "wait_for_child_task",
+        lambda task_id, interval_seconds=0.5: {
+            "task_id": task_id,
+            "status": TaskExecutionStatus.SUCCESS.value,
+            "message": "SSH 深度检查完成",
+            "result_json": {},
+            "error_json": {},
+        },
+    )
+    monkeypatch.setattr(agent_tasks, "SessionLocal", _SessionLocalContext(db))
+    monkeypatch.setattr(
+        agent_tasks,
+        "execute_approved_action",
+        lambda *args, **kwargs: SimpleNamespace(
+            status="queued",
+            summary="已提交自动修复任务 remediation-task-1",
+            payload={"asset_id": "asset-1", "session_id": "remediation-session-1"},
+            child_task_id="remediation-task-1",
+        ),
+    )
+    monkeypatch.setattr(
+        agent_tasks,
+        "append_agent_task_message",
+        lambda *args, **kwargs: appended_messages.append(kwargs),
+    )
+    monkeypatch.setattr(
+        agent_tasks,
+        "enqueue_auto_action_followup_task",
+        lambda **kwargs: followup_calls.append(kwargs),
+    )
+
+    result = agent_tasks.run_agent_secure_post_verify_resume_task.run(
+        "session-1",
+        "task-collect-1",
+        {
+            "action_type": "create_or_resume_remediation_session",
+            "params": {"asset_id": "asset-1", "submit_if_ready": True},
+        },
+        "asset-1",
+    )
+
+    assert result == "remediation-task-1"
+    assert db.committed is True
+    assert len(appended_messages) == 2
+    assert appended_messages[0]["watching"] is False
+    assert appended_messages[0]["message_type"] == "action_update"
+    assert "主机信息已刷新，正在重新评估修复条件" in str(appended_messages[0]["content"])
+    assert "这一步可能比采集更久" in str(appended_messages[0]["content"])
+    first_payload_json = appended_messages[0]["payload_json"]
+    assert first_payload_json["task_id"] == "task-collect-1"
+    assert first_payload_json["post_verify_action"] == "refresh_reassessing"
+    assert appended_messages[1]["watching"] is True
+    assert appended_messages[1]["message_type"] == "action_update"
+    assert "我已重新评估修复条件，并继续自动修复" in str(appended_messages[1]["content"])
+    payload_json = appended_messages[1]["payload_json"]
+    assert payload_json["task_id"] == "remediation-task-1"
+    assert payload_json["post_verify_action"] == "refresh_and_resume"
+    assert followup_calls == [
+        {
+            "session_id": "session-1",
+            "child_task_id": "remediation-task-1",
+            "action": {
+                "action_type": "create_or_resume_remediation_session",
+                "params": {"asset_id": "asset-1", "submit_if_ready": True},
+                "payload": {"asset_id": "asset-1", "session_id": "remediation-session-1"},
+            },
+        }
+    ]
+    assert session.status == "running"
+    assert session.agent_state_json["execution"]["step_label"] == "主机事实已刷新，正在重新评估修复条件"
+    assert session.agent_state_json["execution"]["waiting_for"] == "等待重新评估自动修复条件"
+
+
+def test_run_agent_secure_post_verify_resume_task_humanizes_upstream_reassessment_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(id="session-1", user_id="user-1", messages=[])
+    db = _FakeDB(session)
+    appended_messages: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        agent_tasks,
+        "wait_for_child_task",
+        lambda task_id, interval_seconds=0.5: {
+            "task_id": task_id,
+            "status": TaskExecutionStatus.SUCCESS.value,
+            "message": "SSH 深度检查完成",
+            "result_json": {},
+            "error_json": {},
+        },
+    )
+    monkeypatch.setattr(agent_tasks, "SessionLocal", _SessionLocalContext(db))
+
+    def _raise_upstream_failure(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("AI 模型服务异常：502 Bad Gateway")
+
+    monkeypatch.setattr(agent_tasks, "execute_approved_action", _raise_upstream_failure)
+    monkeypatch.setattr(
+        agent_tasks,
+        "append_agent_task_message",
+        lambda *args, **kwargs: appended_messages.append(kwargs),
+    )
+
+    result = agent_tasks.run_agent_secure_post_verify_resume_task.run(
+        "session-1",
+        "task-collect-1",
+        {
+            "action_type": "create_or_resume_remediation_session",
+            "params": {"asset_id": "asset-1", "submit_if_ready": True},
+        },
+        "asset-1",
+    )
+
+    assert result == "task-collect-1"
+    assert db.committed is True
+    assert len(appended_messages) == 2
+    assert appended_messages[0]["payload_json"]["post_verify_action"] == "refresh_reassessing"
+    assert appended_messages[1]["message_type"] == "error"
+    assert "上游模型暂时不可用" in str(appended_messages[1]["content"])
+    assert appended_messages[1]["payload_json"]["post_verify_action"] == "refresh_resume_failed"
+
+
+def test_run_agent_secure_post_verify_resume_task_recommends_runner_or_interactive_fallback(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(id="session-1", user_id="user-1", messages=[])
+    db = _FakeDB(session)
+    blocked_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        agent_tasks,
+        "wait_for_child_task",
+        lambda task_id, interval_seconds=0.5: {
+            "task_id": task_id,
+            "status": TaskExecutionStatus.SUCCESS.value,
+            "message": "SSH 深度检查完成",
+            "result_json": {},
+            "error_json": {},
+        },
+    )
+    monkeypatch.setattr(agent_tasks, "SessionLocal", _SessionLocalContext(db))
+    monkeypatch.setattr(
+        agent_tasks,
+        "execute_approved_action",
+        lambda *args, **kwargs: SimpleNamespace(
+            status="success",
+            summary="当前主机尚未安装 Host Runner",
+            payload={
+                "asset_id": "asset-1",
+                "execution_ready": False,
+                "blocked_reasons": [
+                    "当前主机尚未安装 Host Runner",
+                    "未识别到稳定的软件包管理器或包名",
+                ],
+                "blocker_categories": ["runner", "render"],
+                "blockers": [
+                    {
+                        "code": "runner_not_installed",
+                        "message": "当前主机尚未安装 Host Runner",
+                        "blocker_category": "runner",
+                    },
+                    {
+                        "code": "unstable_render",
+                        "message": "未识别到稳定的软件包管理器或包名",
+                        "blocker_category": "render",
+                    },
+                ],
+            },
+            child_task_id=None,
+        ),
+    )
+    monkeypatch.setattr(
+        agent_tasks,
+        "append_blocked_action_result_message",
+        lambda *args, **kwargs: blocked_calls.append(kwargs),
+    )
+
+    result = agent_tasks.run_agent_secure_post_verify_resume_task.run(
+        "session-1",
+        "task-collect-1",
+        {
+            "action_type": "create_or_resume_remediation_session",
+            "params": {"asset_id": "asset-1", "submit_if_ready": True},
+        },
+        "asset-1",
+    )
+
+    assert result == "task-collect-1"
+    assert db.committed is True
+    assert blocked_calls
+    assert "即使先安装 Runner，也不保证能立即自动修成功" in str(blocked_calls[0]["content"])
+    assert blocked_calls[0]["message_payload_patch"]["post_verify_action"] == "interactive_remediation_recommended"
+
+
 def test_run_agent_orchestrate_task_preserves_plan_during_progress_updates(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     initial_result_json = {
         "context": {"session_id": "session-1", "platform_url": "http://localhost:3000"},
@@ -785,6 +1024,125 @@ def test_run_agent_orchestrate_task_keeps_non_ssh_remediation_blocked(monkeypatc
     assert blocked_calls[0]["action"]["action_type"] == "create_or_resume_remediation_session"
     assert session.current_goal.status == "blocked"
     assert "Host Runner" in str(session.current_goal.blocked_reason)
+    assert task_success_calls[0]["task_id"] == "task-orchestrate-1"
+
+
+def test_run_agent_orchestrate_task_keeps_maintenance_window_blocked(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    initial_result_json = {
+        "context": {"session_id": "session-1", "platform_url": "http://localhost:3000"},
+        "plan": {
+            "proposed_write_actions": [
+                {
+                    "action_type": "approve_remediation_session",
+                    "title": "批准修复会话",
+                    "params": {"session_id": "remediation-session-1"},
+                }
+            ]
+        },
+        "execution": {"approved_by": "user-1", "results": []},
+    }
+    task_run = _make_task_run(result_json=initial_result_json)
+    goal = SimpleNamespace(status="active", blocked_reason=None, progress_json={})
+    session = SimpleNamespace(
+        id="session-1",
+        user_id="user-1",
+        current_goal=goal,
+        current_goal_id="goal-1",
+        status="running",
+        pending_plan_json={},
+        dialog_state_json={},
+        browser_runtime_json={},
+        last_task_id=None,
+    )
+    db = _FakeDB(session, task_run=task_run)
+    blocked_calls: list[dict[str, object]] = []
+    task_success_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(agent_tasks, "SessionLocal", _SessionLocalContext(db))
+    monkeypatch.setattr(agent_tasks, "tracked_task", _tracked_task_context)
+    monkeypatch.setattr(agent_tasks, "ensure_task_not_canceled", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agent_tasks, "get_task_run", lambda _db, _task_run_id: task_run)
+    monkeypatch.setattr(agent_tasks, "set_task_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent_tasks, "append_current_task_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent_tasks, "sync_agent_task_watch_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent_tasks, "set_task_failure", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent_tasks, "set_task_retry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        agent_tasks,
+        "set_task_success",
+        lambda task_id, message, result_json: task_success_calls.append(
+            {"task_id": task_id, "message": message, "result_json": deepcopy(result_json)}
+        ),
+    )
+    monkeypatch.setattr(
+        agent_tasks,
+        "execute_approved_action",
+        lambda *args, **kwargs: SimpleNamespace(
+            status="success",
+            summary="修复会话 remediation-session-1 当前仍缺维护窗口。阻塞原因：当前阶段包含高风险步骤，请先填写 maintenance_window_id 后再正式执行。请先填写 maintenance_window_id 后再继续自动修复，或进入修复工作台查看详情。",
+            payload={
+                "asset_id": "asset-1",
+                "session_id": "remediation-session-1",
+                "execution_ready": False,
+                "blocked_reasons": ["当前阶段包含高风险步骤，请先填写 maintenance_window_id 后再正式执行"],
+                "blocker_codes": ["maintenance_window_required"],
+                "blocker_categories": ["policy"],
+                "blockers": [
+                    {
+                        "code": "maintenance_window_required",
+                        "message": "当前阶段包含高风险步骤，请先填写 maintenance_window_id 后再正式执行",
+                        "blocker_category": "policy",
+                        "scope": "stage",
+                        "blocking": "hard",
+                    }
+                ],
+                "submitted_task_id": None,
+            },
+            child_task_id=None,
+        ),
+    )
+    monkeypatch.setattr(
+        agent_tasks,
+        "transition_session_to_remediation_secure_input",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not open secure input for maintenance window blockers")),
+    )
+
+    def _fake_append_blocked(db_obj, *, session_id, task_id, action, result_payload, content, blocked_reason=None):  # type: ignore[no-untyped-def]
+        blocked_calls.append(
+            {
+                "session_id": session_id,
+                "task_id": task_id,
+                "action": action,
+                "result_payload": result_payload,
+                "content": content,
+                "blocked_reason": blocked_reason,
+            }
+        )
+        db_obj._session.current_goal.status = "blocked"
+        db_obj._session.current_goal.blocked_reason = blocked_reason or content
+
+    monkeypatch.setattr(agent_tasks, "append_blocked_action_result_message", _fake_append_blocked)
+    monkeypatch.setattr(
+        agent_tasks,
+        "append_agent_task_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not append generic failure message")),
+    )
+
+    orchestrate_fn = agent_tasks.run_agent_orchestrate_task.__wrapped__.__func__
+    fake_task = SimpleNamespace(
+        request=SimpleNamespace(id="celery-1", retries=0),
+        max_retries=1,
+        retry=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not retry blocked path")),
+    )
+
+    result = orchestrate_fn(fake_task, "task-orchestrate-1", "session-1")
+
+    assert result == "task-orchestrate-1"
+    assert blocked_calls
+    assert blocked_calls[0]["action"]["action_type"] == "approve_remediation_session"
+    assert "maintenance_window_id" in str(blocked_calls[0]["content"])
+    assert session.current_goal.status == "blocked"
+    assert "maintenance_window_id" in str(session.current_goal.blocked_reason)
     assert task_success_calls[0]["task_id"] == "task-orchestrate-1"
 
 

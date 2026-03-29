@@ -22,7 +22,12 @@ import CollapsibleJsonBlock from "@/components/CollapsibleJsonBlock";
 import DesktopPageHeader from "@/components/DesktopPageHeader";
 import StatusTag from "@/components/StatusTag";
 import { getStoredToken } from "@/lib/auth";
-import { buildRemediationAssetPath, pickRecommendedFindingId } from "@/lib/remediation";
+import {
+  buildRemediationAssetPath,
+  pickRecommendedFindingId,
+  remediationBusinessStatusLabel,
+  remediationExecutionStatusLabel,
+} from "@/lib/remediation";
 import { formatDateTime, getTaskEventTypeLabel, localizeTaskMessage } from "@/lib/ui-text";
 import { executeRemediationPlan, getRemediationPlan, getRemediationTask, getRemediationWorkspace } from "@/services/api";
 import { RemediationPlan, RemediationStreamEnvelope, RemediationTask, RemediationWorkspace } from "@/types/remediation";
@@ -43,6 +48,21 @@ function buildRemediationWebSocketUrl(streamPath: string, token: string): string
   }
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   return `${protocol}://${window.location.host}${streamPath}?token=${encodeURIComponent(token)}`;
+}
+
+function remediationBusinessStatusColor(value: string | null | undefined): string {
+  switch ((value || "").trim().toLowerCase()) {
+    case "verified_closed":
+      return "green";
+    case "pending_reverify":
+      return "blue";
+    case "verified_partial":
+      return "orange";
+    case "verified_failed":
+      return "red";
+    default:
+      return "default";
+  }
 }
 
 export default function RemediationWorkspaceView({ assetId }: { assetId: string }) {
@@ -467,14 +487,33 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                         <StatusTag value={task.status} />
                         <Typography.Text>{task.execution_boundary || "-"}</Typography.Text>
                         <Tag>{task.execution_mode || "-"}</Tag>
+                        <Tag>{remediationExecutionStatusLabel(task.execution_status)}</Tag>
+                        {task.business_status ? (
+                          <Tag color={remediationBusinessStatusColor(task.business_status)}>
+                            {remediationBusinessStatusLabel(task.business_status)}
+                          </Tag>
+                        ) : null}
                       </Space>
                     </Descriptions.Item>
                     <Descriptions.Item label="进度">{task.progress}%</Descriptions.Item>
                     <Descriptions.Item label="最近消息">{localizeTaskMessage(task.message)}</Descriptions.Item>
                     <Descriptions.Item label="自动复测">
-                      {String(toRecord(task.reverify).reverify_task_id || "-")}
+                      {String(task.reverify_task_id || toRecord(task.reverify).reverify_task_id || "-")}
                     </Descriptions.Item>
+                    {task.business_status ? (
+                      <Descriptions.Item label="业务闭环">
+                        {remediationBusinessStatusLabel(task.business_status)}
+                      </Descriptions.Item>
+                    ) : null}
                   </Descriptions>
+                  {Object.keys(task.reverify_summary || {}).length ? (
+                    <Alert
+                      type={task.business_status === "verified_closed" ? "success" : task.business_status === "verified_failed" ? "error" : "info"}
+                      showIcon
+                      message={remediationBusinessStatusLabel(task.business_status)}
+                      description={localizeTaskMessage(task.message)}
+                    />
+                  ) : null}
                   <div className="remediation-stream-shell">
                     <pre className="remediation-stream-body">
                       {(streamLines.length ? streamLines : ["等待任务输出..."]).join("\n")}
@@ -514,6 +553,7 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                 <Empty description="暂无步骤执行结果" />
               )}
               {task ? <CollapsibleJsonBlock title="任务结果（JSON）" value={task.execution} /> : null}
+              {task ? <CollapsibleJsonBlock title="业务复验（JSON）" value={task.reverify_summary} /> : null}
             </Card>
           </Space>
         </Col>

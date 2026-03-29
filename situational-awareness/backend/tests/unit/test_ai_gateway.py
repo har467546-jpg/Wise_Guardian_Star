@@ -195,6 +195,33 @@ def test_build_provider_applies_minimax_defaults() -> None:
     assert result.provider.wire_api == "chat_completions"
 
 
+@pytest.mark.parametrize("provider_name", ["openai", "minimax", "custom_proxy"])
+def test_build_provider_requires_api_key_for_remote_openai_like_providers(provider_name: str) -> None:
+    with pytest.raises(ValueError, match="API Key"):
+        providers_module.build_provider(
+            provider_name=provider_name,
+            model="gpt-5.4",
+            base_url="https://relay.example.com/v1" if provider_name == "custom_proxy" else "",
+            timeout_seconds=20,
+            api_key="",
+        )
+
+
+def test_build_provider_can_fallback_to_mock_when_custom_proxy_api_key_missing() -> None:
+    result = providers_module.build_provider(
+        provider_name="custom_proxy",
+        model="gpt-5.4",
+        base_url="https://relay.example.com/v1",
+        timeout_seconds=20,
+        api_key="",
+        fallback_to_mock=True,
+    )
+
+    assert result.provider_name == "mock"
+    assert isinstance(result.provider, providers_module.MockProvider)
+    assert "API Key" in result.provider.notice
+
+
 @pytest.mark.parametrize(
     ("provider_name", "base_url", "expected"),
     [
@@ -882,6 +909,16 @@ def test_list_remote_models_rejects_html_response(monkeypatch) -> None:  # type:
         assert "API 根地址" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_list_remote_models_requires_api_key_for_custom_proxy() -> None:
+    with pytest.raises(ValueError, match="API Key"):
+        providers_module.list_remote_models(
+            provider_name="custom_proxy",
+            base_url="https://relay.example.com",
+            api_key="",
+            timeout_seconds=15,
+        )
 
 
 def test_custom_proxy_provider_stream_generate_reads_responses_stream(monkeypatch) -> None:  # type: ignore[no-untyped-def]

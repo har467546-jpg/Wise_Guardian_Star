@@ -48,9 +48,16 @@ from app.schemas.remediation import (
     RunnerTaskEventBatch,
     RunnerTaskStepRead,
 )
+from app.services.remediation_business_service import (
+    BUSINESS_STATUS_PENDING_REVERIFY,
+    BUSINESS_STATUS_VERIFIED_FAILED,
+    EXECUTION_STATUS_FAILED,
+    EXECUTION_STATUS_SUCCEEDED,
+    build_business_status_message,
+    queue_remediation_reverify,
+)
 from app.services.remediation_evidence_service import build_remediation_evidence
 from app.tasks.task_runtime import append_current_task_event
-from app.tasks.verify_tasks import run_risk_verify_task
 from app.db.session import SessionLocal
 
 RUNNER_VERSION = "2.0.0"
@@ -1069,46 +1076,6 @@ def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload:
     if step_results and failed_count <= 0:
         failed_count = sum(1 for item in step_results if isinstance(item, dict) and str(item.get("status") or "").strip() == "failed")
     execution["failed_count"] = failed_count
-    reverify = {"reverify_triggered": False, "reverify_task_id": None, "reverify_status": None}
-    if bool(settings.REMEDIATION_AUTO_REVERIFY_ENABLED) and success_count > 0:
-        reverify_task = create_task_run(
-            db,
-            task_type=TaskType.RISK_VERIFY,
-            scope_type="asset",
-            scope_id=runner.asset_id,
-            message="风险验证任务已入队",
-        )
-        celery_task = run_risk_verify_task.delay(reverify_task.id, runner.asset_id)
-        update_task_run(db, reverify_task, celery_task_id=celery_task.id)
-        reverify = {
-            "reverify_triggered": True,
-            "reverify_task_id": reverify_task.id,
-            "reverify_status": "pending",
-        }
-        create_task_event(
-            db,
-            task_run_id=task.id,
-            event_type="reverify",
-            level="info",
-            stage_code="auto_reverify",
-            stage_name="自动复测",
-            message="修复后已自动触发风险复测",
-            payload_json=reverify,
-        )
-
-    execution_mode = str(execution.get("execution_mode") or "apply").strip().lower() or "apply"
-    if failed_count > 0 or payload.status == "failure":
-        overall_status = "apply_failed"
-        final_message = payload.message or f"共有 {failed_count or 1} 个 Runner 修复步骤执行失败"
-    elif reverify.get("reverify_triggered"):
-        overall_status = "applied_pending_reverify"
-        final_message = payload.message or "Host Runner 已执行修复命令，自动复测已触发，等待复测结论"
-    else:
-        overall_status = "applied"
-        final_message = payload.message or "Host Runner 已完成整机修复计划"
-    execution["execution_mode"] = execution_mode
-    execution["overall_status"] = overall_status
-    execution["final_message"] = final_message
     plan = result_json.get("plan") if isinstance(result_json.get("plan"), dict) else {}
     execution_context = result_json.get("execution") if isinstance(result_json.get("execution"), dict) else {}
     submitted_steps = execution_context.get("submitted_steps") if isinstance(execution_context.get("submitted_steps"), list) else []
@@ -1122,6 +1089,57 @@ def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload:
         for step in (plan.get("steps") or [])
         if isinstance(step, dict) and (not submitted_step_ids or str(step.get("step_id") or "").strip() in submitted_step_ids)
     ]
+    reverify = {"reverify_triggered": False, "reverify_task_id": None, "reverify_status": None}
+    if bool(settings.REMEDIATION_AUTO_REVERIFY_ENABLED) and success_count > 0:
+        reverify = queue_remediation_reverify(
+            db,
+            asset_id=runner.asset_id,
+            remediation_task_id=task.id,
+            plan=plan,
+            selected_steps=selected_steps,
+            stage_code=str(execution_context.get("stage_code") or "").strip() or None,
+            stage_name=str(execution_context.get("stage_name") or "").strip() or None,
+            session_id=str(result_json.get("context", {}).get("session_id") or "").strip() or None,
+        )
+        create_task_event(
+            db,
+            task_run_id=task.id,
+            event_type="reverify",
+            level="info",
+            stage_code="auto_reverify",
+            stage_name="自动复测",
+            message="修复后已自动触发业务复验",
+            payload_json=reverify,
+        )
+
+    execution_mode = str(execution.get("execution_mode") or "apply").strip().lower() or "apply"
+    if failed_count > 0 or payload.status == "failure":
+        overall_status = "apply_failed"
+        final_message = payload.message or build_business_status_message(
+            BUSINESS_STATUS_VERIFIED_FAILED,
+            stage_name=str(execution_context.get("stage_name") or "").strip() or None,
+        )
+        execution_status = EXECUTION_STATUS_FAILED
+        business_status = BUSINESS_STATUS_VERIFIED_FAILED
+    elif reverify.get("reverify_triggered"):
+        overall_status = "applied_pending_reverify"
+        final_message = payload.message or build_business_status_message(
+            BUSINESS_STATUS_PENDING_REVERIFY,
+            stage_name=str(execution_context.get("stage_name") or "").strip() or None,
+        )
+        execution_status = EXECUTION_STATUS_SUCCEEDED
+        business_status = BUSINESS_STATUS_PENDING_REVERIFY
+    else:
+        overall_status = "applied"
+        final_message = payload.message or "Host Runner 已完成整机修复计划"
+        execution_status = EXECUTION_STATUS_SUCCEEDED
+        business_status = None
+    execution["execution_mode"] = execution_mode
+    execution["overall_status"] = overall_status
+    execution["final_message"] = final_message
+    execution["execution_status"] = execution_status
+    if business_status:
+        execution["business_status"] = business_status
     result_json["evidence"] = build_remediation_evidence(
         task_id=task.id,
         plan=plan,
@@ -1136,8 +1154,13 @@ def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload:
         stage_name=str(execution_context.get("stage_name") or "").strip() or None,
     )
     result_json["execution"] = execution
+    result_json["execution_status"] = execution_status
+    result_json["business_status"] = business_status
     result_json["backups"] = backups
     result_json["reverify"] = reverify
+    result_json["reverify_task_id"] = reverify.get("reverify_task_id")
+    result_json["reverify_summary"] = {}
+    result_json["targeted_finding_outcomes"] = []
     result_json.setdefault("context", {})
     result_json["context"]["runner_id"] = runner.id
     status = TaskExecutionStatus.SUCCESS if overall_status != "apply_failed" else TaskExecutionStatus.FAILURE

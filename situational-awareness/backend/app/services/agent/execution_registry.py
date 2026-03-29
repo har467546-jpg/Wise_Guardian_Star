@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.asset import Asset
 from app.db.models.enums import TaskExecutionStatus, TaskType
+from app.db.models.remediation_session import RemediationSession
 from app.db.models.user import User
 from app.repositories.discovery_repo import create_job, get_active_job_by_cidr
 from app.repositories.task_repo import create_task_run, get_latest_task_run_for_scope, get_task_run, update_task_run
@@ -17,6 +18,13 @@ from app.tasks.scan_tasks import run_asset_scan_task
 from app.tasks.verify_tasks import run_risk_verify_task
 from app.utils.net import normalize_cidr
 from app.utils.sanitize import sanitize_json_value, sanitize_text
+
+_APPROVE_REMEDIATION_BLOCKING_MESSAGES = {
+    "当前阶段包含高风险步骤，请先填写 maintenance_window_id 后再正式执行",
+    "当前整机修复计划不可执行",
+    "当前没有可执行阶段",
+    "仅允许审批当前最早可执行阶段",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +69,8 @@ def _resolve_approved_by_user_id(context: AgentActionExecutorContext) -> str:
 def _infer_remediation_blocker_code(message: str | None) -> str:
     normalized = sanitize_text(message, max_length=280) or ""
     lowered = normalized.lower()
+    if "maintenance_window_id" in lowered or "维护窗口" in normalized:
+        return "maintenance_window_required"
     if ("ssh" in lowered and any(marker in normalized for marker in ("凭据", "私钥", "密码", "授权"))) or "未配置 ssh" in lowered:
         return "missing_ssh_credential"
     if "管理员授权" in normalized:
@@ -75,6 +85,14 @@ def _infer_remediation_blocker_code(message: str | None) -> str:
         return "runner_installing"
     if "当前离线" in normalized:
         return "runner_offline"
+    if "未识别到稳定的软件包管理器或包名" in normalized:
+        return "unstable_render"
+    if "未识别稳定的软件包管理器" in normalized or "未识别稳定的软件包名" in normalized:
+        return "unstable_render"
+    if "无法生成安全步骤" in normalized or "无法稳定渲染" in normalized:
+        return "unstable_render"
+    if "缺少自动修复适配器" in normalized:
+        return "missing_adapter"
     if "未解析到" in normalized:
         return "missing_target"
     if "白名单" in normalized:
@@ -84,7 +102,87 @@ def _infer_remediation_blocker_code(message: str | None) -> str:
     return "unknown_blocker"
 
 
-def _serialize_remediation_blockers(plan: Any) -> tuple[list[str], list[dict[str, Any]]]:
+def _categorize_remediation_blocker(*, code: str | None, message: str | None) -> str:
+    normalized_code = sanitize_text(code, max_length=64, single_line=True) or ""
+    normalized_message = sanitize_text(message, max_length=280) or ""
+    lowered = normalized_message.lower()
+    if normalized_code == "maintenance_window_required":
+        return "policy"
+    if normalized_code in {
+        "missing_ssh_credential",
+        "authorization_unconfirmed",
+        "authorization_not_verified",
+        "insufficient_privilege",
+    }:
+        return "ssh"
+    if normalized_code in {"runner_not_installed", "runner_installing", "runner_offline"}:
+        return "runner"
+    if normalized_code in {"unstable_render", "missing_target", "missing_adapter"}:
+        return "render"
+    if "runner" in lowered:
+        return "runner"
+    if "未识别到稳定的软件包管理器或包名" in normalized_message:
+        return "render"
+    if "未识别稳定的软件包管理器" in normalized_message or "未识别稳定的软件包名" in normalized_message:
+        return "render"
+    if "无法生成安全步骤" in normalized_message or "无法稳定渲染" in normalized_message:
+        return "render"
+    if "ssh" in lowered or "sudo" in lowered:
+        return "ssh"
+    return "other"
+
+
+def _build_blocked_remediation_approval_result(
+    *,
+    session_id: str,
+    asset_id: str | None,
+    error_message: str,
+    execution_mode: str,
+    stage_code: str | None,
+    change_ticket: str | None,
+    maintenance_window_id: str | None,
+) -> AgentExecutionResult:
+    blocker_code = _infer_remediation_blocker_code(error_message)
+    blocker_category = _categorize_remediation_blocker(code=blocker_code, message=error_message)
+    payload = {
+        "session_id": session_id,
+        "asset_id": asset_id,
+        "execution_ready": False,
+        "submitted_task_id": None,
+        "blocked_reasons": [error_message],
+        "blocker_codes": [blocker_code],
+        "blocker_categories": [blocker_category],
+        "blockers": [
+            {
+                "code": blocker_code,
+                "message": error_message,
+                "blocker_category": blocker_category,
+                "scope": "stage",
+                "blocking": "hard",
+                "stage_code": stage_code,
+                "step_id": None,
+            }
+        ],
+        "execution_mode": execution_mode,
+        "change_ticket": change_ticket,
+        "maintenance_window_id": maintenance_window_id,
+    }
+    if blocker_code == "maintenance_window_required":
+        summary = (
+            f"修复会话 {session_id} 当前仍缺维护窗口。"
+            f"阻塞原因：{error_message}。"
+            "请先填写 maintenance_window_id 后再继续自动修复，或进入修复工作台查看详情。"
+        )
+    else:
+        summary = (
+            f"修复会话 {session_id} 当前仍缺前置条件。"
+            f"阻塞原因：{error_message}。"
+            "请先补齐条件后再继续自动修复，或进入修复工作台查看详情。"
+        )
+    return AgentExecutionResult(status="success", summary=summary, payload=payload)
+
+
+def _serialize_remediation_blockers(plan: Any) -> tuple[list[str], list[dict[str, Any]], list[str]]:
     blockers: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, str, str, str]] = set()
     for field_name in ("global_blockers", "step_blockers"):
@@ -113,6 +211,7 @@ def _serialize_remediation_blockers(plan: Any) -> tuple[list[str], list[dict[str
             blocker = {
                 "code": code or "unknown_blocker",
                 "message": message,
+                "blocker_category": _categorize_remediation_blocker(code=code, message=message),
                 "scope": sanitize_text(str(payload.get("scope") or ""), max_length=64, single_line=True) or None,
                 "blocking": sanitize_text(str(payload.get("blocking") or ""), max_length=32, single_line=True) or None,
                 "stage_code": sanitize_text(str(payload.get("stage_code") or ""), max_length=64, single_line=True) or None,
@@ -147,6 +246,7 @@ def _serialize_remediation_blockers(plan: Any) -> tuple[list[str], list[dict[str
                     {
                         "code": code,
                         "message": message,
+                        "blocker_category": _categorize_remediation_blocker(code=code, message=message),
                         "scope": None,
                         "blocking": None,
                         "stage_code": None,
@@ -155,11 +255,15 @@ def _serialize_remediation_blockers(plan: Any) -> tuple[list[str], list[dict[str
                 )
 
     blocker_codes: list[str] = []
+    blocker_categories: list[str] = []
     for item in blockers:
         code = sanitize_text(str(item.get("code") or ""), max_length=64, single_line=True) or ""
         if code and code not in blocker_codes:
             blocker_codes.append(code)
-    return blocker_codes, sanitize_json_value(blockers)
+        category = sanitize_text(str(item.get("blocker_category") or ""), max_length=32, single_line=True) or ""
+        if category and category not in blocker_categories:
+            blocker_categories.append(category)
+    return blocker_codes, sanitize_json_value(blockers), blocker_categories
 
 
 def _queue_discovery_job(context: AgentActionExecutorContext, *, action: dict[str, Any]) -> AgentExecutionResult:
@@ -270,24 +374,59 @@ def _create_or_resume_remediation(context: AgentActionExecutorContext, *, action
     params = action.get("params") if isinstance(action.get("params"), dict) else {}
     asset_id = sanitize_text(str(params.get("asset_id") or ""), max_length=64, single_line=True) or ""
     submit_if_ready = _coerce_bool(params.get("submit_if_ready"))
+    stage_code = sanitize_text(str(params.get("stage_code") or ""), max_length=64, single_line=True) or None
+    execution_mode = sanitize_text(str(params.get("execution_mode") or "apply"), max_length=32, single_line=True) or "apply"
+    change_ticket = sanitize_text(str(params.get("change_ticket") or ""), max_length=128, single_line=True) or None
+    maintenance_window_id = sanitize_text(
+        str(params.get("maintenance_window_id") or ""),
+        max_length=128,
+        single_line=True,
+    ) or None
     if not asset_id:
         raise RuntimeError("修复会话计划缺少 asset_id")
     session = create_or_resume_remediation_session(db, asset_id=asset_id)
     blocked_reasons = list(session.plan.blocked_reasons or [])
-    blocker_codes, blockers = _serialize_remediation_blockers(session.plan)
+    blocker_codes, blockers, blocker_categories = _serialize_remediation_blockers(session.plan)
     payload = {
         "asset_id": asset_id,
         "session_id": session.session_id,
         "execution_ready": bool(session.plan.execution_ready),
         "blocked_reasons": blocked_reasons,
         "blocker_codes": blocker_codes,
+        "blocker_categories": blocker_categories,
         "blockers": blockers,
         "submitted_task_id": None,
     }
     if submit_if_ready and session.plan.execution_ready:
         approved_by = _resolve_approved_by_user_id(context)
-        response = approve_remediation_session(db, session_id=session.session_id, approved_by=approved_by)
+        try:
+            response = approve_remediation_session(
+                db,
+                session_id=session.session_id,
+                approved_by=approved_by,
+                stage_code=stage_code,
+                execution_mode=execution_mode,
+                change_ticket=change_ticket,
+                maintenance_window_id=maintenance_window_id,
+            )
+        except RuntimeError as exc:
+            error_message = sanitize_text(str(exc), max_length=280) or "当前修复审批仍缺前置条件"
+            if error_message in _APPROVE_REMEDIATION_BLOCKING_MESSAGES:
+                return _build_blocked_remediation_approval_result(
+                    session_id=session.session_id,
+                    asset_id=asset_id,
+                    error_message=error_message,
+                    execution_mode=execution_mode,
+                    stage_code=stage_code,
+                    change_ticket=change_ticket,
+                    maintenance_window_id=maintenance_window_id,
+                )
+            raise
         payload["submitted_task_id"] = response.task_id
+        payload["stage_code"] = stage_code
+        payload["execution_mode"] = execution_mode
+        payload["change_ticket"] = change_ticket
+        payload["maintenance_window_id"] = maintenance_window_id
         return AgentExecutionResult(
             status="queued",
             summary=f"已准备修复会话 {session.session_id}，并直接提交自动修复任务 {response.task_id}",
@@ -320,13 +459,57 @@ def _approve_remediation(context: AgentActionExecutorContext, *, action: dict[st
     session_id = sanitize_text(str(params.get("session_id") or ""), max_length=64, single_line=True) or ""
     if not session_id:
         raise RuntimeError("修复批准计划缺少 session_id")
+    remediation_session = db.get(RemediationSession, session_id)
+    asset_id = sanitize_text(
+        str(getattr(remediation_session, "asset_id", "") or ""),
+        max_length=64,
+        single_line=True,
+    ) or None
     approved_by = _resolve_approved_by_user_id(context)
-    response = approve_remediation_session(db, session_id=session_id, approved_by=approved_by)
+    stage_code = sanitize_text(str(params.get("stage_code") or ""), max_length=64, single_line=True) or None
+    execution_mode = sanitize_text(str(params.get("execution_mode") or "apply"), max_length=32, single_line=True) or "apply"
+    change_ticket = sanitize_text(str(params.get("change_ticket") or ""), max_length=128, single_line=True) or None
+    maintenance_window_id = sanitize_text(
+        str(params.get("maintenance_window_id") or ""),
+        max_length=128,
+        single_line=True,
+    ) or None
+    try:
+        response = approve_remediation_session(
+            db,
+            session_id=session_id,
+            approved_by=approved_by,
+            stage_code=stage_code,
+            execution_mode=execution_mode,
+            change_ticket=change_ticket,
+            maintenance_window_id=maintenance_window_id,
+        )
+    except RuntimeError as exc:
+        error_message = sanitize_text(str(exc), max_length=280) or "当前修复审批仍缺前置条件"
+        if error_message in _APPROVE_REMEDIATION_BLOCKING_MESSAGES:
+            return _build_blocked_remediation_approval_result(
+                session_id=session_id,
+                asset_id=asset_id,
+                error_message=error_message,
+                execution_mode=execution_mode,
+                stage_code=stage_code,
+                change_ticket=change_ticket,
+                maintenance_window_id=maintenance_window_id,
+            )
+        raise
     return AgentExecutionResult(
         status="queued",
         summary=f"已批准修复会话 {session_id}",
         child_task_id=response.task_id,
-        payload={"session_id": session_id, "task_id": response.task_id},
+        payload={
+            "session_id": session_id,
+            "asset_id": asset_id,
+            "task_id": response.task_id,
+            "stage_code": stage_code,
+            "execution_mode": execution_mode,
+            "change_ticket": change_ticket,
+            "maintenance_window_id": maintenance_window_id,
+        },
     )
 
 

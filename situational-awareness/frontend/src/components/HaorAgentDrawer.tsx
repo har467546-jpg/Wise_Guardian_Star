@@ -29,6 +29,7 @@ import type {
   AgentBrowserContext,
   AgentErrorEvent,
   AgentGoal,
+  AgentMessageActionSuggestion,
   AgentMessage,
   AgentPendingSecureInput,
   AgentPageContext,
@@ -132,6 +133,12 @@ type SecureInputResultItem = {
   verified: boolean;
   effective_privilege?: string | null;
   error_summary?: string | null;
+};
+
+type MaintenanceWindowPrompt = {
+  messageId: string;
+  content: string;
+  action: AgentMessageActionSuggestion;
 };
 
 const MESSAGE_TURN_ACK_TIMEOUT_MS = 8_000;
@@ -360,17 +367,25 @@ function toPendingSecureInput(session: AgentSession | null): AgentPendingSecureI
     return EMPTY_SECURE_INPUT;
   }
   const record = raw as Record<string, unknown>;
+  // Older sessions may only persist a singular asset_id and omit kind.
+  const singularAssetId = typeof record.asset_id === "string" && record.asset_id.trim().length > 0
+    ? record.asset_id.trim()
+    : "";
   const assetIds = Array.isArray(record.asset_ids)
     ? record.asset_ids.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
     : [];
+  const normalizedAssetIds = assetIds.length > 0 ? assetIds : (singularAssetId ? [singularAssetId] : []);
   const assetLabels = Array.isArray(record.asset_labels)
     ? record.asset_labels.filter((item): item is string => typeof item === "string")
     : [];
+  const normalizedKind = typeof record.kind === "string" && record.kind.trim()
+    ? record.kind.trim()
+    : (normalizedAssetIds.length > 0 ? "ssh_credential" : "");
   return {
-    kind: typeof record.kind === "string" ? record.kind : "",
-    mode: typeof record.mode === "string" ? record.mode : (assetIds.length > 1 ? "batch_choice" : "single_asset"),
-    asset_ids: assetIds,
-    asset_labels: assetIds.map((assetId, index) => {
+    kind: normalizedKind,
+    mode: typeof record.mode === "string" ? record.mode : (normalizedAssetIds.length > 1 ? "batch_choice" : "single_asset"),
+    asset_ids: normalizedAssetIds,
+    asset_labels: normalizedAssetIds.map((assetId, index) => {
       const label = assetLabels[index];
       return label && label.trim() ? label.trim() : `资产 ${assetId}`;
     }),
@@ -538,6 +553,70 @@ function messageTone(message: AgentMessage): "action" | "error" | "plan" | "task
     default:
       return undefined;
   }
+}
+
+function toMessageActionSuggestion(value: unknown): AgentMessageActionSuggestion | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const kind = typeof record.kind === "string" ? record.kind.trim() : "";
+  const label = typeof record.label === "string" ? record.label.trim() : "";
+  if (!kind || !label) {
+    return null;
+  }
+  return {
+    kind,
+    label,
+    message_text: typeof record.message_text === "string" ? record.message_text : null,
+    pathname: typeof record.pathname === "string" ? record.pathname : null,
+  };
+}
+
+function messageActionSuggestions(message: AgentMessage): AgentMessageActionSuggestion[] {
+  const payload = message.payload_json && typeof message.payload_json === "object" ? message.payload_json : {};
+  const actions = [
+    toMessageActionSuggestion(payload.recommended_action),
+    toMessageActionSuggestion(payload.alternative_action),
+  ].filter((item): item is AgentMessageActionSuggestion => Boolean(item));
+  const seen = new Set<string>();
+  return actions.filter((item) => {
+    const signature = `${item.kind}:${item.label}:${item.message_text || ""}:${item.pathname || ""}`;
+    if (seen.has(signature)) {
+      return false;
+    }
+    seen.add(signature);
+    return true;
+  });
+}
+
+function hasMaintenanceWindowText(value: unknown): boolean {
+  if (typeof value !== "string" || !value.trim()) {
+    return false;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized.includes("maintenance_window_id") || value.includes("维护窗口");
+}
+
+function findLatestMaintenanceWindowPrompt(messages: AgentMessage[] | null | undefined): MaintenanceWindowPrompt | null {
+  if (!Array.isArray(messages)) {
+    return null;
+  }
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const item = messages[index];
+    if (item.role !== "assistant") {
+      continue;
+    }
+    const action = messageActionSuggestions(item).find((candidate) => candidate.kind === "open_maintenance_window_input");
+    if (action) {
+      return {
+        messageId: item.id,
+        content: item.content,
+        action,
+      };
+    }
+  }
+  return null;
 }
 
 function actionUpdateTrace(event: AgentActionUpdateEvent): Record<string, unknown> | null {
@@ -855,6 +934,11 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const [secureGuidedIndex, setSecureGuidedIndex] = useState(0);
   const [secureGuidedResults, setSecureGuidedResults] = useState<SecureInputResultItem[]>([]);
   const [secureErrorText, setSecureErrorText] = useState<string | null>(null);
+  const [maintenanceWindowModalOpen, setMaintenanceWindowModalOpen] = useState(false);
+  const [maintenanceWindowValue, setMaintenanceWindowValue] = useState("");
+  const [maintenanceWindowSubmitting, setMaintenanceWindowSubmitting] = useState(false);
+  const [maintenanceWindowErrorText, setMaintenanceWindowErrorText] = useState<string | null>(null);
+  const [dismissedMaintenancePromptId, setDismissedMaintenancePromptId] = useState<string | null>(null);
 
   const pageContext = useMemo(() => buildPageContext(pathname, searchParams), [pathname, searchParams]);
   const runtimeSnapshot = useMemo(() => toRuntimeSnapshot(session), [session]);
@@ -864,6 +948,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const sessionSummary = useMemo(() => deriveSessionSummary(session), [session]);
   const proposedActions = useMemo(() => toProposedActions(session), [session]);
   const remediationAutoSubmitPlan = useMemo(() => hasRemediationAutoSubmitPlan(proposedActions), [proposedActions]);
+  const latestMaintenanceWindowPrompt = useMemo(() => findLatestMaintenanceWindowPrompt(session?.messages || []), [session?.messages]);
   const visiblePendingUserMessages = useMemo(
     () => reconcilePendingUserMessages(pendingUserMessages, session?.messages || []),
     [pendingUserMessages, session?.messages],
@@ -899,6 +984,15 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     () => (Array.isArray(currentGoalProgress.blockers) ? currentGoalProgress.blockers : []),
     [currentGoalProgress],
   );
+  const maintenanceWindowBlocked = useMemo(() => {
+    if (hasMaintenanceWindowText(runtimeSnapshot.blocker_summary)) {
+      return true;
+    }
+    if (currentGoalBlockers.some((item) => hasMaintenanceWindowText(goalBlockerText(item)))) {
+      return true;
+    }
+    return latestMaintenanceWindowPrompt ? hasMaintenanceWindowText(latestMaintenanceWindowPrompt.content) : false;
+  }, [runtimeSnapshot.blocker_summary, currentGoalBlockers, latestMaintenanceWindowPrompt]);
   const sidebarStageText = firstNonEmptyString([
     typeof currentGoalProgress.stage === "string" ? currentGoalProgress.stage : "",
     agentStatePanel.stage,
@@ -987,6 +1081,25 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     setSecureGuidedResults([]);
     setSecureErrorText(null);
   }, [secureInputVisible, pendingSecureInput, secureAssetCount]);
+
+  useEffect(() => {
+    setMaintenanceWindowValue("");
+    setMaintenanceWindowErrorText(null);
+  }, [latestMaintenanceWindowPrompt?.messageId]);
+
+  useEffect(() => {
+    if (!open || !latestMaintenanceWindowPrompt || !maintenanceWindowBlocked) {
+      setMaintenanceWindowModalOpen(false);
+      setMaintenanceWindowSubmitting(false);
+      setMaintenanceWindowErrorText(null);
+      return;
+    }
+    if (dismissedMaintenancePromptId === latestMaintenanceWindowPrompt.messageId) {
+      return;
+    }
+    setMaintenanceWindowModalOpen(true);
+    setMaintenanceWindowErrorText(null);
+  }, [open, latestMaintenanceWindowPrompt, maintenanceWindowBlocked, dismissedMaintenancePromptId]);
 
   useEffect(() => {
     if (!session) {
@@ -2109,10 +2222,10 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     };
   }, [open, pendingUiKey, stepping, sending, approving, interrupting, resetting, router]);
 
-  const handleSend = async (content: string) => {
+  const handleSend = async (content: string): Promise<boolean> => {
     const normalized = content.trim();
     if (!normalized) {
-      return;
+      return false;
     }
     const clientMessageId = createClientId();
     const createdAt = new Date().toISOString();
@@ -2196,7 +2309,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       });
       if (usedStream) {
         scheduleMessageTurnFallback();
-        return;
+        return true;
       }
       const result = await postHaorMessage({
         client_message_id: clientMessageId,
@@ -2206,6 +2319,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       });
       applyMessageTurnResult(result, clientMessageId);
       resetPendingMessageTurnState();
+      return true;
     } catch (error) {
       const text = error instanceof Error ? error.message : "haor 消息发送失败";
       resetPendingMessageTurnState();
@@ -2215,10 +2329,66 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       setAssistantPlaceholder(null);
       setErrorText(text);
       message.error(text);
+      return false;
     } finally {
       if (!usedStream) {
         setSending(false);
       }
+    }
+  };
+
+  const handleMaintenanceWindowCancel = () => {
+    if (latestMaintenanceWindowPrompt) {
+      setDismissedMaintenancePromptId(latestMaintenanceWindowPrompt.messageId);
+    }
+    setMaintenanceWindowModalOpen(false);
+    setMaintenanceWindowSubmitting(false);
+    setMaintenanceWindowErrorText(null);
+  };
+
+  const handleMaintenanceWindowSubmit = async () => {
+    const normalized = maintenanceWindowValue.trim();
+    if (!normalized) {
+      setMaintenanceWindowErrorText("请先填写 maintenance_window_id");
+      return;
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,126}$/.test(normalized)) {
+      setMaintenanceWindowErrorText("维护窗口 ID 仅支持字母、数字、点、下划线和中划线");
+      return;
+    }
+    setMaintenanceWindowSubmitting(true);
+    setMaintenanceWindowErrorText(null);
+    const submitted = await handleSend(
+      pageContext.asset_id
+        ? `maintenance_window_id=${normalized}，继续为资产 ${pageContext.asset_id} 自动修复`
+        : `maintenance_window_id=${normalized}，继续当前自动修复`,
+    );
+    if (submitted) {
+      if (latestMaintenanceWindowPrompt) {
+        setDismissedMaintenancePromptId(latestMaintenanceWindowPrompt.messageId);
+      }
+      setMaintenanceWindowModalOpen(false);
+      setMaintenanceWindowValue("");
+      message.success(`已记录 maintenance_window_id=${normalized}`);
+    } else {
+      setMaintenanceWindowErrorText("维护窗口编号发送失败，请重试");
+    }
+    setMaintenanceWindowSubmitting(false);
+  };
+
+  const handleMessageAction = async (action: AgentMessageActionSuggestion, _messageId?: string) => {
+    if (action.kind === "send_message" && action.message_text) {
+      await handleSend(action.message_text);
+      return;
+    }
+    if (action.kind === "open_maintenance_window_input") {
+      setMaintenanceWindowErrorText(null);
+      setMaintenanceWindowModalOpen(true);
+      setOpen(true);
+      return;
+    }
+    if (action.kind === "navigate" && action.pathname) {
+      router.push(action.pathname);
     }
   };
 
@@ -2630,8 +2800,58 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
           <button type="button" className="haor-chat-backdrop" onClick={() => setOpen(false)} aria-label="关闭 haor 聊天窗口" />
 
           <Modal
+            open={open && maintenanceWindowModalOpen && Boolean(latestMaintenanceWindowPrompt)}
+            title="填写维护窗口"
+            zIndex={1600}
+            onCancel={() => {
+              if (!maintenanceWindowSubmitting) {
+                handleMaintenanceWindowCancel();
+              }
+            }}
+            destroyOnClose
+            maskClosable={!maintenanceWindowSubmitting}
+            keyboard={!maintenanceWindowSubmitting}
+            closable={!maintenanceWindowSubmitting}
+            okText="保存并继续自动修复"
+            cancelText="稍后再说"
+            okButtonProps={{ loading: maintenanceWindowSubmitting }}
+            onOk={() => void handleMaintenanceWindowSubmit()}
+          >
+            <div style={{ display: "grid", gap: 12 }}>
+              <Alert
+                type="info"
+                showIcon
+                message="当前自动修复需要维护窗口"
+                description="当前阶段包含高风险步骤。填写 maintenance_window_id 后，Haor 会继续推进当前自动修复；如果仍有 Runner 或渲染类阻塞，会继续明确提示。"
+              />
+              {maintenanceWindowBlocked ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  message={runtimeSnapshot.blocker_summary || sidebarBlockerText || "当前阶段需要维护窗口后才能正式执行"}
+                />
+              ) : null}
+              {maintenanceWindowErrorText ? <Alert type="error" showIcon message={maintenanceWindowErrorText} /> : null}
+              <Input
+                autoFocus
+                placeholder="例如 MW-20260327-001"
+                value={maintenanceWindowValue}
+                disabled={maintenanceWindowSubmitting}
+                onChange={(event) => setMaintenanceWindowValue(event.target.value)}
+                onPressEnter={() => void handleMaintenanceWindowSubmit()}
+              />
+              {latestMaintenanceWindowPrompt?.content ? (
+                <div style={{ color: "rgba(15,23,42,0.72)", fontSize: 13, lineHeight: 1.6 }}>
+                  {latestMaintenanceWindowPrompt.content}
+                </div>
+              ) : null}
+            </div>
+          </Modal>
+
+          <Modal
             open={secureInputVisible}
             title="SSH 凭据安全配置"
+            zIndex={1600}
             onCancel={() => {
               if (!secureSubmitting) {
                 void handleSecureCancel();
@@ -2892,6 +3112,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
 
                   {session?.messages?.map((item) => {
                     const isPendingPlanMessage = Boolean(proposedActions.length && item.id === pendingPlanMessageId);
+                    const messageActions = messageActionSuggestions(item);
                     const content = isPendingPlanMessage
                       ? joinSections([item.content, pendingPlanDetails])
                       : item.content;
@@ -2903,6 +3124,14 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                       ) : (
                         <span className="haor-chat-inline-note">{approvalBlockedText}</span>
                       )
+                    ) : messageActions.length ? (
+                      <>
+                        {messageActions.map((action) => (
+                          <Button key={`${item.id}-${action.kind}-${action.label}`} size="small" onClick={() => void handleMessageAction(action, item.id)}>
+                            {action.label}
+                          </Button>
+                        ))}
+                      </>
                     ) : undefined;
 
                     return (

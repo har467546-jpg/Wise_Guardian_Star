@@ -55,10 +55,11 @@ function renderTaskSummary(value: Record<string, unknown>, record: TaskRun): str
     const executed = Number(execution?.executed_count ?? 0);
     const reverify = (value?.reverify || {}) as Record<string, unknown>;
     const boundary = String(execution?.execution_boundary || "-");
-    if (!success && !executed && !reverify?.reverify_task_id) {
+    const businessStatus = String(value?.business_status || execution?.business_status || "-");
+    if (!success && !executed && !reverify?.reverify_task_id && businessStatus === "-") {
       return "-";
     }
-    return `已执行:${executed} / 成功:${success} / 执行边界:${boundary} / 复测任务:${String(reverify?.reverify_task_id || "-")}`;
+    return `已执行:${executed} / 成功:${success} / 执行边界:${boundary} / 业务状态:${businessStatus} / 复测任务:${String((value?.reverify_task_id as string) || reverify?.reverify_task_id || "-")}`;
   }
   if (record.task_type === "runner_install") {
     const install = (value?.install || {}) as Record<string, unknown>;

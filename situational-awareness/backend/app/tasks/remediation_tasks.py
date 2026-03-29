@@ -3,8 +3,18 @@ from __future__ import annotations
 from celery import Task
 
 from app.core.celery_app import celery_app
+from app.db.models.asset import Asset
 from app.db.session import SessionLocal
 from app.repositories.task_repo import get_task_run
+from app.services.remediation_business_service import (
+    BUSINESS_STATUS_VERIFIED_FAILED,
+    build_business_status_message,
+    build_reverify_failure_summary,
+    build_reverify_outcome,
+    finalize_remediation_business_outcome,
+    run_inline_collection,
+    run_inline_rescan,
+)
 from app.services.remediation_executor import run_remediation_execution
 from app.services.remediation_session_service import process_remediation_session_ai_generation
 from app.tasks.task_runtime import (
@@ -16,6 +26,7 @@ from app.tasks.task_runtime import (
     set_task_success,
     tracked_task,
 )
+from app.tasks.risk_tasks import execute_risk_evaluation
 from app.db.models.risk_finding import RiskFinding
 
 
@@ -76,6 +87,140 @@ def run_remediation_execute_task(
         if self.request.retries < self.max_retries:
             set_task_retry(task_run_id, self.request.retries + 1, str(exc))
             raise self.retry(exc=exc, countdown=3)
+        failure_message = str(exc).strip() or "交互式漏洞修复失败"
+        set_task_failure(task_run_id, self.request.retries, failure_message)
+        raise
+    return task_run_id
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.remediation_tasks.run_remediation_reverify_task",
+    max_retries=0,
+)
+def run_remediation_reverify_task(
+    self: Task,
+    task_run_id: str,
+    remediation_task_id: str,
+    asset_id: str,
+    followup_payload: dict | None = None,
+) -> str:
+    payload = followup_payload if isinstance(followup_payload, dict) else {}
+    stage_name = str(payload.get("stage_name") or "").strip() or None
+    scan_summary: dict | None = None
+    collection_summary: dict | None = None
+    verification_summary: dict | None = None
+    try:
+        with tracked_task(task_run_id, celery_task_id=self.request.id, retry_count=self.request.retries):
+            ensure_task_not_canceled(task_run_id)
+            set_task_progress(
+                task_run_id,
+                8,
+                "载入修复后业务复验上下文",
+                {
+                    "asset_id": asset_id,
+                    "remediation_task_id": remediation_task_id,
+                    "stage_code": payload.get("stage_code"),
+                },
+                stage_code="load_reverify_context",
+                stage_name="载入上下文",
+            )
+            with SessionLocal() as db:
+                asset = db.get(Asset, asset_id)
+                if asset is None:
+                    raise RuntimeError("资产不存在")
+                asset_label = f"{asset.hostname or asset.ip}"
+
+            if bool(payload.get("requires_rescan")):
+                ensure_task_not_canceled(task_run_id)
+                set_task_progress(
+                    task_run_id,
+                    28,
+                    "执行修复后重扫",
+                    {"asset_id": asset_id, "asset_label": asset_label},
+                    stage_code="rescan_after_remediation",
+                    stage_name="修复后重扫",
+                )
+                scan_summary = run_inline_rescan(asset)
+                if scan_summary.get("status") != "success":
+                    raise RuntimeError(str(scan_summary.get("error") or "修复后重扫失败"))
+
+            if bool(payload.get("requires_recollect")):
+                ensure_task_not_canceled(task_run_id)
+                set_task_progress(
+                    task_run_id,
+                    56,
+                    "执行修复后重采集",
+                    {"asset_id": asset_id, "asset_label": asset_label},
+                    stage_code="recollect_after_remediation",
+                    stage_name="修复后重采集",
+                )
+                collection_summary = run_inline_collection(asset_id)
+                if collection_summary.get("status") not in {"success", "partial"}:
+                    raise RuntimeError(str(collection_summary.get("error") or "修复后重采集失败"))
+
+            ensure_task_not_canceled(task_run_id)
+            set_task_progress(
+                task_run_id,
+                82,
+                "重新验证目标风险",
+                {"asset_id": asset_id, "asset_label": asset_label},
+                stage_code="reverify_targeted_findings",
+                stage_name="目标风险复验",
+            )
+            verification_summary = execute_risk_evaluation(asset_id)
+            with SessionLocal() as db:
+                business_status, reverify_summary, targeted_finding_outcomes = build_reverify_outcome(
+                    db,
+                    asset_id=asset_id,
+                    followup_payload=payload,
+                    scan_summary=scan_summary,
+                    collection_summary=collection_summary,
+                    verification_summary=verification_summary,
+                )
+                final_message = build_business_status_message(business_status, stage_name=stage_name)
+                finalize_remediation_business_outcome(
+                    db,
+                    remediation_task_id=remediation_task_id,
+                    reverify_task_id=task_run_id,
+                    business_status=business_status,
+                    reverify_status="success",
+                    reverify_summary=reverify_summary,
+                    targeted_finding_outcomes=targeted_finding_outcomes,
+                    message=final_message,
+                )
+            set_task_success(
+                task_run_id,
+                final_message,
+                {
+                    "asset_id": asset_id,
+                    "remediation_task_id": remediation_task_id,
+                    "business_status": business_status,
+                    "reverify_summary": reverify_summary,
+                    "targeted_finding_outcomes": targeted_finding_outcomes,
+                },
+            )
+    except TaskCanceledError:
+        return task_run_id
+    except Exception as exc:
+        failure_message = build_business_status_message(BUSINESS_STATUS_VERIFIED_FAILED, stage_name=stage_name)
+        with SessionLocal() as db:
+            finalize_remediation_business_outcome(
+                db,
+                remediation_task_id=remediation_task_id,
+                reverify_task_id=task_run_id,
+                business_status=BUSINESS_STATUS_VERIFIED_FAILED,
+                reverify_status="failure",
+                reverify_summary=build_reverify_failure_summary(
+                    followup_payload=payload,
+                    error_message=str(exc),
+                    scan_summary=scan_summary,
+                    collection_summary=collection_summary,
+                    verification_summary=verification_summary,
+                ),
+                targeted_finding_outcomes=[],
+                message=failure_message,
+            )
         set_task_failure(task_run_id, self.request.retries, str(exc))
         raise
     return task_run_id

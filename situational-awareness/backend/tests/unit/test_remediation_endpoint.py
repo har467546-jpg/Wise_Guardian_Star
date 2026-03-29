@@ -986,7 +986,12 @@ def test_remediation_task_endpoint_accepts_runner_dispatch_boundary(tmp_path) ->
                 message="等待 Runner 接单",
                 result_json={
                     "context": {"asset_id": asset_id},
-                    "execution": {"execution_boundary": "runner_dispatch"},
+                    "execution": {"execution_boundary": "runner_dispatch", "execution_status": "succeeded", "business_status": "verified_partial"},
+                    "execution_status": "succeeded",
+                    "business_status": "verified_partial",
+                    "reverify_task_id": "reverify-task-1",
+                    "reverify_summary": {"open_target_count": 1, "closed_target_count": 0},
+                    "targeted_finding_outcomes": [{"rule_id": "apache.webdav.enabled", "status": "open"}],
                 },
             )
         )
@@ -995,7 +1000,13 @@ def test_remediation_task_endpoint_accepts_runner_dispatch_boundary(tmp_path) ->
     response = client.get(f"/api/v1/remediation/tasks/{task_id}")
 
     assert response.status_code == 200
-    assert response.json()["execution_boundary"] == "runner_dispatch"
+    body = response.json()
+    assert body["execution_boundary"] == "runner_dispatch"
+    assert body["execution_status"] == "succeeded"
+    assert body["business_status"] == "verified_partial"
+    assert body["reverify_task_id"] == "reverify-task-1"
+    assert body["reverify_summary"]["open_target_count"] == 1
+    assert body["targeted_finding_outcomes"][0]["status"] == "open"
 
 
 def test_runner_install_endpoint_queues_task(monkeypatch, tmp_path) -> None:

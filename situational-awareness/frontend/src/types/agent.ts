@@ -178,6 +178,13 @@ export type AgentPendingSecureInput = {
   blocker_summary?: string | null;
 };
 
+export type AgentMessageActionSuggestion = {
+  kind: string;
+  label: string;
+  message_text?: string | null;
+  pathname?: string | null;
+};
+
 export type AgentAttentionKind = "none" | "waiting_approval" | "running_task" | "pending_ui_action";
 
 export type AgentSessionSummary = {

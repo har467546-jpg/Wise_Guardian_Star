@@ -30,6 +30,7 @@ from app.schemas.remediation import (
     RemediationWorkspaceFindingRead,
     RemediationWorkspaceRead,
 )
+from app.services.admin_cidr_service import get_admin_cidrs
 
 PROBE_SNAPSHOT_TYPE = "ssh_probe_baseline"
 NETWORK_INITIAL_SNAPSHOT_TYPE = "network_initial"
@@ -289,6 +290,7 @@ _ACTION_ADAPTER_CONTRACTS: dict[str, dict[str, Any]] = {
         "evidence_items": ["permission_snapshot_before", "command_preview", "permission_snapshot_after", "reverify_result"],
     },
 }
+_EXPLICIT_ADMIN_CIDR_SERVICES = {"samba"}
 
 
 def get_manual_credential(db: Session, asset_id: str) -> SSHCredential | None:
@@ -1123,6 +1125,14 @@ class RemediationCommandPlanner:
         config_key = str(params.get("config_key") or "").strip().lower()
         rule_id = str(params.get("rule_id") or _yaml_rule_id(self.finding) or "").strip()
         target_scope = str(params.get("target_scope") or "admin_segment_only").strip().lower()
+        if target_scope == "admin_segment_only" and service_name in _EXPLICIT_ADMIN_CIDR_SERVICES and not get_admin_cidrs():
+            return self._blocked_step(
+                step_id,
+                action_type,
+                title,
+                requires_confirmation,
+                "缺少管理网段配置，当前无法稳定收敛到管理网段",
+            )
         source_files = self._resolve_source_files(service_name)
         if not source_files:
             return self._blocked_step(step_id, action_type, title, requires_confirmation, "未解析到可用于收敛网络暴露面的稳定配置文件")
@@ -2429,11 +2439,13 @@ def _render_network_command(*, service_name: str, config_key: str, rule_id: str,
     if service_name == "docker" and (config_key == "tcp_listener_without_tlsverify" or "docker" in normalized_rule_id):
         return _build_docker_remove_tcp_listener_command(source_files)
     if service_name == "samba" and target_scope == "admin_segment_only":
+        admin_cidrs = get_admin_cidrs()
+        allow_tokens = ["127.0.0.1", "::1", *admin_cidrs]
         return _build_ini_section_directive_command(
             source_files=source_files,
             section_name="global",
             directives={
-                "hosts allow": "127.0.0.1 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7",
+                "hosts allow": " ".join(dict.fromkeys([item for item in allow_tokens if item])),
                 "hosts deny": "0.0.0.0/0 ::/0",
             },
             validate_command=None,

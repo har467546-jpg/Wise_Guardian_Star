@@ -7,6 +7,10 @@ from typing import Any
 from app.utils.sanitize import sanitize_json_value, sanitize_text
 
 CIDR_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b")
+MAINTENANCE_WINDOW_PATTERN = re.compile(
+    r"(?:maintenance_window_id|维护窗口(?:id|编号)?)\s*(?:是|为|=|:|：)\s*([A-Za-z0-9][A-Za-z0-9._-]{1,126})",
+    re.IGNORECASE,
+)
 
 PLAYBOOK_SCAN_AND_ANALYZE_CIDR = "scan_and_analyze_cidr"
 PLAYBOOK_ANALYZE_ASSET_RISKS = "analyze_asset_risks"
@@ -149,6 +153,13 @@ def _extract_cidr(value: str) -> str | None:
     if not match:
         return None
     return sanitize_text(match.group(0), max_length=64, single_line=True) or None
+
+
+def _extract_maintenance_window_id(value: str) -> str | None:
+    match = MAINTENANCE_WINDOW_PATTERN.search(value)
+    if not match:
+        return None
+    return sanitize_text(match.group(1), max_length=128, single_line=True) or None
 
 
 def _contains_any(content: str, markers: tuple[str, ...]) -> bool:
@@ -424,22 +435,34 @@ def _playbook_install_runner(content: str, *, page_context: dict[str, Any], work
 
 def _playbook_start_remediation_session(content: str, *, page_context: dict[str, Any], working_context: dict[str, Any]) -> AgentPlaybookDecision | None:
     asset_id = _asset_id_from_context(page_context, working_context)
-    if not asset_id or not _contains_any(content, ("修复", "整改", "修补", "恢复修复")):
+    maintenance_window_id = _extract_maintenance_window_id(content)
+    if not asset_id or (not _contains_any(content, ("修复", "整改", "修补", "恢复修复")) and not maintenance_window_id):
         return None
+    params: dict[str, Any] = {"asset_id": asset_id, "submit_if_ready": True}
+    if maintenance_window_id:
+        params["maintenance_window_id"] = maintenance_window_id
+    reply_markdown = (
+        f"我已为资产 {asset_id} 准备修复计划。"
+        "确认后，如果当前修复条件已满足，我会直接提交自动修复；"
+        "如果条件不足，我会只创建修复会话并明确告诉你阻塞原因。"
+    )
+    reason = "用户已明确要求推进当前资产修复。"
+    if maintenance_window_id:
+        reply_markdown = (
+            f"我已记录 maintenance_window_id={maintenance_window_id}，并为资产 {asset_id} 准备修复计划。"
+            "确认后，我会带着这个维护窗口继续自动修复；如果仍有其他条件不足，我会明确告诉你阻塞原因。"
+        )
+        reason = f"用户已补充 maintenance_window_id={maintenance_window_id}，要求继续自动修复。"
     return AgentPlaybookDecision(
         playbook_id=PLAYBOOK_START_REMEDIATION_SESSION,
         objective=f"为资产 {asset_id} 准备修复会话",
-        reply_markdown=(
-            f"我已为资产 {asset_id} 准备修复计划。"
-            "确认后，如果当前修复条件已满足，我会直接提交自动修复；"
-            "如果条件不足，我会只创建修复会话并明确告诉你阻塞原因。"
-        ),
+        reply_markdown=reply_markdown,
         proposed_write_actions=[
             {
                 "action_type": "create_or_resume_remediation_session",
                 "title": f"为资产 {asset_id} 准备修复会话",
-                "reason": "用户已明确要求推进当前资产修复。",
-                "params": {"asset_id": asset_id, "submit_if_ready": True},
+                "reason": reason,
+                "params": params,
             }
         ],
         needs_confirmation=True,

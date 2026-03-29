@@ -84,7 +84,7 @@ def test_create_or_resume_remediation_auto_submits_when_ready(monkeypatch) -> No
         ),
     )
 
-    def _approve_remediation_session(db, session_id, approved_by):  # type: ignore[no-untyped-def]
+    def _approve_remediation_session(db, session_id, approved_by, **kwargs):  # type: ignore[no-untyped-def]
         observed["approved_by"] = approved_by
         return SimpleNamespace(task_id="remediation-task-1")
 
@@ -113,8 +113,13 @@ def test_create_or_resume_remediation_auto_submits_when_ready(monkeypatch) -> No
         "execution_ready": True,
         "blocked_reasons": [],
         "blocker_codes": [],
+        "blocker_categories": [],
         "blockers": [],
         "submitted_task_id": "remediation-task-1",
+        "stage_code": None,
+        "execution_mode": "apply",
+        "change_ticket": None,
+        "maintenance_window_id": None,
     }
     assert observed["approved_by"] == "user-1"
     assert "直接提交自动修复任务 remediation-task-1" in result.summary
@@ -158,10 +163,12 @@ def test_create_or_resume_remediation_returns_blockers_without_submitting(monkey
         "execution_ready": False,
         "blocked_reasons": ["当前主机尚未安装 Host Runner"],
         "blocker_codes": ["runner_not_installed"],
+        "blocker_categories": ["runner"],
         "blockers": [
             {
                 "code": "runner_not_installed",
                 "message": "当前主机尚未安装 Host Runner",
+                "blocker_category": "runner",
                 "scope": None,
                 "blocking": None,
                 "stage_code": None,
@@ -226,10 +233,12 @@ def test_create_or_resume_remediation_prefers_structured_plan_blockers(monkeypat
     )
 
     assert result.payload["blocker_codes"] == ["missing_ssh_credential", "runner_not_installed"]
+    assert result.payload["blocker_categories"] == ["ssh", "runner"]
     assert result.payload["blockers"] == [
         {
             "code": "missing_ssh_credential",
             "message": "当前自动修复仍缺少 SSH 管理员凭据",
+            "blocker_category": "ssh",
             "scope": "asset",
             "blocking": "hard",
             "stage_code": "preflight",
@@ -238,6 +247,7 @@ def test_create_or_resume_remediation_prefers_structured_plan_blockers(monkeypat
         {
             "code": "runner_not_installed",
             "message": "当前主机尚未安装 Host Runner",
+            "blocker_category": "runner",
             "scope": "asset",
             "blocking": "hard",
             "stage_code": None,
@@ -246,10 +256,53 @@ def test_create_or_resume_remediation_prefers_structured_plan_blockers(monkeypat
     ]
 
 
+def test_create_or_resume_remediation_marks_render_blockers(monkeypatch) -> None:
+    monkeypatch.setattr(
+        execution_registry,
+        "create_or_resume_remediation_session",
+        lambda db, asset_id: SimpleNamespace(
+            session_id="session-render-1",
+            plan=SimpleNamespace(
+                execution_ready=False,
+                blocked_reasons=["未识别到稳定的软件包管理器或包名"],
+            ),
+        ),
+    )
+
+    context = execution_registry.AgentActionExecutorContext(
+        db=_UserLookupDB({"user-1"}),
+        session_user_id="user-1",
+        platform_url="http://localhost:3000",
+        get_manual_credential=lambda *_args, **_kwargs: None,
+    )
+
+    result = execution_registry.execute_registered_action(
+        context,
+        action={
+            "action_type": "create_or_resume_remediation_session",
+            "params": {"asset_id": "asset-1", "submit_if_ready": True},
+        },
+    )
+
+    assert result.payload["blocker_codes"] == ["unstable_render"]
+    assert result.payload["blocker_categories"] == ["render"]
+    assert result.payload["blockers"] == [
+        {
+            "code": "unstable_render",
+            "message": "未识别到稳定的软件包管理器或包名",
+            "blocker_category": "render",
+            "scope": None,
+            "blocking": None,
+            "stage_code": None,
+            "step_id": None,
+        }
+    ]
+
+
 def test_approve_remediation_uses_session_user_id(monkeypatch) -> None:
     observed: dict[str, str] = {}
 
-    def _approve_remediation_session(db, session_id, approved_by):  # type: ignore[no-untyped-def]
+    def _approve_remediation_session(db, session_id, approved_by, **kwargs):  # type: ignore[no-untyped-def]
         observed["session_id"] = session_id
         observed["approved_by"] = approved_by
         return SimpleNamespace(task_id="remediation-task-9")
@@ -271,6 +324,85 @@ def test_approve_remediation_uses_session_user_id(monkeypatch) -> None:
     assert result.status == "queued"
     assert result.child_task_id == "remediation-task-9"
     assert observed == {"session_id": "session-9", "approved_by": "user-9"}
+
+
+def test_approve_remediation_returns_blocked_result_when_maintenance_window_required(monkeypatch) -> None:
+    class _RemediationLookupDB(_UserLookupDB):
+        def get(self, model, value):
+            if model is execution_registry.RemediationSession and value == "session-9":
+                return SimpleNamespace(id="session-9", asset_id="asset-1")
+            return super().get(model, value)
+
+    monkeypatch.setattr(
+        execution_registry,
+        "approve_remediation_session",
+        lambda db, session_id, approved_by, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("当前阶段包含高风险步骤，请先填写 maintenance_window_id 后再正式执行")
+        ),
+    )
+
+    context = execution_registry.AgentActionExecutorContext(
+        db=_RemediationLookupDB({"user-9"}),
+        session_user_id="user-9",
+        platform_url="http://localhost:3000",
+        get_manual_credential=lambda *_args, **_kwargs: None,
+    )
+
+    result = execution_registry.execute_registered_action(
+        context,
+        action={"action_type": "approve_remediation_session", "params": {"session_id": "session-9"}},
+    )
+
+    assert result.status == "success"
+    assert result.child_task_id is None
+    assert "maintenance_window_id" in result.summary
+    assert result.payload["asset_id"] == "asset-1"
+    assert result.payload["blocker_codes"] == ["maintenance_window_required"]
+    assert result.payload["blocker_categories"] == ["policy"]
+
+
+def test_create_or_resume_remediation_auto_submit_returns_blocked_result_when_maintenance_window_required(monkeypatch) -> None:
+    monkeypatch.setattr(
+        execution_registry,
+        "create_or_resume_remediation_session",
+        lambda db, asset_id: SimpleNamespace(
+            session_id="session-10",
+            plan=SimpleNamespace(
+                execution_ready=True,
+                blocked_reasons=[],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        execution_registry,
+        "approve_remediation_session",
+        lambda db, session_id, approved_by, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("当前阶段包含高风险步骤，请先填写 maintenance_window_id 后再正式执行")
+        ),
+    )
+
+    context = execution_registry.AgentActionExecutorContext(
+        db=_UserLookupDB({"user-10"}),
+        session_user_id="user-10",
+        platform_url="http://localhost:3000",
+        get_manual_credential=lambda *_args, **_kwargs: None,
+    )
+
+    result = execution_registry.execute_registered_action(
+        context,
+        action={
+            "action_type": "create_or_resume_remediation_session",
+            "params": {"asset_id": "asset-1", "submit_if_ready": True},
+        },
+    )
+
+    assert result.status == "success"
+    assert result.child_task_id is None
+    assert "maintenance_window_id" in result.summary
+    assert result.payload["asset_id"] == "asset-1"
+    assert result.payload["session_id"] == "session-10"
+    assert result.payload["blocker_codes"] == ["maintenance_window_required"]
+    assert result.payload["blocker_categories"] == ["policy"]
 
 
 def test_create_or_resume_remediation_rejects_empty_session_user_id(monkeypatch) -> None:

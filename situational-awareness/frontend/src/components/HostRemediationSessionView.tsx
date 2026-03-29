@@ -22,7 +22,11 @@ import CollapsibleJsonBlock from "@/components/CollapsibleJsonBlock";
 import DesktopPageHeader from "@/components/DesktopPageHeader";
 import StatusTag from "@/components/StatusTag";
 import { getStoredToken } from "@/lib/auth";
-import { buildRemediationAssetPath } from "@/lib/remediation";
+import {
+  buildRemediationAssetPath,
+  remediationBusinessStatusLabel,
+  remediationExecutionStatusLabel,
+} from "@/lib/remediation";
 import { formatDateTime, getTaskEventTypeLabel, localizeTaskMessage } from "@/lib/ui-text";
 import {
   approveRemediationSession,
@@ -99,6 +103,21 @@ function workbenchStatusTone(status: string | null | undefined): "neutral" | "ac
       return "warning";
     default:
       return "neutral";
+  }
+}
+
+function remediationBusinessStatusColor(value: string | null | undefined): string {
+  switch ((value || "").trim().toLowerCase()) {
+    case "verified_closed":
+      return "green";
+    case "pending_reverify":
+      return "blue";
+    case "verified_partial":
+      return "orange";
+    case "verified_failed":
+      return "red";
+    default:
+      return "default";
   }
 }
 
@@ -874,7 +893,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
       ? "步骤：仅可执行"
       : "步骤：仅阻塞";
   const taskOutputSummary = task
-    ? localizeTaskMessage(task.message) || `当前任务状态：${task.status}`
+    ? `${localizeTaskMessage(task.message) || `当前任务状态：${task.status}`}${task.business_status ? ` · ${remediationBusinessStatusLabel(task.business_status)}` : ""}`
     : activeTaskId
       ? `已关联任务 ${activeTaskId}`
       : "当前暂无任务输出";
@@ -1051,6 +1070,11 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
               <Tag color={stageGateColor(stage.gate_status)}>{stageGateLabel(stage.gate_status)}</Tag>
               <Tag color="green">可执行 {stage.ready_step_count}</Tag>
               {stage.blocked_step_count ? <Tag color="orange">阻塞 {stage.blocked_step_count}</Tag> : null}
+              {stage.business_status ? (
+                <Tag color={remediationBusinessStatusColor(stage.business_status)}>
+                  {remediationBusinessStatusLabel(stage.business_status)}
+                </Tag>
+              ) : null}
             </Space>
             <Typography.Text type="secondary" className="ui-detail-wrap">
               {stage.summary}
@@ -1065,6 +1089,8 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
           {stage.related_services.length ? <Tag>{`服务：${stage.related_services.join("、")}`}</Tag> : null}
           <Tag>{`${stage.related_finding_ids.length} 条关联风险`}</Tag>
           <Tag>{`${stage.filtered_steps.length} 个匹配步骤`}</Tag>
+          {stage.targeted_rule_ids.length ? <Tag>{`目标规则 ${stage.targeted_rule_ids.length}`}</Tag> : null}
+          {stage.business_status ? <Tag>{`已关闭 ${stage.closed_target_count} / 仍开放 ${stage.open_target_count}`}</Tag> : null}
         </div>
 
         {stage.global_blockers.length ? (
@@ -1865,15 +1891,33 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                           <StatusTag value={task.status} />
                           <Typography.Text>{executionBoundaryLabel(task.execution_boundary)}</Typography.Text>
                           <Tag>{executionModeLabel(task.execution_mode)}</Tag>
+                          <Tag>{remediationExecutionStatusLabel(task.execution_status)}</Tag>
+                          {task.business_status ? (
+                            <Tag color={remediationBusinessStatusColor(task.business_status)}>
+                              {remediationBusinessStatusLabel(task.business_status)}
+                            </Tag>
+                          ) : null}
                         </Space>
                       </Descriptions.Item>
                       <Descriptions.Item label="进度">{task.progress}%</Descriptions.Item>
                       <Descriptions.Item label="最近消息">{localizeTaskMessage(task.message)}</Descriptions.Item>
                       <Descriptions.Item label="开始时间">{formatDateTime(task.started_at)}</Descriptions.Item>
                       <Descriptions.Item label="完成时间">{formatDateTime(task.finished_at)}</Descriptions.Item>
-                      <Descriptions.Item label="自动复测">{String(toRecord(task.reverify).reverify_task_id || "-")}</Descriptions.Item>
+                      <Descriptions.Item label="自动复测">{String(task.reverify_task_id || toRecord(task.reverify).reverify_task_id || "-")}</Descriptions.Item>
+                      {task.business_status ? (
+                        <Descriptions.Item label="业务闭环">{remediationBusinessStatusLabel(task.business_status)}</Descriptions.Item>
+                      ) : null}
                       <Descriptions.Item label="证据条目">{taskEvidence?.item_count || 0}</Descriptions.Item>
                     </Descriptions>
+
+                    {Object.keys(task.reverify_summary || {}).length ? (
+                      <Alert
+                        type={task.business_status === "verified_closed" ? "success" : task.business_status === "verified_failed" ? "error" : "info"}
+                        showIcon
+                        message={remediationBusinessStatusLabel(task.business_status)}
+                        description={localizeTaskMessage(task.message)}
+                      />
+                    ) : null}
 
                     <div className="remediation-workbench-task-stream">
                       <pre className="remediation-workbench-task-stream-pre">
@@ -1909,6 +1953,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                     <CollapsibleJsonBlock title="执行结果（JSON）" value={task.execution} />
                     <CollapsibleJsonBlock title={`执行证据（JSON）${taskEvidenceLoading ? " · 加载中" : ""}`} value={taskEvidence || {}} />
                     <CollapsibleJsonBlock title="自动复测（JSON）" value={task.reverify} />
+                    <CollapsibleJsonBlock title="业务复验（JSON）" value={task.reverify_summary} />
                   </Space>
                 ) : (
                   <div className="remediation-compact-empty">

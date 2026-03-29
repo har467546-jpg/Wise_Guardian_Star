@@ -21,13 +21,20 @@ from app.core.config import settings
 from app.core.crypto import decrypt_text
 from app.db.models.asset import Asset
 from app.db.models.credential import SSHCredential
-from app.db.models.enums import CredentialAuthType, TaskType
+from app.db.models.enums import CredentialAuthType
 from app.db.models.risk_finding import RiskFinding
-from app.repositories.task_repo import create_task_run, update_task_run
 from app.schemas.remediation import RemediationExecuteStepInput
+from app.services.remediation_business_service import (
+    BUSINESS_STATUS_PENDING_REVERIFY,
+    BUSINESS_STATUS_VERIFIED_FAILED,
+    EXECUTION_STATUS_FAILED,
+    EXECUTION_STATUS_PREVIEW_ONLY,
+    EXECUTION_STATUS_SUCCEEDED,
+    build_business_status_message,
+    queue_remediation_reverify,
+)
 from app.services.remediation_evidence_service import build_remediation_evidence
 from app.tasks.task_runtime import append_current_task_event, ensure_task_not_canceled
-from app.tasks.verify_tasks import run_risk_verify_task
 
 STREAM_LINE_LIMIT = 120
 STREAM_LINE_LENGTH_LIMIT = 800
@@ -373,41 +380,44 @@ def run_remediation_execution(
     )
     reverify = {"reverify_triggered": False, "reverify_task_id": None, "reverify_status": None}
     if _auto_reverify_enabled() and int(execution.get("success_count") or 0) > 0:
-        reverify_task = create_task_run(
+        reverify = queue_remediation_reverify(
             db,
-            task_type=TaskType.RISK_VERIFY,
-            scope_type="asset",
-            scope_id=asset.id,
-            message="风险验证任务已入队",
+            asset_id=asset.id,
+            remediation_task_id=task_run_id,
+            plan=plan,
+            selected_steps=selected_steps,
+            finding_id=finding.id,
         )
-        task = run_risk_verify_task.delay(reverify_task.id, asset.id)
-        update_task_run(db, reverify_task, celery_task_id=task.id)
-        reverify = {
-            "reverify_triggered": True,
-            "reverify_task_id": reverify_task.id,
-            "reverify_status": "pending",
-        }
         append_current_task_event(
             event_type="reverify",
             stage_code="auto_reverify",
             stage_name="自动复测",
-            message="修复后已自动触发风险复测",
+            message="修复后已自动触发业务复验",
             payload_json=reverify,
         )
     if int(execution.get("failed_count") or 0) > 0:
         overall_status = "apply_failed"
-        final_message = f"共有 {execution.get('failed_count')} 个修复步骤执行失败"
+        final_message = build_business_status_message(BUSINESS_STATUS_VERIFIED_FAILED)
+        execution_status = EXECUTION_STATUS_FAILED
+        business_status = BUSINESS_STATUS_VERIFIED_FAILED
     elif reverify.get("reverify_triggered"):
         overall_status = "applied_pending_reverify"
-        final_message = "修复命令已执行，自动复测已触发，等待复测结论"
+        final_message = build_business_status_message(BUSINESS_STATUS_PENDING_REVERIFY)
+        execution_status = EXECUTION_STATUS_SUCCEEDED
+        business_status = BUSINESS_STATUS_PENDING_REVERIFY
     else:
         overall_status = "applied"
         final_message = "修复命令已执行完成"
+        execution_status = EXECUTION_STATUS_SUCCEEDED
+        business_status = None
     execution["execution_mode"] = execution_mode
     execution["change_ticket"] = change_ticket
     execution["maintenance_window_id"] = maintenance_window_id
     execution["overall_status"] = overall_status
     execution["final_message"] = final_message
+    execution["execution_status"] = execution_status
+    if business_status:
+        execution["business_status"] = business_status
     evidence = build_remediation_evidence(
         task_id=task_run_id,
         plan=plan,
@@ -429,8 +439,13 @@ def run_remediation_execution(
         },
         "plan": plan,
         "execution": execution,
+        "execution_status": execution_status,
+        "business_status": business_status,
         "backups": execution.get("backup_map") or {},
         "reverify": reverify,
+        "reverify_task_id": reverify.get("reverify_task_id"),
+        "reverify_summary": {},
+        "targeted_finding_outcomes": [],
         "evidence": evidence,
     }
 
@@ -457,6 +472,7 @@ def build_remediation_preview_result(
         "skipped_count": 0,
         "overall_status": "preview_ready",
         "final_message": "修复预演已生成，尚未执行任何主机变更",
+        "execution_status": EXECUTION_STATUS_PREVIEW_ONLY,
         "change_ticket": change_ticket,
         "maintenance_window_id": maintenance_window_id,
         "stage_code": stage_code,
@@ -480,8 +496,13 @@ def build_remediation_preview_result(
         "context": dict(context),
         "plan": plan,
         "execution": execution,
+        "execution_status": EXECUTION_STATUS_PREVIEW_ONLY,
+        "business_status": None,
         "backups": {},
         "reverify": reverify,
+        "reverify_task_id": None,
+        "reverify_summary": {},
+        "targeted_finding_outcomes": [],
         "evidence": evidence,
     }
 

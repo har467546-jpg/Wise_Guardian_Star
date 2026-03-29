@@ -189,8 +189,12 @@ def test_get_haor_session_summary_returns_none_when_session_missing(monkeypatch)
         "has_attention": False,
         "attention_kind": "none",
         "session_status": None,
+        "runtime_phase": "idle",
+        "input_state": "enabled",
+        "input_block_reason": "none",
         "current_goal_id": None,
         "current_goal_title": None,
+        "active_skill_title": None,
         "last_task_id": None,
         "updated_at": None,
     }
@@ -807,7 +811,7 @@ def test_post_haor_message_falls_back_to_scan_when_model_returns_non_json(monkey
     monkeypatch.setattr(
         haor_agent_service,
         "_build_runtime_provider",
-        lambda: SimpleNamespace(provider=_FakeProvider()),
+        lambda **kwargs: SimpleNamespace(provider=_FakeProvider()),
     )
     monkeypatch.setattr(
         haor_agent_service.run_asset_scan_task,
@@ -1632,7 +1636,7 @@ def test_get_haor_session_reconciles_stale_running_agent_task(monkeypatch) -> No
     assert body["messages"][-1]["payload_json"]["interrupted"] is True
 
 
-def test_post_haor_message_returns_409_when_agent_orchestrate_task_is_running(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_post_haor_message_allows_continue_when_only_watch_task_is_running(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, user_id = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
 
@@ -1662,8 +1666,10 @@ def test_post_haor_message_returns_409_when_agent_orchestrate_task_is_running(mo
         },
     )
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "当前 haor 正在执行编排任务，请先中断当前任务"
+    assert response.status_code == 200
+    body = response.json()
+    assert body["runtime_snapshot"]["input_state"] == "enabled"
+    assert body["runtime_snapshot"]["input_block_reason"] == "none"
 
 
 def test_reset_haor_session_interrupts_running_task_and_creates_new_session(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1874,6 +1880,73 @@ def test_soft_focus_is_not_rebound_by_page_change_without_reference(monkeypatch)
     body = second.json()
     assert body["working_context_json"]["asset_id"] == "asset-1"
     assert "资产 asset-1" in body["messages"][-1]["content"]
+
+
+def test_message_asset_ip_reference_is_canonicalized_to_real_asset_id(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, _ = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "mock")
+
+    with SessionLocal() as db:
+        db.add(Asset(id="asset-1", ip="192.168.130.138", hostname="metasploit", status=AssetStatus.ONLINE))
+        db.commit()
+
+    browser_context = {
+        **_browser_context(pathname="/assets/asset-1", asset_id="asset-1"),
+        "semantic_page_context": {
+            "page_kind": "asset_detail",
+            "primary_entity": {
+                "kind": "asset",
+                "id": "asset-1",
+                "label": "192.168.130.138",
+                "status": "online",
+            },
+            "secondary_entities": [],
+            "visible_sections": [],
+            "semantic_actions": [],
+            "semantic_forms": [],
+            "active_dialog": {},
+            "selected_rows": [],
+            "summary": "Asset detail for 192.168.130.138",
+        },
+        "summary_json": {
+            "page_kind": "asset_detail",
+            "primary_entity": {
+                "kind": "asset",
+                "id": "asset-1",
+                "label": "192.168.130.138",
+                "status": "online",
+            },
+            "secondary_entities": [],
+            "visible_sections": [],
+            "top_semantic_actions": [],
+            "selected_rows": [],
+            "active_dialog": {},
+            "has_modal_or_drawer": True,
+            "summary": "Asset detail for 192.168.130.138",
+        },
+    }
+
+    first = client.post(
+        "/api/v1/agent/haor/session/messages",
+        json={
+            "content": "请围绕资产 192.168.130.138 做闭环测试",
+            "page_context": _page_context(pathname="/assets/asset-1", asset_id="asset-1"),
+            "browser_context": browser_context,
+        },
+    )
+    second = client.post(
+        "/api/v1/agent/haor/session/messages",
+        json={
+            "content": "继续",
+            "page_context": _page_context(pathname="/"),
+        },
+    )
+
+    assert first.status_code == 200
+    assert first.json()["working_context_json"]["asset_id"] == "asset-1"
+    assert second.status_code == 200
+    assert second.json()["working_context_json"]["asset_id"] == "asset-1"
 
 
 def test_soft_focus_allows_switching_target_in_same_session(monkeypatch) -> None:  # type: ignore[no-untyped-def]

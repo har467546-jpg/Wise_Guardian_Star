@@ -100,6 +100,7 @@ from app.services.remediation_session_service import (
     get_remediation_session_read,
 )
 from app.services.task_observability_service import serialize_task_detail, serialize_task_event
+from app.tasks.collect_tasks import run_asset_collect_task
 from app.tasks.scan_tasks import run_asset_scan_task
 from app.utils.local_asset import resolve_local_asset
 from app.utils.net import normalize_cidr
@@ -152,6 +153,16 @@ SSH_CREDENTIAL_BLOCKER_CODES = {
     "authorization_unconfirmed",
     "authorization_not_verified",
     "insufficient_privilege",
+}
+RUNNER_BLOCKER_CODES = {
+    "runner_not_installed",
+    "runner_installing",
+    "runner_offline",
+}
+RENDER_BLOCKER_CODES = {
+    "unstable_render",
+    "missing_target",
+    "missing_adapter",
 }
 ACTION_POLICY_REGISTRY: dict[str, dict[str, Any]] = {
     "create_discovery_job": {
@@ -1077,6 +1088,58 @@ def _working_context_primary_target(context: dict[str, Any] | None) -> dict[str,
     return _normalize_focus_target(payload)
 
 
+def _canonicalize_working_context_asset_targets(
+    db: Session,
+    working_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    normalized = _normalize_working_context(working_context)
+    if not normalized:
+        return {}
+
+    primary_target = _working_context_primary_target(normalized)
+    asset_reference = _sanitize_line(
+        str(primary_target.get("asset_id") or normalized.get("asset_id") or ""),
+        max_length=96,
+    )
+    if not asset_reference:
+        return normalized
+
+    asset = _resolve_asset_for_read_tool(db, asset_reference)
+    if asset is None:
+        return normalized
+
+    asset_display = str(getattr(asset, "ip", None) or getattr(asset, "hostname", None) or asset.id)
+    canonical_summary = f"资产 {asset_display}"
+
+    def _canonicalize_target(target: dict[str, Any]) -> dict[str, Any]:
+        candidate = _normalize_focus_target(target)
+        if not candidate:
+            return {}
+        if str(candidate.get("asset_id") or "").strip() != asset_reference:
+            return candidate
+        if not candidate.get("summary") or candidate.get("summary") == f"资产 {asset_reference}":
+            candidate["summary"] = canonical_summary
+        candidate["asset_id"] = asset.id
+        candidate["target_type"] = "asset"
+        return candidate
+
+    canonical_primary = _canonicalize_target(primary_target) or primary_target
+    canonical_recent: list[dict[str, Any]] = []
+    for item in _normalize_recent_targets(normalized.get("recent_targets")):
+        canonical_item = _canonicalize_target(item) or item
+        canonical_recent.append(canonical_item)
+
+    payload = {
+        **normalized,
+        "asset_id": asset.id,
+        "primary_target": canonical_primary,
+        "recent_targets": canonical_recent,
+    }
+    if not payload.get("summary") or payload.get("summary") == f"资产 {asset_reference}":
+        payload["summary"] = canonical_summary
+    return _normalize_working_context(payload)
+
+
 def _merge_soft_focus_context(
     current_context: dict[str, Any] | None,
     next_target: dict[str, Any] | None,
@@ -1228,6 +1291,14 @@ def _latest_resume_hint(session: AgentSession | Any | None) -> dict[str, Any]:
         if normalized:
             return normalized
     return {}
+
+
+def _should_skip_preflight_clarification(
+    content: str,
+    *,
+    session: AgentSession | Any | None,
+) -> bool:
+    return _content_prefers_resume_hint_read(content, recent_resume_hint=_latest_resume_hint(session))
 
 
 def _build_working_context_from_page_context(page_context: dict[str, Any], *, source: str) -> dict[str, Any]:
@@ -3395,6 +3466,7 @@ def append_agent_task_message(
     content: str,
     payload_json: dict[str, Any] | None = None,
     message_type: str = "task_update",
+    watching: bool | None = False,
 ) -> None:
     session = db.get(AgentSession, session_id)
     if session is None:
@@ -3432,13 +3504,17 @@ def append_agent_task_message(
     ) or None
     if task_id:
         session.last_task_id = task_id
+    if watching is True:
+        session.status = "running"
+    elif session.status == "running":
+        session.status = "active"
     state_delta = sync_agent_task_watch_state(
         session,
         task_id=task_id,
         status=child_task.get("status") or ("failure" if message_type == "error" else "success"),
         message=content,
         action=normalized_payload.get("action") if isinstance(normalized_payload.get("action"), dict) else {},
-        watching=False,
+        watching=watching,
     )
     _append_message(
         db,
@@ -3942,18 +4018,51 @@ def _build_running_task_conflict_decision(*, task_id: str | None) -> _AgentModel
     )
 
 
-def _build_short_resume_fallback_decision(
+def _content_prefers_resume_hint_read(
+    content: str,
+    *,
+    recent_resume_hint: dict[str, Any],
+) -> bool:
+    normalized = sanitize_text(content, max_length=160, single_line=True) or ""
+    if not normalized or not recent_resume_hint:
+        return False
+    if normalized in _SHORT_FOLLOWUP_AFFIRM_MARKERS:
+        return True
+
+    suggested_reply_label = sanitize_text(
+        str(recent_resume_hint.get("suggested_reply_label") or ""),
+        max_length=80,
+        single_line=True,
+    ) or ""
+    normalized_compact = re.sub(r"\s+", "", normalized)
+    suggested_compact = re.sub(r"\s+", "", suggested_reply_label)
+    if suggested_compact and suggested_compact in normalized_compact:
+        return True
+
+    if "maintenance_window_id" in normalized.lower() or "维护窗口" in normalized:
+        return False
+
+    review_markers = ("复盘", "结果", "状态", "详情", "进度")
+    resume_verbs = ("继续", "接着", "看看", "查看", "分析", "告诉我", "复盘", "看")
+    return any(marker in normalized for marker in review_markers) and any(marker in normalized for marker in resume_verbs)
+
+
+def _build_resume_hint_read_decision(
     *,
     content: str,
     session: AgentSession | Any | None,
     working_context: dict[str, Any],
     tool_traces: list[dict[str, Any]],
+    allow_extended_resume: bool = False,
 ) -> _AgentModelDecision | None:
-    normalized = sanitize_text(content, max_length=80, single_line=True) or ""
-    if normalized not in _SHORT_FOLLOWUP_AFFIRM_MARKERS:
-        return None
-
+    normalized = sanitize_text(content, max_length=160, single_line=True) or ""
     recent_resume_hint = _latest_resume_hint(session)
+    if not recent_resume_hint:
+        return None
+    if normalized not in _SHORT_FOLLOWUP_AFFIRM_MARKERS:
+        if not allow_extended_resume or not _content_prefers_resume_hint_read(normalized, recent_resume_hint=recent_resume_hint):
+            return None
+
     resume_context = _normalize_working_context(
         recent_resume_hint.get("working_context") if isinstance(recent_resume_hint.get("working_context"), dict) else {}
     )
@@ -3988,19 +4097,123 @@ def _build_short_resume_fallback_decision(
         )
         not in executed_signatures
     ]
-    if pending_read_tools:
-        suggested_reply_label = sanitize_text(
-            str(recent_resume_hint.get("suggested_reply_label") or ""),
-            max_length=80,
-            single_line=True,
-        ) or "上一轮结果"
-        return _AgentModelDecision(
-            reply_markdown=f"我先承接上一轮结果，继续{suggested_reply_label}。",
-            conversation_state="answer",
-            objective=sanitize_text(content, max_length=240) or None,
-            read_tool_calls=[_ReadToolCall.model_validate(item) for item in pending_read_tools],
-            stop_reason="resume_hint_read",
+    if not pending_read_tools:
+        return None
+
+    suggested_reply_label = sanitize_text(
+        str(recent_resume_hint.get("suggested_reply_label") or ""),
+        max_length=80,
+        single_line=True,
+    ) or "上一轮结果"
+    return _AgentModelDecision(
+        reply_markdown=f"我先承接上一轮结果，继续{suggested_reply_label}。",
+        conversation_state="answer",
+        objective=sanitize_text(content, max_length=240) or None,
+        read_tool_calls=[_ReadToolCall.model_validate(item) for item in pending_read_tools],
+        stop_reason="resume_hint_read",
+    )
+
+
+def _latest_successful_tool_result(tool_traces: list[dict[str, Any]], *, tool_name: str) -> dict[str, Any]:
+    for item in reversed(tool_traces):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("tool_name") or "").strip() != tool_name or not item.get("ok"):
+            continue
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        if result:
+            return result
+    return {}
+
+
+def _scan_asset_brief(item: dict[str, Any]) -> str:
+    asset_id = _sanitize_line(str(item.get("asset_id") or item.get("id") or ""), max_length=64)
+    ip = sanitize_text(str(item.get("ip") or ""), max_length=64, single_line=True) or ""
+    hostname = sanitize_text(str(item.get("hostname") or ""), max_length=120, single_line=True) or ""
+    os_name = sanitize_text(str(item.get("os_name") or ""), max_length=80, single_line=True) or ""
+    label = ip or hostname or asset_id or "未命名资产"
+    parts = [label]
+    if hostname and hostname != label:
+        parts.append(hostname)
+    if os_name:
+        parts.append(os_name)
+    return " / ".join(parts)
+
+
+def _build_resume_hint_summary_decision(
+    *,
+    session: AgentSession | Any | None,
+    tool_traces: list[dict[str, Any]],
+) -> _AgentModelDecision | None:
+    recent_resume_hint = _latest_resume_hint(session)
+    if _sanitize_line(str(recent_resume_hint.get("kind") or ""), max_length=64) != "post_scan_analysis":
+        return None
+
+    assets_result = _latest_successful_tool_result(tool_traces, tool_name="list_assets")
+    task_result = _latest_successful_tool_result(tool_traces, tool_name="get_task_detail")
+    items = assets_result.get("items") if isinstance(assets_result.get("items"), list) else []
+    if not items and not task_result:
+        return None
+
+    total = int(assets_result.get("total") or len(items))
+    task_message = sanitize_text(str(task_result.get("message") or ""), max_length=180) or ""
+    task_prefix = "我已接上这次扫描结果。"
+    if task_message:
+        task_prefix = f"{task_prefix}{task_message}。"
+
+    if total <= 0:
+        reply = (
+            f"{task_prefix}\n\n当前还没有查询到该网段下的新资产。"
+            "\n\n如果你愿意，我可以继续查看任务事件，或换一个更精确的网段重新分析。"
         )
+        return _AgentModelDecision(
+            reply_markdown=reply,
+            conversation_state="answer",
+            objective="分析扫描结果",
+            stop_reason="resume_hint_scan_summary",
+        )
+
+    asset_lines = "；".join(_scan_asset_brief(item) for item in items[:3] if isinstance(item, dict))
+    remainder = total - len([item for item in items[:3] if isinstance(item, dict)])
+    if remainder > 0:
+        asset_lines = f"{asset_lines}；另有 {remainder} 台未展开" if asset_lines else f"另有 {remainder} 台未展开"
+
+    if total == 1:
+        recommendation = "如果你要继续，我可以直接分析这台资产的风险和修复建议。"
+    else:
+        recommendation = "如果你要继续，我可以先分析其中一台资产的风险，或继续帮你查看本次扫描任务详情。"
+
+    reply = (
+        f"{task_prefix}\n\n本次扫描共关联到 {total} 台资产。"
+        f"{(' 当前可见：' + asset_lines + '。') if asset_lines else ''}\n\n{recommendation}"
+    )
+    return _AgentModelDecision(
+        reply_markdown=reply,
+        conversation_state="answer",
+        objective="分析扫描结果",
+        stop_reason="resume_hint_scan_summary",
+    )
+
+
+def _build_short_resume_fallback_decision(
+    *,
+    content: str,
+    session: AgentSession | Any | None,
+    working_context: dict[str, Any],
+    tool_traces: list[dict[str, Any]],
+) -> _AgentModelDecision | None:
+    normalized = sanitize_text(content, max_length=80, single_line=True) or ""
+    if normalized not in _SHORT_FOLLOWUP_AFFIRM_MARKERS:
+        return None
+
+    resume_decision = _build_resume_hint_read_decision(
+        content=content,
+        session=session,
+        working_context=working_context,
+        tool_traces=tool_traces,
+    )
+    if resume_decision is not None:
+        return resume_decision
 
     return _build_contract_error_clarifying_decision()
 
@@ -4118,6 +4331,7 @@ def _dialog_state_working_context(dialog_state: dict[str, Any] | None) -> dict[s
 
 def _resolve_effective_working_context(
     *,
+    db: Session,
     session: AgentSession,
     content: str,
     page_context: dict[str, Any],
@@ -4131,7 +4345,10 @@ def _resolve_effective_working_context(
     recent_resume_hint = _latest_resume_hint(session)
     explicit_context = _extract_explicit_working_context(content, page_context)
     if _has_object_target(explicit_context):
-        normalized_context = _merge_soft_focus_context(current_context, explicit_context)
+        normalized_context = _canonicalize_working_context_asset_targets(
+            db,
+            _merge_soft_focus_context(current_context, explicit_context),
+        )
         session.working_context_json = normalized_context
         return normalized_context
 
@@ -4148,7 +4365,11 @@ def _resolve_effective_working_context(
         dialog_state=dialog_state,
     )
 
-    if not _has_object_target(effective_context) and sanitize_text(content, max_length=80, single_line=True) in _SHORT_FOLLOWUP_AFFIRM_MARKERS:
+    should_apply_resume_context = sanitize_text(content, max_length=80, single_line=True) in _SHORT_FOLLOWUP_AFFIRM_MARKERS
+    if not should_apply_resume_context and recent_resume_hint:
+        should_apply_resume_context = _content_prefers_resume_hint_read(content, recent_resume_hint=recent_resume_hint)
+
+    if not _has_object_target(effective_context) and should_apply_resume_context:
         resume_context = _normalize_working_context(
             recent_resume_hint.get("working_context") if isinstance(recent_resume_hint.get("working_context"), dict) else {}
         )
@@ -4161,19 +4382,24 @@ def _resolve_effective_working_context(
         if not _has_object_target(page_target):
             page_target = _build_working_context_from_browser_context(browser_context, source="browser_reference")
         if _has_object_target(page_target):
-            normalized_context = _merge_soft_focus_context(effective_context, page_target)
+            normalized_context = _canonicalize_working_context_asset_targets(
+                db,
+                _merge_soft_focus_context(effective_context, page_target),
+            )
             session.working_context_json = normalized_context
             return normalized_context
 
     if _has_object_target(effective_context):
-        session.working_context_json = effective_context
-        return effective_context
+        normalized_context = _canonicalize_working_context_asset_targets(db, effective_context)
+        session.working_context_json = normalized_context
+        return normalized_context
 
     return {}
 
 
 def _resolve_working_context_for_message(
     *,
+    db: Session,
     session: AgentSession,
     content: str,
     page_context: dict[str, Any],
@@ -4182,6 +4408,7 @@ def _resolve_working_context_for_message(
     followup_hint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _resolve_effective_working_context(
+        db=db,
         session=session,
         content=content,
         page_context=page_context,
@@ -5494,15 +5721,33 @@ def _run_agent_loop(
 ) -> tuple[_AgentModelDecision, list[dict[str, Any]]]:
     tool_traces: list[dict[str, Any]] = []
     working_context = _normalize_working_context(working_context)
+    loop_allow_write_plans = allow_write_plans
+    loop_allow_auto_execute_actions = allow_auto_execute_actions
     session_last_task_id = _session_last_task_id(session)
-    current_content = str(browser_runtime.get("last_user_intent") or "") or str(session.messages[-1].content if session.messages else "")
-    playbook_match = match_registered_playbook(
+    latest_user_content = ""
+    for item in reversed(getattr(session, "messages", []) or []):
+        if str(getattr(item, "role", "") or "").strip().lower() != "user":
+            continue
+        latest_user_content = sanitize_text(str(getattr(item, "content", "") or ""), max_length=400) or ""
+        if latest_user_content:
+            break
+    current_content = latest_user_content or str(browser_runtime.get("last_user_intent") or "") or str(session.messages[-1].content if session.messages else "")
+    resume_priority_decision = _build_resume_hint_read_decision(
         content=current_content,
-        page_context=page_context,
-        browser_context=browser_context,
+        session=session,
         working_context=working_context,
-        current_goal=_session_goal(session),
+        tool_traces=tool_traces,
+        allow_extended_resume=True,
     )
+    playbook_match = None
+    if resume_priority_decision is None:
+        playbook_match = match_registered_playbook(
+            content=current_content,
+            page_context=page_context,
+            browser_context=browser_context,
+            working_context=working_context,
+            current_goal=_session_goal(session),
+        )
     objective = _build_current_objective(
         str(browser_runtime.get("current_objective") or "") or current_content,
         dialog_state=dialog_state,
@@ -5543,7 +5788,10 @@ def _run_agent_loop(
     )
     _emit_agent_state(stream_emitter, session, turn_id=turn_id)
     for _ in range(MAX_AGENT_LOOP_STEPS):
-        if playbook_match is not None:
+        if resume_priority_decision is not None:
+            decision = resume_priority_decision
+            resume_priority_decision = None
+        elif playbook_match is not None:
             decision = _build_model_decision_from_playbook(playbook_match)
             playbook_match = None
         else:
@@ -5558,8 +5806,8 @@ def _run_agent_loop(
                     dialog_state=dialog_state,
                     followup_hint=followup_hint,
                     tool_traces=tool_traces,
-                    allow_write_plans=allow_write_plans,
-                    allow_auto_execute_actions=allow_auto_execute_actions,
+                    allow_write_plans=loop_allow_write_plans,
+                    allow_auto_execute_actions=loop_allow_auto_execute_actions,
                 )
             except Exception as exc:
                 if not _is_model_decision_contract_error(exc):
@@ -5573,8 +5821,8 @@ def _run_agent_loop(
                     working_context=working_context,
                     dialog_state=dialog_state,
                     followup_hint=followup_hint,
-                    allow_write_plans=allow_write_plans,
-                    allow_auto_execute_actions=allow_auto_execute_actions,
+                    allow_write_plans=loop_allow_write_plans,
+                    allow_auto_execute_actions=loop_allow_auto_execute_actions,
                     tool_traces=tool_traces,
                 )
                 if fallback_decision is None:
@@ -5590,12 +5838,15 @@ def _run_agent_loop(
                 working_context=working_context,
                 dialog_state=dialog_state,
                 followup_hint=followup_hint,
-                allow_write_plans=allow_write_plans,
-                allow_auto_execute_actions=allow_auto_execute_actions,
+                allow_write_plans=loop_allow_write_plans,
+                allow_auto_execute_actions=loop_allow_auto_execute_actions,
                 tool_traces=tool_traces,
             )
             if fallback_decision is not None:
                 decision = fallback_decision
+        if decision.stop_reason == "resume_hint_read":
+            loop_allow_write_plans = False
+            loop_allow_auto_execute_actions = False
         if decision.conversation_state == "clarifying":
             decision.ui_actions = []
             decision.auto_execute_actions = []
@@ -5688,6 +5939,10 @@ def _run_agent_loop(
                 _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         if not executed_any:
             return decision, tool_traces
+        if decision.stop_reason == "resume_hint_read":
+            resume_summary_decision = _build_resume_hint_summary_decision(session=session, tool_traces=tool_traces)
+            if resume_summary_decision is not None:
+                return resume_summary_decision, tool_traces
     if decision.read_tool_calls:
         decision.reply_markdown = f"{decision.reply_markdown}\n\n已达到只读工具调用上限，请缩小问题范围后重试。".strip()
         decision.read_tool_calls = []
@@ -6154,6 +6409,12 @@ def build_auto_action_task_followup_content(action: dict[str, Any], child_summar
     payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
     status = _normalize_task_status(child_summary.get("status"))
     task_message = sanitize_text(str(child_summary.get("message") or ""), max_length=300) or ""
+    result_json = child_summary.get("result_json") if isinstance(child_summary.get("result_json"), dict) else {}
+    remediation_business_status = _sanitize_line(
+        str(result_json.get("business_status") or ""),
+        max_length=64,
+    ).lower()
+    reverify_summary = result_json.get("reverify_summary") if isinstance(result_json.get("reverify_summary"), dict) else {}
     resume_hint = _build_task_followup_resume_hint(action, child_summary)
 
     if action_type == "create_discovery_job":
@@ -6195,7 +6456,22 @@ def build_auto_action_task_followup_content(action: dict[str, Any], child_summar
         session_id = _sanitize_line(str(payload.get("session_id") or ""), max_length=64)
         session_label = f"修复会话 {session_id}" if session_id else "修复会话"
         if status == TaskExecutionStatus.SUCCESS.value:
-            message = f"资产 {asset_id} 的自动修复任务已完成。"
+            target_total = int(reverify_summary.get("targeted_target_count") or 0)
+            closed_total = int(reverify_summary.get("closed_target_count") or 0)
+            open_total = int(reverify_summary.get("open_target_count") or 0)
+            other_total = int(reverify_summary.get("other_open_finding_count") or 0)
+            if remediation_business_status == "pending_reverify":
+                message = f"资产 {asset_id} 的阶段执行已完成，正在复验目标风险。"
+            elif remediation_business_status == "verified_closed":
+                message = f"资产 {asset_id} 的目标风险已复验关闭。"
+            elif remediation_business_status == "verified_partial":
+                message = f"资产 {asset_id} 的阶段执行已完成，但目标风险仍未关闭。"
+            elif remediation_business_status == "verified_failed":
+                message = f"资产 {asset_id} 的阶段执行后复验失败。"
+            else:
+                message = f"资产 {asset_id} 的自动修复任务已完成。"
+            if target_total:
+                message = f"{message}本阶段目标 {target_total} 条，已关闭 {closed_total} 条，仍开放 {open_total} 条，未纳入本阶段的其余风险 {other_total} 条。"
             if task_message:
                 message = f"{message}{task_message}。"
             return "task_update", f"{message} 如需继续，我可以帮你复盘修复结果，或带你进入 {session_label} 查看详情。", resume_hint
@@ -6986,6 +7262,7 @@ def post_agent_message(
     has_pending_plan = _has_pending_plan(existing_pending_plan)
     db.add(session)
     working_context = _resolve_working_context_for_message(
+        db=db,
         session=session,
         content=payload.content,
         page_context=page_context,
@@ -7376,7 +7653,7 @@ def post_agent_message(
         _emit_session_snapshot(stream_emitter, session)
         return serialize_agent_session(session)
 
-    if not current_dialog_state:
+    if not current_dialog_state and not _should_skip_preflight_clarification(payload.content, session=session):
         preflight_clarification = _build_preflight_clarification(
             payload.content,
             working_context=working_context,
@@ -7655,6 +7932,8 @@ def _normalize_result_payload_blockers(result_payload: dict[str, Any] | None) ->
 
     def _infer_blocker_code_from_message(message: str) -> str:
         lowered_message = message.lower()
+        if "maintenance_window_id" in lowered_message or "维护窗口" in message:
+            return "maintenance_window_required"
         if ("ssh" in lowered_message and any(marker in message for marker in ("凭据", "私钥", "密码", "授权"))) or "未配置 ssh" in lowered_message:
             return "missing_ssh_credential"
         if "管理员授权" in message:
@@ -7669,6 +7948,14 @@ def _normalize_result_payload_blockers(result_payload: dict[str, Any] | None) ->
             return "runner_installing"
         if "当前离线" in message:
             return "runner_offline"
+        if "未识别到稳定的软件包管理器或包名" in message:
+            return "unstable_render"
+        if "未识别稳定的软件包管理器" in message or "未识别稳定的软件包名" in message:
+            return "unstable_render"
+        if "无法生成安全步骤" in message or "无法稳定渲染" in message:
+            return "unstable_render"
+        if "缺少自动修复适配器" in message:
+            return "missing_adapter"
         if "未解析到" in message:
             return "missing_target"
         if "白名单" in message:
@@ -7676,6 +7963,29 @@ def _normalize_result_payload_blockers(result_payload: dict[str, Any] | None) ->
         if "snapshot" in lowered_message or "深度检查结果" in message:
             return "missing_snapshot"
         return "unknown_blocker"
+
+    def _blocker_category(code: str, message: str) -> str:
+        normalized_code = _sanitize_line(code, max_length=64)
+        lowered_message = message.lower()
+        if normalized_code == "maintenance_window_required":
+            return "policy"
+        if normalized_code in SSH_CREDENTIAL_BLOCKER_CODES:
+            return "ssh"
+        if normalized_code in RUNNER_BLOCKER_CODES:
+            return "runner"
+        if normalized_code in RENDER_BLOCKER_CODES:
+            return "render"
+        if "runner" in lowered_message:
+            return "runner"
+        if "未识别到稳定的软件包管理器或包名" in message:
+            return "render"
+        if "未识别稳定的软件包管理器" in message or "未识别稳定的软件包名" in message:
+            return "render"
+        if "无法生成安全步骤" in message or "无法稳定渲染" in message:
+            return "render"
+        if "ssh" in lowered_message or "sudo" in lowered_message:
+            return "ssh"
+        return "other"
 
     raw_blockers = payload.get("blockers") if isinstance(payload.get("blockers"), list) else []
     for item in raw_blockers:
@@ -7689,6 +7999,7 @@ def _normalize_result_payload_blockers(result_payload: dict[str, Any] | None) ->
         blocker = {
             "code": normalized_code,
             "message": raw_message,
+            "blocker_category": _blocker_category(normalized_code, raw_message),
             "scope": _sanitize_line(str(item.get("scope") or ""), max_length=64) or None,
             "blocking": _sanitize_line(str(item.get("blocking") or ""), max_length=32) or None,
             "stage_code": _sanitize_line(str(item.get("stage_code") or ""), max_length=64) or None,
@@ -7725,6 +8036,7 @@ def _normalize_result_payload_blockers(result_payload: dict[str, Any] | None) ->
             {
                 "code": code,
                 "message": message,
+                "blocker_category": _blocker_category(code, message),
                 "scope": None,
                 "blocking": None,
                 "stage_code": None,
@@ -7755,6 +8067,160 @@ def _format_blocker_summary(blockers: list[dict[str, Any]], *, max_items: int = 
         if len(messages) >= max_items:
             break
     return "；".join(messages)
+
+
+def _collect_blocker_categories(blockers: list[dict[str, Any]]) -> list[str]:
+    categories: list[str] = []
+    for item in blockers:
+        if not isinstance(item, dict):
+            continue
+        category = _sanitize_line(str(item.get("blocker_category") or ""), max_length=32)
+        if not category:
+            code = _sanitize_line(str(item.get("code") or item.get("blocker_code") or ""), max_length=64)
+            if code in SSH_CREDENTIAL_BLOCKER_CODES:
+                category = "ssh"
+            elif code in RUNNER_BLOCKER_CODES:
+                category = "runner"
+            elif code == "maintenance_window_required":
+                category = "policy"
+            elif code in RENDER_BLOCKER_CODES:
+                category = "render"
+            else:
+                message = sanitize_text(str(item.get("message") or item.get("blocker_message") or ""), max_length=280) or ""
+                lowered_message = message.lower()
+                if "runner" in lowered_message:
+                    category = "runner"
+                elif "未识别到稳定的软件包管理器或包名" in message or "无法稳定渲染" in message:
+                    category = "render"
+                elif "ssh" in lowered_message or "sudo" in lowered_message:
+                    category = "ssh"
+        if category and category not in categories:
+            categories.append(category)
+    return categories
+
+
+def _build_message_action_payload(
+    *,
+    kind: str,
+    label: str,
+    message_text: str | None = None,
+    pathname: str | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "kind": _sanitize_line(kind, max_length=32) or "navigate",
+        "label": sanitize_text(label, max_length=80) or "继续",
+    }
+    if message_text:
+        payload["message_text"] = sanitize_text(message_text, max_length=240) or ""
+    if pathname:
+        payload["pathname"] = sanitize_text(pathname, max_length=255, single_line=True) or ""
+    return payload
+
+
+def _build_remediation_guidance_payload(
+    *,
+    asset_id: str,
+    blockers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    blocker_categories = _collect_blocker_categories(blockers)
+    guidance: dict[str, Any] = {"blocker_categories": blocker_categories}
+    if "policy" in blocker_categories:
+        guidance["recommended_action"] = _build_message_action_payload(
+            kind="open_maintenance_window_input",
+            label="填写维护窗口并继续自动修复",
+        )
+        guidance["alternative_action"] = _build_message_action_payload(
+            kind="navigate",
+            label="查看修复工作台详情",
+            pathname=f"/remediation/{asset_id}",
+        )
+        guidance["post_verify_action"] = "maintenance_window_required"
+        return guidance
+    if "runner" in blocker_categories:
+        guidance["recommended_action"] = _build_message_action_payload(
+            kind="send_message",
+            label="继续安装 Runner 后走自动修复",
+            message_text=f"继续为资产 {asset_id} 安装 Runner，然后继续自动修复",
+        )
+        guidance["post_verify_action"] = "runner_required"
+        if "render" in blocker_categories:
+            guidance["alternative_action"] = _build_message_action_payload(
+                kind="navigate",
+                label="改走交互式修复预演",
+                pathname=f"/remediation-workspace/{asset_id}",
+            )
+        else:
+            guidance["alternative_action"] = _build_message_action_payload(
+                kind="navigate",
+                label="查看修复工作台详情",
+                pathname=f"/remediation/{asset_id}",
+            )
+        return guidance
+    if "render" in blocker_categories:
+        guidance["recommended_action"] = _build_message_action_payload(
+            kind="navigate",
+            label="改走交互式修复预演",
+            pathname=f"/remediation-workspace/{asset_id}",
+        )
+        guidance["alternative_action"] = _build_message_action_payload(
+            kind="navigate",
+            label="查看修复工作台详情",
+            pathname=f"/remediation/{asset_id}",
+        )
+        guidance["post_verify_action"] = "interactive_remediation_recommended"
+        return guidance
+    guidance["recommended_action"] = _build_message_action_payload(
+        kind="navigate",
+        label="查看修复工作台详情",
+        pathname=f"/remediation/{asset_id}",
+    )
+    guidance["post_verify_action"] = "review_remediation_workspace"
+    return guidance
+
+
+def _queue_asset_collection_refresh(db: Session, *, asset_id: str) -> str:
+    task_run = create_task_run(
+        db,
+        task_type=TaskType.INFO_COLLECT,
+        scope_type="asset",
+        scope_id=asset_id,
+        message="SSH 凭据已验证，正在刷新主机事实",
+    )
+    task = run_asset_collect_task.delay(task_run.id, asset_id)
+    update_task_run(db, task_run, celery_task_id=task.id)
+    return task_run.id
+
+
+def _enqueue_secure_refresh_resume_followup(
+    *,
+    session_id: str,
+    refresh_task_id: str,
+    action: dict[str, Any],
+    asset_id: str,
+) -> None:
+    normalized_session_id = _sanitize_line(str(session_id or ""), max_length=64)
+    normalized_refresh_task_id = _sanitize_line(str(refresh_task_id or ""), max_length=64)
+    normalized_asset_id = _sanitize_line(str(asset_id or ""), max_length=64)
+    if not normalized_session_id or not normalized_refresh_task_id or not normalized_asset_id:
+        return
+    try:
+        celery_app.send_task(
+            "app.tasks.agent_tasks.run_agent_secure_post_verify_resume_task",
+            args=[
+                normalized_session_id,
+                normalized_refresh_task_id,
+                sanitize_json_value(action if isinstance(action, dict) else {}),
+                normalized_asset_id,
+            ],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to enqueue secure post-verify remediation resume for session=%s task=%s asset=%s: %s",
+            normalized_session_id,
+            normalized_refresh_task_id,
+            normalized_asset_id,
+            exc,
+        )
 
 
 def _remediation_resume_action_from_payload(result_payload: dict[str, Any], *, asset_id: str) -> dict[str, Any]:
@@ -7937,11 +8403,21 @@ def append_blocked_action_result_message(
     result_payload: dict[str, Any],
     content: str,
     blocked_reason: str | None = None,
+    message_payload_patch: dict[str, Any] | None = None,
 ) -> None:
     session = db.get(AgentSession, session_id)
     if session is None:
         return
     blocker_items = _normalize_result_payload_blockers(result_payload)
+    asset_id = _sanitize_line(
+        str(
+            result_payload.get("asset_id")
+            or (action.get("params") if isinstance(action.get("params"), dict) else {}).get("asset_id")
+            or ""
+        ),
+        max_length=64,
+    ) or ""
+    guidance_payload = _build_remediation_guidance_payload(asset_id=asset_id, blockers=blocker_items) if asset_id else {}
     current_browser_runtime = _normalize_browser_runtime(
         session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
     )
@@ -8007,6 +8483,8 @@ def append_blocked_action_result_message(
             "task_id": task_id,
             "action": sanitize_json_value(action),
             "result_payload": sanitize_json_value(result_payload),
+            **sanitize_json_value(guidance_payload),
+            **sanitize_json_value(message_payload_patch if isinstance(message_payload_patch, dict) else {}),
             **_build_message_state_metadata(
                 decision_summary=sanitize_text(content, max_length=280) or blocked_summary,
                 evidence=blocker_items[:4],
@@ -8276,6 +8754,8 @@ def _handle_secure_input_step(
     failed_items = [item for item in result_items if item.get("verified") is not True]
     child_task_ids: list[str] = []
     resume_results: list[dict[str, Any]] = []
+    refresh_task_id: str | None = None
+    post_verify_action: str | None = None
     if success_asset_ids and pending_secure_input.get("auto_resume") is not False:
         resume_goal_id = _sanitize_line(str(pending_secure_input.get("resume_goal_id") or ""), max_length=64)
         if resume_goal_id:
@@ -8284,7 +8764,22 @@ def _handle_secure_input_step(
             except Exception:
                 pass
         resume_actions = _expand_secure_resume_actions(pending_secure_input, success_asset_ids=success_asset_ids)
-        if resume_actions:
+        if (
+            len(success_asset_ids) == 1
+            and len(resume_actions) == 1
+            and _sanitize_line(str(resume_actions[0].get("action_type") or ""), max_length=64)
+            == "create_or_resume_remediation_session"
+        ):
+            refresh_task_id = _queue_asset_collection_refresh(db, asset_id=success_asset_ids[0])
+            child_task_ids = [refresh_task_id]
+            post_verify_action = "refresh_and_resume"
+            _enqueue_secure_refresh_resume_followup(
+                session_id=session.id,
+                refresh_task_id=refresh_task_id,
+                action=resume_actions[0],
+                asset_id=success_asset_ids[0],
+            )
+        elif resume_actions:
             resume_results = _execute_auto_actions(
                 db,
                 session=session,
@@ -8302,7 +8797,7 @@ def _handle_secure_input_step(
 
     blocked_resume_results, blocked_resume_blockers, blocked_resume_summary = _collect_blocked_resume_results(resume_results)
     blocked_resume_count = len(blocked_resume_results)
-    auto_resumed_count = len(child_task_ids)
+    auto_resumed_count = 0 if refresh_task_id else len(child_task_ids)
 
     failure_lines = [
         f"{item.get('asset_id') or '目标资产'}：{item.get('error_summary') or '未通过管理员权限验证'}"
@@ -8327,7 +8822,9 @@ def _handle_secure_input_step(
     else:
         asset_id = success_asset_ids[0] if success_asset_ids else _sanitize_line(str(details.get("asset_id") or ""), max_length=64) or "目标资产"
         if success_asset_ids:
-            if blocked_resume_count:
+            if refresh_task_id:
+                content = f"资产 {asset_id} 的 SSH 凭据已保存并验证成功。正在通过 SSH 刷新主机信息；刷新完成后会重新评估修复条件。"
+            elif blocked_resume_count:
                 content = f"资产 {asset_id} 的 SSH 凭据已保存并验证成功，但修复暂未继续执行。"
                 if blocked_resume_summary:
                     content = f"{content} 剩余阻塞：{blocked_resume_summary}。"
@@ -8360,12 +8857,19 @@ def _handle_secure_input_step(
                 working_context=session.working_context_json if isinstance(session.working_context_json, dict) else {},
                 fallback_watch_task_id=child_task_ids[0],
             ),
-            execution={"stage": "watching_task", "step_kind": "secure_input", "step_label": "凭据验证成功，已续接原目标", "waiting_for": "等待后台任务完成", "missing_slots": [], "pending_ui_actions": []},
+            execution={
+                "stage": "watching_task",
+                "step_kind": "secure_input",
+                "step_label": "SSH 已验证，正在刷新主机信息" if refresh_task_id else "凭据验证成功，已续接原目标",
+                "waiting_for": "等待主机事实刷新完成" if refresh_task_id else "等待后台任务完成",
+                "missing_slots": [],
+                "pending_ui_actions": [],
+            },
             explanation={
-                "reason": "SSH 凭据验证成功后，已恢复原阻塞目标",
+                "reason": "SSH 凭据验证成功后，正在刷新主机事实并恢复原修复目标" if refresh_task_id else "SSH 凭据验证成功后，已恢复原阻塞目标",
                 "decision_summary": content,
-                "expected_outcome": "等待恢复后的任务完成并自动回传结果",
-                "next_step": "任务完成后自动追加结论消息",
+                "expected_outcome": "主机事实刷新完成后自动重新评估修复条件" if refresh_task_id else "等待恢复后的任务完成并自动回传结果",
+                "next_step": "采集完成后自动进入修复条件重评估，并给出继续自动修或替代建议" if refresh_task_id else "任务完成后自动追加结论消息",
                 "evidence": [],
             },
             watch={"primary_task_id": child_task_ids[0], "related_task_ids": child_task_ids, "status": "running", "watching": True},
@@ -8444,6 +8948,8 @@ def _handle_secure_input_step(
                 "failure_count": len(failed_items),
                 "auto_resumed_count": auto_resumed_count,
                 "blocked_resume_count": blocked_resume_count,
+                "post_verify_action": post_verify_action,
+                "refresh_task_id": refresh_task_id,
             },
             "auto_executed_actions": resume_results,
             "resume_hint": resume_hint,

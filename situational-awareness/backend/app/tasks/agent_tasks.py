@@ -17,6 +17,7 @@ from app.services.haor_agent_service import (
     append_blocked_action_result_message,
     append_agent_task_message,
     build_auto_action_task_followup_content,
+    enqueue_auto_action_followup_task,
     execute_approved_action,
     has_agent_task_followup_message,
     mark_agent_session_interrupted,
@@ -44,6 +45,7 @@ _NON_RETRYABLE_REMEDIATION_ERRORS = (
     "当前整机修复计划不可执行",
     "当前没有可执行阶段",
     "仅允许审批当前最早可执行阶段",
+    "当前阶段包含高风险步骤，请先填写 maintenance_window_id 后再正式执行",
     "修复会话不存在",
 )
 _NON_RETRYABLE_ORCHESTRATE_ERRORS = _NON_RETRYABLE_REMEDIATION_ERRORS + (
@@ -110,6 +112,65 @@ def _humanize_orchestrate_error(exc: Exception) -> str:
     return sanitized or "haor 编排执行失败，请稍后重试"
 
 
+def _is_post_verify_upstream_failure(exc: Exception) -> bool:
+    lowered = str(exc or "").strip().lower()
+    if not lowered:
+        return False
+    markers = (
+        "ai 模型服务异常",
+        "上游模型",
+        "upstream",
+        "bad gateway",
+        "gateway timeout",
+        "cloudflare",
+        "502",
+        "503",
+        "504",
+        "/responses",
+        "model service",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _mark_post_verify_reassessment_wait_state(
+    session: AgentSession,
+    *,
+    refresh_task_id: str,
+    content: str,
+) -> None:
+    current_state = getattr(session, "agent_state_json", None)
+    current_state = current_state if isinstance(current_state, dict) else {}
+    session.status = "running"
+    session.last_task_id = refresh_task_id
+    session.agent_state_json = _deep_merge_dict(
+        current_state,
+        {
+            "execution": {
+                "stage": "watching_task",
+                "step_kind": "secure_input",
+                "step_label": "主机事实已刷新，正在重新评估修复条件",
+                "waiting_for": "等待重新评估自动修复条件",
+                "missing_slots": [],
+                "pending_ui_actions": [],
+            },
+            "explanation": {
+                "reason": "SSH 凭据验证成功后，主机事实已刷新，正在重新评估自动修复条件",
+                "decision_summary": content,
+                "expected_outcome": "完成修复条件重评估后，自动继续修复或明确剩余阻塞",
+                "next_step": "若上游模型响应较慢，这一步可能比采集更久；完成后会自动回传结论",
+                "evidence": [],
+            },
+            "watch": {
+                "primary_task_id": refresh_task_id,
+                "related_task_ids": [refresh_task_id],
+                "status": TaskExecutionStatus.RUNNING.value,
+                "watching": True,
+                "last_task_message": content,
+            },
+        },
+    )
+
+
 def _is_submit_if_ready_remediation_action(action: dict[str, Any]) -> bool:
     if str(action.get("action_type") or "").strip() != "create_or_resume_remediation_session":
         return False
@@ -139,9 +200,16 @@ def _remediation_blocked_followup_mode(
     child_task_id: str | None,
     result_payload: dict[str, Any] | None,
 ) -> str | None:
-    if child_task_id or not _is_submit_if_ready_remediation_action(action):
+    if child_task_id:
         return None
     payload = result_payload if isinstance(result_payload, dict) else {}
+    action_type = str(action.get("action_type") or "").strip()
+    if action_type == "approve_remediation_session":
+        if payload.get("execution_ready") is False or _result_blocker_codes(payload):
+            return _TERMINAL_FOLLOWUP_BLOCKED
+        return None
+    if not _is_submit_if_ready_remediation_action(action):
+        return None
     if payload.get("execution_ready") is not False:
         return None
     if any(code in _SSH_REMEDIATION_BLOCKER_CODES for code in _result_blocker_codes(payload)):
@@ -165,6 +233,53 @@ def _should_retry_orchestrate_error(
     if humanized in _NON_RETRYABLE_ORCHESTRATE_ERRORS:
         return False
     return True
+
+
+def _result_blocker_categories(result_payload: dict[str, Any] | None) -> list[str]:
+    payload = result_payload if isinstance(result_payload, dict) else {}
+    raw_categories = payload.get("blocker_categories") if isinstance(payload.get("blocker_categories"), list) else []
+    normalized: list[str] = []
+    for item in raw_categories:
+        category = str(item or "").strip()
+        if category and category not in normalized:
+            normalized.append(category)
+    return normalized
+
+
+def _summarize_post_refresh_blocked_content(
+    *,
+    asset_id: str,
+    result_summary: str,
+    result_payload: dict[str, Any] | None,
+) -> str:
+    payload = result_payload if isinstance(result_payload, dict) else {}
+    blocker_categories = _result_blocker_categories(payload)
+    blocker_messages = payload.get("blocked_reasons") if isinstance(payload.get("blocked_reasons"), list) else []
+    blocker_summary = "；".join(str(item).strip() for item in blocker_messages if str(item).strip())
+    normalized_asset_id = str(asset_id or "").strip() or "目标资产"
+    if "runner" in blocker_categories and "render" in blocker_categories:
+        summary = blocker_summary or result_summary or "仍存在 Host Runner 与步骤渲染前置条件"
+        return (
+            f"资产 {normalized_asset_id} 的 SSH 凭据已验证成功，主机信息也已刷新，但整机自动修复仍未继续执行。"
+            f"当前阻塞：{summary}。即使先安装 Runner，也不保证能立即自动修成功；你也可以改走交互式修复预演。"
+        )
+    if "runner" in blocker_categories:
+        summary = blocker_summary or result_summary or "当前主机尚未安装 Host Runner"
+        return (
+            f"资产 {normalized_asset_id} 的 SSH 凭据已验证成功，主机信息也已刷新，但整机自动修复仍需要 Host Runner。"
+            f" 当前阻塞：{summary}。建议先安装 Runner，再继续自动修复。"
+        )
+    if "render" in blocker_categories:
+        summary = blocker_summary or result_summary or "当前仍无法稳定生成自动修复步骤"
+        return (
+            f"资产 {normalized_asset_id} 的 SSH 凭据已验证成功，主机信息也已刷新，但当前仍不适合继续整机自动修复。"
+            f" 当前阻塞：{summary}。这类情况更适合先走交互式修复预演或人工处理。"
+        )
+    summary = blocker_summary or result_summary or "仍有其他前置条件未满足"
+    return (
+        f"资产 {normalized_asset_id} 的 SSH 凭据已验证成功，主机信息也已刷新，但自动修复暂未继续执行。"
+        f" 当前阻塞：{summary}。你可以先查看修复工作台详情，再决定下一步。"
+    )
 
 
 @celery_app.task(
@@ -582,3 +697,175 @@ def run_agent_auto_followup_task(
         )
         db.commit()
     return child_task_id
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.agent_tasks.run_agent_secure_post_verify_resume_task",
+    max_retries=0,
+)
+def run_agent_secure_post_verify_resume_task(
+    self: Task,
+    session_id: str,
+    refresh_task_id: str,
+    action: dict | None = None,
+    asset_id: str | None = None,
+) -> str:
+    normalized_action = action if isinstance(action, dict) else {}
+    normalized_asset_id = str(asset_id or "").strip() or (
+        str((normalized_action.get("params") if isinstance(normalized_action.get("params"), dict) else {}).get("asset_id") or "").strip()
+    )
+    try:
+        refresh_summary = wait_for_child_task(refresh_task_id, interval_seconds=0.5)
+    except Exception as exc:
+        refresh_summary = {
+            "task_id": refresh_task_id,
+            "status": TaskExecutionStatus.FAILURE.value,
+            "message": str(exc),
+            "error_json": {"error": str(exc)},
+        }
+
+    refresh_terminal_status = str(refresh_summary.get("status") or "").strip().lower()
+    if refresh_terminal_status != TaskExecutionStatus.SUCCESS.value:
+        with SessionLocal() as db:
+            append_blocked_action_result_message(
+                db,
+                session_id=session_id,
+                task_id=refresh_task_id,
+                action=normalized_action,
+                result_payload={"asset_id": normalized_asset_id, "refresh_task": refresh_summary},
+                content=(
+                    f"资产 {normalized_asset_id or '目标资产'} 的 SSH 凭据已验证成功，但主机事实刷新失败，暂无法继续自动修复。"
+                    "请查看采集任务详情或稍后重试。"
+                ),
+                blocked_reason="SSH 已配置成功，但主机事实刷新失败，暂无法继续自动修复",
+                message_payload_patch={
+                    "refresh_task_id": refresh_task_id,
+                    "refresh_task": refresh_summary,
+                    "post_verify_action": "refresh_failed",
+                },
+            )
+            db.commit()
+        return refresh_task_id
+
+    with SessionLocal() as db:
+        session = db.get(AgentSession, session_id)
+        if session is None:
+            return refresh_task_id
+        reassessing_content = (
+            f"资产 {normalized_asset_id or '目标资产'} 的主机信息已刷新，正在重新评估修复条件。"
+            "若上游模型响应较慢或暂时不可用，这一步可能比采集更久。"
+        )
+        append_agent_task_message(
+            db,
+            session_id=session_id,
+            content=reassessing_content,
+            payload_json={
+                "task_id": refresh_task_id,
+                "refresh_task_id": refresh_task_id,
+                "refresh_task": refresh_summary,
+                "action": normalized_action,
+                "post_verify_action": "refresh_reassessing",
+            },
+            message_type="action_update",
+            watching=False,
+        )
+        _mark_post_verify_reassessment_wait_state(
+            session,
+            refresh_task_id=refresh_task_id,
+            content=reassessing_content,
+        )
+        db.commit()
+        try:
+            result = execute_approved_action(
+                db,
+                action=normalized_action,
+                session_user_id=session.user_id,
+                platform_url="",
+            )
+        except Exception as exc:
+            if _is_post_verify_upstream_failure(exc):
+                content = (
+                    f"资产 {normalized_asset_id or '目标资产'} 的主机信息已刷新，"
+                    "但重新评估修复条件时上游模型暂时不可用，请稍后恢复会话或重试。"
+                )
+            else:
+                content = (
+                    f"资产 {normalized_asset_id or '目标资产'} 的 SSH 凭据已验证成功，主机信息也已刷新，"
+                    f"但重新评估自动修复时失败：{sanitize_text(str(exc), max_length=200) or '未知错误'}"
+                )
+            append_agent_task_message(
+                db,
+                session_id=session_id,
+                content=content,
+                payload_json={
+                    "task_id": refresh_task_id,
+                    "refresh_task_id": refresh_task_id,
+                    "refresh_task": refresh_summary,
+                    "action": normalized_action,
+                    "post_verify_action": "refresh_resume_failed",
+                },
+                message_type="error",
+            )
+            db.commit()
+            return refresh_task_id
+
+        result_payload = result.payload if isinstance(result.payload, dict) else {}
+        if result.child_task_id:
+            action_payload = {**normalized_action, "payload": result_payload}
+            append_agent_task_message(
+                db,
+                session_id=session_id,
+                content=(
+                    f"资产 {normalized_asset_id or '目标资产'} 的主机信息已刷新。"
+                    "我已重新评估修复条件，并继续自动修复。"
+                ),
+                payload_json={
+                    "task_id": result.child_task_id,
+                    "refresh_task_id": refresh_task_id,
+                    "refresh_task": refresh_summary,
+                    "action": action_payload,
+                    "child_task": {
+                        "task_id": result.child_task_id,
+                        "status": TaskExecutionStatus.RUNNING.value,
+                        "message": result.summary,
+                    },
+                    "result_payload": result_payload,
+                    "post_verify_action": "refresh_and_resume",
+                },
+                message_type="action_update",
+                watching=True,
+            )
+            db.commit()
+            enqueue_auto_action_followup_task(
+                session_id=session_id,
+                child_task_id=result.child_task_id,
+                action=action_payload,
+            )
+            return result.child_task_id
+
+        blocked_content = _summarize_post_refresh_blocked_content(
+            asset_id=normalized_asset_id,
+            result_summary=result.summary,
+            result_payload=result_payload,
+        )
+        append_blocked_action_result_message(
+            db,
+            session_id=session_id,
+            task_id=refresh_task_id,
+            action=normalized_action,
+            result_payload=result_payload,
+            content=blocked_content,
+            blocked_reason=result.summary or blocked_content,
+            message_payload_patch={
+                "refresh_task_id": refresh_task_id,
+                "refresh_task": refresh_summary,
+                "post_verify_action": "interactive_remediation_recommended"
+                if "render" in _result_blocker_categories(result_payload)
+                else "runner_required"
+                if "runner" in _result_blocker_categories(result_payload)
+                else "review_remediation_workspace",
+            },
+        )
+        db.commit()
+    return refresh_task_id

@@ -67,6 +67,7 @@ const FIELD_TO_TAB_KEY: Record<string, SettingsTabKey> = {
   cors_allow_all: "platform-security",
   cors_allow_origins: "platform-security",
   local_asset_ips: "platform-security",
+  security_admin_cidrs: "platform-security",
   access_token_expire_minutes: "platform-security",
 };
 
@@ -126,6 +127,7 @@ const READ_ONLY_DEFAULTS: PlatformSettingsInput = {
   cors_allow_all: true,
   cors_allow_origins: "http://localhost:3000",
   local_asset_ips: "127.0.0.1,::1",
+  security_admin_cidrs: "",
   access_token_expire_minutes: 480,
 };
 
@@ -251,6 +253,7 @@ function toFormValues(payload: PlatformSettings): PlatformSettingsInput {
     cors_allow_all: payload.cors_allow_all,
     cors_allow_origins: payload.cors_allow_origins,
     local_asset_ips: payload.local_asset_ips,
+    security_admin_cidrs: payload.security_admin_cidrs,
     access_token_expire_minutes: payload.access_token_expire_minutes,
   };
 }
@@ -1007,6 +1010,13 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
                         extra="使用逗号分隔 Origin，支持通配符，例如 http://192.168.*.*:3000"
                       />
                       <TextField name="local_asset_ips" label="本机 IP / 网段" disabled={disabled} textarea extra="使用逗号分隔 IP 或网段" />
+                      <TextField
+                        name="security_admin_cidrs"
+                        label="管理网段 CIDR"
+                        disabled={disabled}
+                        textarea
+                        extra="用于 admin_segment_only 类修复与复验判断，使用逗号分隔网段，例如 192.168.130.0/24"
+                      />
                     </SectionCard>
                     <SectionCard title="认证时效">
                       <NumberField name="access_token_expire_minutes" label="访问令牌有效期" min={5} max={10080} disabled={disabled} extra="单位：分钟" />

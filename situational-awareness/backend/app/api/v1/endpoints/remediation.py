@@ -32,6 +32,7 @@ from app.schemas.remediation import (
     RemediationTaskEvidenceRead,
     RemediationWorkspaceRead,
 )
+from app.services.remediation_business_service import EXECUTION_STATUS_PENDING
 from app.services.remediation_executor import build_remediation_preview_result
 from app.services.remediation_service import (
     build_plan,
@@ -278,9 +279,15 @@ def execute_remediation_plan(
             "execution_mode": execution_mode,
             "change_ticket": change_ticket,
             "maintenance_window_id": maintenance_window_id,
+            "execution_status": EXECUTION_STATUS_PENDING if execution_mode == "apply" else "preview_only",
         },
+        "execution_status": EXECUTION_STATUS_PENDING if execution_mode == "apply" else "preview_only",
+        "business_status": None,
         "backups": {},
         "reverify": {},
+        "reverify_task_id": None,
+        "reverify_summary": {},
+        "targeted_finding_outcomes": [],
     }
     if execution_mode == "dry_run":
         preview_result = build_remediation_preview_result(
@@ -361,11 +368,16 @@ def get_remediation_task(
         last_event_at=events[-1].created_at if events else None,
         execution_boundary=(result_json.get("execution") or {}).get("execution_boundary"),
         execution_mode=(result_json.get("execution") or {}).get("execution_mode"),
+        execution_status=result_json.get("execution_status"),
+        business_status=result_json.get("business_status"),
         context=context,
         plan=result_json.get("plan") if isinstance(result_json.get("plan"), dict) else {},
         execution=result_json.get("execution") if isinstance(result_json.get("execution"), dict) else {},
         backups=result_json.get("backups") if isinstance(result_json.get("backups"), dict) else {},
         reverify=result_json.get("reverify") if isinstance(result_json.get("reverify"), dict) else {},
+        targeted_finding_outcomes=result_json.get("targeted_finding_outcomes") if isinstance(result_json.get("targeted_finding_outcomes"), list) else [],
+        reverify_task_id=str(result_json.get("reverify_task_id") or "").strip() or None,
+        reverify_summary=result_json.get("reverify_summary") if isinstance(result_json.get("reverify_summary"), dict) else {},
     )
 
 

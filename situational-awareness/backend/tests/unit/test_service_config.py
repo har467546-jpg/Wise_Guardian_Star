@@ -82,6 +82,15 @@ def test_parse_samba_config_extracts_guest_and_writable_share() -> None:
     }
 
 
+def test_parse_samba_config_extracts_source_file() -> None:
+    parsed = parse_service_config(
+        "samba",
+        "source_file=/etc/samba/smb.conf\nmap to guest = Bad User\nguest ok = yes\n",
+    )
+
+    assert parsed["source_files"] == ["/etc/samba/smb.conf"]
+
+
 def test_parse_tomcat_config_extracts_flags() -> None:
     parsed = parse_service_config(
         "tomcat",
@@ -107,6 +116,21 @@ def test_parse_apache_and_nginx_configs_extract_http_flags() -> None:
         "directory_listing_enabled": True,
         "webdav_enabled": True,
     }
+
+
+def test_parse_apache_config_extracts_source_files_from_grep_output() -> None:
+    apache = parse_service_config(
+        "apache",
+        "/etc/apache2/mods-enabled/dav.conf:Dav On\n"
+        "/etc/apache2/sites-enabled/default.conf:Options Indexes FollowSymLinks\n",
+    )
+
+    assert apache["source_files"] == [
+        "/etc/apache2/mods-enabled/dav.conf",
+        "/etc/apache2/sites-enabled/default.conf",
+    ]
+    assert apache["directory_listing_enabled"] is True
+    assert apache["webdav_enabled"] is True
 
 
 def test_parse_postgresql_config_extracts_auth_and_listener_flags() -> None:

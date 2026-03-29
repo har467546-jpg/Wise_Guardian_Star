@@ -63,6 +63,24 @@ def test_match_registered_playbook_prepares_auto_submit_remediation_plan() -> No
     assert decision.proposed_write_actions[0]["params"] == {"asset_id": "asset-9", "submit_if_ready": True}
 
 
+def test_match_registered_playbook_carries_maintenance_window_id_into_remediation_plan() -> None:
+    decision = match_registered_playbook(
+        content="maintenance_window_id 是 mw-e2e-20260327，请继续自动修复这台主机",
+        page_context={"pathname": "/assets/asset-9", "asset_id": "asset-9"},
+        browser_context={},
+        working_context={},
+    )
+
+    assert decision is not None
+    assert decision.playbook_id == PLAYBOOK_START_REMEDIATION_SESSION
+    assert "mw-e2e-20260327" in decision.reply_markdown
+    assert decision.proposed_write_actions[0]["params"] == {
+        "asset_id": "asset-9",
+        "submit_if_ready": True,
+        "maintenance_window_id": "mw-e2e-20260327",
+    }
+
+
 def test_match_registered_playbook_returns_none_for_generic_smalltalk() -> None:
     decision = match_registered_playbook(
         content="你好，介绍一下你自己",

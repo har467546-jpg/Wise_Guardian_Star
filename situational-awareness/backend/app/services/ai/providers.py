@@ -29,6 +29,7 @@ class ProviderMeta:
     default_base_url: str = ""
     default_wire_api: str = "responses"
     requires_base_url: bool = False
+    requires_api_key: bool = False
     url_style: Literal["none", "openai_like", "ollama"] = "none"
 
 
@@ -37,16 +38,19 @@ PROVIDER_META = {
     "openai": ProviderMeta(
         default_base_url=DEFAULT_OPENAI_BASE_URL,
         default_wire_api="responses",
+        requires_api_key=True,
         url_style="openai_like",
     ),
     "minimax": ProviderMeta(
         default_base_url=DEFAULT_MINIMAX_BASE_URL,
         default_wire_api="chat_completions",
+        requires_api_key=True,
         url_style="openai_like",
     ),
     "custom_proxy": ProviderMeta(
         default_wire_api="auto",
         requires_base_url=True,
+        requires_api_key=True,
         url_style="openai_like",
     ),
     "ollama_remote": ProviderMeta(
@@ -308,6 +312,10 @@ def resolve_provider_default_wire_api(provider_name: str) -> str:
 
 def provider_requires_base_url(provider_name: str) -> bool:
     return get_provider_meta(provider_name).requires_base_url
+
+
+def provider_requires_api_key(provider_name: str) -> bool:
+    return get_provider_meta(provider_name).requires_api_key
 
 
 def resolve_provider_base_url_candidates(
@@ -1185,6 +1193,9 @@ def list_remote_models(
     if normalized_provider == "mock":
         return "", [RemoteModelOption(id="gpt-4o-mini", display_name="Mock 默认模型")]
 
+    if provider_requires_api_key(normalized_provider) and not normalized_api_key:
+        raise ValueError("当前模型接入方式必须填写 API Key")
+
     if normalized_provider in {"openai", "minimax", "custom_proxy"}:
         resolved_base_urls = resolve_provider_models_base_url_candidates(
             normalized_provider,
@@ -1271,17 +1282,24 @@ def build_provider(
             provider=MockProvider(),
         )
 
+    if provider_requires_api_key(normalized_provider) and not normalized_api_key:
+        provider_labels = {
+            "openai": "OpenAI Provider",
+            "minimax": "MiniMax",
+            "custom_proxy": "自定义中转",
+        }
+        if fallback_to_mock:
+            label = provider_labels.get(normalized_provider, "当前模型接入方式")
+            return ProviderBuildResult(
+                provider_name="mock",
+                model=normalized_model,
+                resolved_base_url="",
+                provider=MockProvider(f"{label} 未配置 API Key，已回退到模板摘要。"),
+            )
+        raise ValueError("当前模型接入方式必须填写 API Key")
+
     if normalized_provider == "openai":
         resolved_base_url = normalized_base_url or DEFAULT_OPENAI_BASE_URL
-        if not normalized_api_key:
-            if fallback_to_mock:
-                return ProviderBuildResult(
-                    provider_name="mock",
-                    model=normalized_model,
-                    resolved_base_url="",
-                    provider=MockProvider("OpenAI Provider 未配置 API Key，已回退到模板摘要。"),
-                )
-            raise ValueError("当前模型接入方式必须填写 API Key")
         return ProviderBuildResult(
             provider_name="openai",
             model=normalized_model,

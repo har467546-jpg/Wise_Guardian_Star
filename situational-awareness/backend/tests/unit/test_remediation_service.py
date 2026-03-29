@@ -1,6 +1,7 @@
 import pytest
 
 import app.services.remediation_service as remediation_service
+from app.core.config import settings
 from app.db.models.credential import SSHCredential
 from app.db.models.enums import CredentialAuthType, FindingStatus, RiskSeverity
 from app.db.models.risk_finding import RiskFinding
@@ -149,32 +150,105 @@ def test_tomcat_remove_path_without_backup_target_is_blocked_for_enterprise_exec
     assert step.rollback_supported is False
 
 
-def test_samba_restrict_network_step_is_renderable() -> None:
+def test_samba_restrict_network_step_is_renderable_with_configured_admin_cidrs() -> None:
+    original_admin_cidrs = settings.SECURITY_ADMIN_CIDRS
+    settings.SECURITY_ADMIN_CIDRS = "192.168.130.0/24,10.10.10.0/24"
+    try:
+        planner = RemediationCommandPlanner(
+            finding=_build_finding(rule_id="samba.writable_share.nse.confirmed", service_name="samba"),
+            rendered_template={
+                "actions": [
+                    {
+                        "action_type": "restrict_network",
+                        "title": "限制 samba 暴露来源",
+                        "params": {
+                            "service_name": "samba",
+                            "target_scope": "admin_segment_only",
+                            "rule_id": "samba.writable_share.nse.confirmed",
+                        },
+                    }
+                ]
+            },
+            snapshot=None,
+            credential=None,
+            snapshot_context={"config_by_service": {}, "host_checks": {}, "packages": []},
+        )
+
+        step = planner.build_steps()[0]
+
+        assert step.execution_state == "ready"
+        assert "'hosts allow': '127.0.0.1 ::1 192.168.130.0/24 10.10.10.0/24'" in (step.generated_command or "")
+        assert "'hosts deny': '0.0.0.0/0 ::/0'" in (step.generated_command or "")
+    finally:
+        settings.SECURITY_ADMIN_CIDRS = original_admin_cidrs
+
+
+def test_samba_restrict_network_step_requires_admin_cidrs() -> None:
+    original_admin_cidrs = settings.SECURITY_ADMIN_CIDRS
+    settings.SECURITY_ADMIN_CIDRS = ""
+    try:
+        planner = RemediationCommandPlanner(
+            finding=_build_finding(rule_id="samba.writable_share.nse.confirmed", service_name="samba"),
+            rendered_template={
+                "actions": [
+                    {
+                        "action_type": "restrict_network",
+                        "title": "限制 samba 暴露来源",
+                        "params": {
+                            "service_name": "samba",
+                            "target_scope": "admin_segment_only",
+                            "rule_id": "samba.writable_share.nse.confirmed",
+                        },
+                    }
+                ]
+            },
+            snapshot=None,
+            credential=None,
+            snapshot_context={"config_by_service": {}, "host_checks": {}, "packages": []},
+        )
+
+        step = planner.build_steps()[0]
+
+        assert step.execution_state == "blocked"
+        assert "管理网段" in (step.blocked_reason or "")
+    finally:
+        settings.SECURITY_ADMIN_CIDRS = original_admin_cidrs
+
+
+def test_apache_remove_exposure_prefers_collected_source_files() -> None:
     planner = RemediationCommandPlanner(
-        finding=_build_finding(rule_id="samba.writable_share.nse.confirmed", service_name="samba"),
+        finding=_build_finding(rule_id="apache.webdav.enabled", service_name="apache"),
         rendered_template={
             "actions": [
                 {
-                    "action_type": "restrict_network",
-                    "title": "限制 samba 暴露来源",
+                    "action_type": "remove_exposure",
+                    "title": "关闭 Apache WebDAV",
                     "params": {
-                        "service_name": "samba",
-                        "target_scope": "admin_segment_only",
-                        "rule_id": "samba.writable_share.nse.confirmed",
+                        "service_name": "apache",
+                        "config_key": "webdav_enabled",
+                        "rule_id": "apache.webdav.enabled",
                     },
                 }
             ]
         },
         snapshot=None,
         credential=None,
-        snapshot_context={"config_by_service": {}, "host_checks": {}, "packages": []},
+        snapshot_context={
+            "config_by_service": {
+                "apache": {
+                    "source_files": ["/opt/apache/conf/extra/webdav.conf"],
+                }
+            },
+            "host_checks": {},
+            "packages": [],
+        },
     )
 
     step = planner.build_steps()[0]
 
     assert step.execution_state == "ready"
-    assert "'hosts allow': '127.0.0.1 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7'" in (step.generated_command or "")
-    assert "'hosts deny': '0.0.0.0/0 ::/0'" in (step.generated_command or "")
+    assert "/opt/apache/conf/extra/webdav.conf" in (step.generated_command or "")
+    assert "/etc/apache2/apache2.conf" not in (step.generated_command or "")
 
 
 def test_sudo_full_privilege_rule_step_is_renderable() -> None:

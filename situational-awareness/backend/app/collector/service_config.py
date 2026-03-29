@@ -45,6 +45,7 @@ SERVICE_CONFIG_COLLECTION_PLANS: dict[str, ServiceConfigCollectionPlan] = {
         command=(
             "sh -lc 'for f in /etc/samba/smb.conf; do "
             "if [ -f \"$f\" ]; then "
+            "printf \"source_file=%s\\n\" \"$f\"; "
             "grep -Eiv \"^[[:space:]]*(;|#|$)\" \"$f\" | "
             "grep -Ei \"(map to guest|guest ok|guest only|public|writable|writeable)[[:space:]]*=\" || true; "
             "fi; done'"
@@ -71,7 +72,7 @@ SERVICE_CONFIG_COLLECTION_PLANS: dict[str, ServiceConfigCollectionPlan] = {
             "sh -lc '"
             "for d in /etc/apache2 /etc/httpd /usr/local/apache2/conf; do "
             "if [ -d \"$d\" ]; then "
-            "grep -R -Eiv \"^[[:space:]]*(#|$)\" \"$d\" 2>/dev/null | "
+            "grep -RH -Eiv \"^[[:space:]]*(#|$)\" \"$d\" 2>/dev/null | "
             "grep -Ei \"(Options[[:space:]].*Indexes|Dav[[:space:]]+On)\" || true; "
             "fi; "
             "done'"
@@ -251,6 +252,7 @@ def _parse_vsftpd_config(raw: str | None) -> dict[str, Any]:
 def _parse_samba_config(raw: str | None) -> dict[str, Any]:
     guest_enabled = False
     writable_enabled = False
+    source_files = _extract_source_files(raw)
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or line.startswith(";") or "=" not in line:
@@ -268,26 +270,34 @@ def _parse_samba_config(raw: str | None) -> dict[str, Any]:
         result["guest_access"] = True
     if guest_enabled and writable_enabled:
         result["writable_guest_share"] = True
+    if source_files:
+        result["source_files"] = source_files
     return result
 
 
 def _parse_httpd_config(raw: str | None, *, webdav_token: str) -> dict[str, Any]:
     content = raw or ""
     result: dict[str, Any] = {}
+    source_files = _extract_source_files(raw)
     if re.search(r"\bOptions\b[^\n#]*\bIndexes\b", content, flags=re.IGNORECASE):
         result["directory_listing_enabled"] = True
     if re.search(webdav_token, content, flags=re.IGNORECASE):
         result["webdav_enabled"] = True
+    if source_files:
+        result["source_files"] = source_files
     return result
 
 
 def _parse_nginx_config(raw: str | None) -> dict[str, Any]:
     content = raw or ""
     result: dict[str, Any] = {}
+    source_files = _extract_source_files(raw)
     if re.search(r"\bautoindex\s+on\b", content, flags=re.IGNORECASE):
         result["directory_listing_enabled"] = True
     if re.search(r"\bdav_methods\b", content, flags=re.IGNORECASE):
         result["webdav_enabled"] = True
+    if source_files:
+        result["source_files"] = source_files
     return result
 
 
