@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from threading import Lock
 from time import sleep
 from typing import Any, Iterator, Literal
 from urllib.parse import urlparse
@@ -22,6 +23,9 @@ DEFAULT_MODEL_REQUEST_CLIENT_NAME = "asset-situational-awareness"
 DEFAULT_TRANSIENT_RETRY_ATTEMPTS = 3
 OPENAI_STYLE_ENDPOINT_SUFFIXES = ["/models", "/responses", "/chat/completions"]
 OLLAMA_ENDPOINT_SUFFIXES = ["/api/tags", "/api/generate"]
+AUTO_WIRE_API_CHOICES = {"responses", "chat_completions"}
+_AUTO_WIRE_API_PREFERENCES: dict[str, str] = {}
+_AUTO_WIRE_API_PREFERENCES_LOCK = Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +35,27 @@ class ProviderMeta:
     requires_base_url: bool = False
     requires_api_key: bool = False
     url_style: Literal["none", "openai_like", "ollama"] = "none"
+
+
+def _auto_wire_api_cache_key(base_url: str) -> str:
+    return str(base_url or "").strip().rstrip("/").lower()
+
+
+def get_cached_auto_wire_api(base_url: str) -> str:
+    cache_key = _auto_wire_api_cache_key(base_url)
+    if not cache_key:
+        return ""
+    with _AUTO_WIRE_API_PREFERENCES_LOCK:
+        return str(_AUTO_WIRE_API_PREFERENCES.get(cache_key) or "")
+
+
+def set_cached_auto_wire_api(base_url: str, wire_api: str) -> None:
+    cache_key = _auto_wire_api_cache_key(base_url)
+    normalized_wire_api = str(wire_api or "").strip().lower()
+    if not cache_key or normalized_wire_api not in AUTO_WIRE_API_CHOICES:
+        return
+    with _AUTO_WIRE_API_PREFERENCES_LOCK:
+        _AUTO_WIRE_API_PREFERENCES[cache_key] = normalized_wire_api
 
 
 PROVIDER_META = {
@@ -682,6 +707,16 @@ class OpenAICompatibleProvider(BaseProvider):
         self.provider_label = provider_label
         self.max_attempts = DEFAULT_TRANSIENT_RETRY_ATTEMPTS
 
+    def _cached_auto_wire_api(self) -> str:
+        if self.wire_api != "auto":
+            return ""
+        return get_cached_auto_wire_api(self.base_url)
+
+    def _remember_auto_wire_api(self, wire_api: str) -> None:
+        if self.wire_api != "auto":
+            return
+        set_cached_auto_wire_api(self.base_url, wire_api)
+
     def _build_headers(self) -> dict[str, str]:
         return _build_model_request_headers(
             api_key=self.api_key,
@@ -997,22 +1032,36 @@ class OpenAICompatibleProvider(BaseProvider):
 
     def generate(self, request: LLMRequest) -> str:
         def _generate() -> str:
+            cached_wire_api = self._cached_auto_wire_api()
             if self.wire_api == "responses":
                 return self._generate_responses(request)
             if self.wire_api == "chat_completions":
                 return self._generate_chat_completions(request)
+            if cached_wire_api == "responses":
+                result = self._generate_responses(request)
+                self._remember_auto_wire_api("responses")
+                return result
+            if cached_wire_api == "chat_completions":
+                result = self._generate_chat_completions(request)
+                self._remember_auto_wire_api("chat_completions")
+                return result
             try:
-                return self._generate_responses(request)
+                result = self._generate_responses(request)
+                self._remember_auto_wire_api("responses")
+                return result
             except httpx.HTTPStatusError as exc:
                 if not self._should_retry_with_chat_completions(exc):
                     raise
-            return self._generate_chat_completions(request)
+            result = self._generate_chat_completions(request)
+            self._remember_auto_wire_api("chat_completions")
+            return result
 
         return self._run_with_base_url_fallback(_generate)
 
     def stream_generate(self, request: LLMRequest) -> Iterator[str]:
         emitted_any = False
         try:
+            cached_wire_api = self._cached_auto_wire_api()
             if self.wire_api == "responses":
                 for chunk in self._stream_with_base_url_fallback(lambda: self._stream_responses(request)):
                     emitted_any = True
@@ -1023,15 +1072,37 @@ class OpenAICompatibleProvider(BaseProvider):
                     emitted_any = True
                     yield chunk
                 return
+            if cached_wire_api == "responses":
+                for chunk in self._stream_with_base_url_fallback(lambda: self._stream_responses(request)):
+                    emitted_any = True
+                    yield chunk
+                self._remember_auto_wire_api("responses")
+                return
+            if cached_wire_api == "chat_completions":
+                for chunk in self._stream_with_base_url_fallback(lambda: self._stream_chat_completions(request)):
+                    emitted_any = True
+                    yield chunk
+                self._remember_auto_wire_api("chat_completions")
+                return
 
             def _stream_auto() -> Iterator[str]:
+                responses_emitted = False
                 try:
-                    yield from self._stream_responses(request)
+                    for chunk in self._stream_responses(request):
+                        responses_emitted = True
+                        yield chunk
+                    if responses_emitted:
+                        self._remember_auto_wire_api("responses")
                     return
                 except httpx.HTTPStatusError as exc:
-                    if not self._should_retry_with_chat_completions(exc):
+                    if responses_emitted or not self._should_retry_with_chat_completions(exc):
                         raise
-                yield from self._stream_chat_completions(request)
+                chat_emitted = False
+                for chunk in self._stream_chat_completions(request):
+                    chat_emitted = True
+                    yield chunk
+                if chat_emitted:
+                    self._remember_auto_wire_api("chat_completions")
 
             for chunk in self._stream_with_base_url_fallback(_stream_auto):
                 emitted_any = True

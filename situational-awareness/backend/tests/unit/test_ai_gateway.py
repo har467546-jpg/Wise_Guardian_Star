@@ -52,6 +52,13 @@ def _use_test_runtime_values(monkeypatch) -> None:  # type: ignore[no-untyped-de
     monkeypatch.setattr(gateway_module, "read_runtime_env_value", lambda _key, fallback="": str(fallback))
 
 
+@pytest.fixture(autouse=True)
+def _clear_auto_wire_api_preferences() -> None:
+    providers_module._AUTO_WIRE_API_PREFERENCES.clear()
+    yield
+    providers_module._AUTO_WIRE_API_PREFERENCES.clear()
+
+
 def _assert_conservative_model_headers(
     headers: dict[str, str],
     *,
@@ -353,6 +360,107 @@ def test_custom_proxy_provider_auto_prefers_responses_then_falls_back_to_chat(mo
     assert summary == "Chat 输出"
     assert captured_urls == [
         "https://relay.example.com/v1/responses",
+        "https://relay.example.com/v1/chat/completions",
+    ]
+
+
+def test_custom_proxy_provider_auto_reuses_cached_chat_completions_after_first_fallback(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured_urls: list[str] = []
+
+    def _fake_post(url: str, *, headers: dict[str, str], json: dict[str, object], timeout: int):  # type: ignore[no-untyped-def]
+        captured_urls.append(url)
+        request = httpx.Request("POST", url)
+        if url.endswith("/responses"):
+            return httpx.Response(
+                404,
+                request=request,
+                json={"error": {"message": "Responses API is not supported by this relay."}},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={"choices": [{"message": {"content": "Chat 输出"}}]},
+        )
+
+    monkeypatch.setattr(providers_module.httpx, "post", _fake_post)
+
+    first_provider = providers_module.build_provider(
+        provider_name="custom_proxy",
+        model="gpt-5.4",
+        base_url="https://relay.example.com/v1",
+        wire_api="auto",
+        timeout_seconds=30,
+        api_key="relay-token",
+        fallback_to_mock=False,
+    )
+    second_provider = providers_module.build_provider(
+        provider_name="custom_proxy",
+        model="gpt-5.4",
+        base_url="https://relay.example.com/v1",
+        wire_api="auto",
+        timeout_seconds=30,
+        api_key="relay-token",
+        fallback_to_mock=False,
+    )
+
+    assert first_provider.provider.generate(providers_module.LLMRequest.from_text("请生成摘要")) == "Chat 输出"
+    assert second_provider.provider.generate(providers_module.LLMRequest.from_text("请继续")) == "Chat 输出"
+    assert captured_urls == [
+        "https://relay.example.com/v1/responses",
+        "https://relay.example.com/v1/chat/completions",
+        "https://relay.example.com/v1/chat/completions",
+    ]
+
+
+def test_custom_proxy_provider_auto_reuses_cached_chat_completions_for_streaming(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured_urls: list[str] = []
+
+    def _fake_stream(method: str, url: str, *, headers: dict[str, str], json: dict[str, object], timeout: int):  # type: ignore[no-untyped-def]
+        del method, headers, json, timeout
+        captured_urls.append(url)
+        request = httpx.Request("POST", url)
+        if url.endswith("/responses"):
+            return _FakeStreamResponse(
+                error=httpx.HTTPStatusError(
+                    "Responses API is not supported by this relay.",
+                    request=request,
+                    response=httpx.Response(404, request=request, json={"error": {"message": "Responses API is not supported by this relay."}}),
+                )
+            )
+        return _FakeStreamResponse(
+            lines=[
+                'data: {"choices":[{"delta":{"content":"Chat "}}]}',
+                'data: {"choices":[{"delta":{"content":"输出"}}]}',
+                "data: [DONE]",
+            ]
+        )
+
+    monkeypatch.setattr(providers_module.httpx, "stream", _fake_stream)
+
+    first_provider = providers_module.build_provider(
+        provider_name="custom_proxy",
+        model="gpt-5.4",
+        base_url="https://relay.example.com/v1",
+        wire_api="auto",
+        timeout_seconds=30,
+        api_key="relay-token",
+        fallback_to_mock=False,
+    )
+    second_provider = providers_module.build_provider(
+        provider_name="custom_proxy",
+        model="gpt-5.4",
+        base_url="https://relay.example.com/v1",
+        wire_api="auto",
+        timeout_seconds=30,
+        api_key="relay-token",
+        fallback_to_mock=False,
+    )
+
+    assert "".join(first_provider.provider.stream_generate(providers_module.LLMRequest.from_text("请生成摘要"))) == "Chat 输出"
+    assert "".join(second_provider.provider.stream_generate(providers_module.LLMRequest.from_text("请继续"))) == "Chat 输出"
+    assert captured_urls == [
+        "https://relay.example.com/v1/responses",
+        "https://relay.example.com/v1/chat/completions",
         "https://relay.example.com/v1/chat/completions",
     ]
 

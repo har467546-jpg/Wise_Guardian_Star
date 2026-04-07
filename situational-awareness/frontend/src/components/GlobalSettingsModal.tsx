@@ -197,7 +197,7 @@ const LLM_PROVIDER_META: Record<LLMProvider, LLMProviderMeta> = {
     defaultBaseUrl: "",
     defaultWireApi: "auto",
     requireBaseUrl: true,
-    wireApiHint: "自定义中转默认建议使用 `自动协商`，优先尝试 Responses，失败后再回退到 Chat Completions。",
+    wireApiHint: "自定义中转默认建议使用 `自动协商`。系统会记住成功的接口类型来减少重复探测；如果你已经确认上游只支持某一种接口，直接固定为对应模式会更快。",
   },
   ollama_remote: {
     title: "远程 Ollama",

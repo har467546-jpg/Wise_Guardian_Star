@@ -143,6 +143,7 @@ type MaintenanceWindowPrompt = {
 
 const MESSAGE_TURN_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_ACK_TIMEOUT_MS = 8_000;
+const STREAM_FRAME_CONNECT_TIMEOUT_MS = 1_200;
 const UI_STEP_FAIL_OPEN_TEXT = "上次页面动作未收到继续结果，已结束等待。你可以继续提问、重试，或新开会话。";
 const HAOR_SUMMARY_POLL_INTERVAL_MS = 15_000;
 const EMPTY_HAOR_SUMMARY: AgentSessionSummary = {
@@ -1463,6 +1464,33 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     return true;
   };
 
+  const waitForStreamConnection = async (timeoutMs = STREAM_FRAME_CONNECT_TIMEOUT_MS) => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        return true;
+      }
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 40);
+      });
+    }
+    return wsRef.current?.readyState === WebSocket.OPEN;
+  };
+
+  const sendStreamFrameWithWarmup = async (frame: Record<string, unknown>, timeoutMs = STREAM_FRAME_CONNECT_TIMEOUT_MS) => {
+    if (sendStreamFrame(frame)) {
+      return true;
+    }
+    const connected = await waitForStreamConnection(timeoutMs);
+    if (!connected) {
+      return false;
+    }
+    return sendStreamFrame(frame);
+  };
+
   const handleStreamTurnStarted = (event: AgentTurnStartedEvent) => {
     if (
       ignoredTurnIdsRef.current.has(event.turn_id) ||
@@ -2176,7 +2204,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
           acked: false,
           timerId: null,
         };
-        usedStream = sendStreamFrame({
+        usedStream = await sendStreamFrameWithWarmup({
           type: "ui_step",
           step_request_id: stepRequestId,
           browser_context: refreshedBrowserContext,
@@ -2300,7 +2328,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       setOpen(true);
       setErrorText(null);
       setStreamError(null);
-      usedStream = sendStreamFrame({
+      usedStream = await sendStreamFrameWithWarmup({
         type: "message",
         client_message_id: clientMessageId,
         content: normalized,
@@ -2396,14 +2424,14 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     let usedStream = false;
     try {
       setApproving(true);
-      usedStream = sendStreamFrame({ type: "approve_plan" });
+      setOpen(true);
+      usedStream = await sendStreamFrameWithWarmup({ type: "approve_plan" });
       if (!usedStream) {
         const result = await approveHaorSession({});
         message.success(`haor 编排任务已提交：${result.task_id}`);
         await loadSession(true);
         await loadTask(result.task_id, true);
       }
-      setOpen(true);
       setErrorText(null);
     } catch (error) {
       const text = error instanceof Error ? error.message : "haor 计划提交失败";
