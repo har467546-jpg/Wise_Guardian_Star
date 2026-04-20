@@ -15,6 +15,8 @@ def purge_local_assets(db: Session) -> list[dict[str, str | None]]:
         hostname = asset.hostname.strip() if isinstance(asset.hostname, str) and asset.hostname.strip() else None
         if not ip:
             continue
+        if getattr(asset, "host_runner", None) is not None:
+            continue
         is_local, reason = resolve_local_asset(ip, hostname)
         if not is_local:
             continue

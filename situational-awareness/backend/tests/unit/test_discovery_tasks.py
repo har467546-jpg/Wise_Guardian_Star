@@ -38,6 +38,9 @@ class _FakeDB:
     def commit(self) -> None:
         self.committed = True
 
+    def delete(self, item) -> None:
+        self.added.append(("deleted", item))
+
 
 class _FakeSessionLocal:
     def __init__(self, db):
@@ -71,7 +74,7 @@ def test_filter_excluded_local_hosts_returns_non_local_only(monkeypatch) -> None
     assert excluded == [{"ip": "192.168.10.5", "hostname": "scanner-host", "reason": "匹配平台本机 IP"}]
 
 
-def test_filter_excluded_local_hosts_skips_gateway_candidate(monkeypatch) -> None:
+def test_filter_excluded_local_hosts_no_longer_skips_gateway_candidate(monkeypatch) -> None:
     monkeypatch.setattr(
         discovery_tasks,
         "resolve_local_asset",
@@ -86,11 +89,14 @@ def test_filter_excluded_local_hosts_skips_gateway_candidate(monkeypatch) -> Non
         cidr="192.168.10.0/24",
     )
 
-    assert filtered == [{"ip": "192.168.10.88", "hostname": "target-host"}]
-    assert excluded == [{"ip": "192.168.10.254", "hostname": "gateway-host", "reason": "命中网段边界网关候选地址"}]
+    assert filtered == [
+        {"ip": "192.168.10.254", "hostname": "gateway-host"},
+        {"ip": "192.168.10.88", "hostname": "target-host"},
+    ]
+    assert excluded == []
 
 
-def test_discover_hosts_excludes_gateway_candidate(monkeypatch) -> None:
+def test_discover_hosts_retains_boundary_addresses_without_explicit_local_evidence(monkeypatch) -> None:
     job = SimpleNamespace(
         id="job-discover-1",
         cidr="192.168.10.0/24",
@@ -131,13 +137,33 @@ def test_discover_hosts_excludes_gateway_candidate(monkeypatch) -> None:
     result = discovery_tasks.discover_hosts("job-discover-1")
 
     assert result == "job-discover-1"
-    assert job.summary_json["host_count"] == 1
-    assert job.summary_json["hosts"] == [{"ip": "192.168.10.88", "hostname": "target-host", "ports": [], "services": []}]
-    assert job.summary_json["excluded_local_ip_count"] == 1
-    assert job.summary_json["excluded_local_hosts"] == [
-        {"ip": "192.168.10.254", "hostname": "gateway-host", "reason": "命中网段边界网关候选地址"}
+    assert job.summary_json["host_count"] == 2
+    assert job.summary_json["hosts"] == [
+        {"ip": "192.168.10.254", "hostname": "gateway-host", "ports": [], "services": []},
+        {"ip": "192.168.10.88", "hostname": "target-host", "ports": [], "services": []},
     ]
+    assert job.summary_json["excluded_local_ip_count"] == 0
+    assert job.summary_json["excluded_local_hosts"] == []
     assert db.committed is True
+
+
+def test_filter_excluded_local_hosts_skips_explicit_runner_local_ip(monkeypatch) -> None:
+    monkeypatch.setattr(
+        discovery_tasks,
+        "resolve_local_asset",
+        lambda ip, hostname=None: (False, None),
+    )
+
+    filtered, excluded = discovery_tasks._filter_excluded_local_hosts(
+        [
+            {"ip": "192.168.10.5", "hostname": "scan-node"},
+            {"ip": "192.168.10.88", "hostname": "target-host"},
+        ],
+        local_node_hints={"ips": ["192.168.10.5"], "hostnames": ["scan-node"]},
+    )
+
+    assert filtered == [{"ip": "192.168.10.88", "hostname": "target-host"}]
+    assert excluded == [{"ip": "192.168.10.5", "hostname": "scan-node", "reason": "匹配扫描节点本机 IP"}]
 
 
 def test_upsert_assets_skips_local_ip(monkeypatch) -> None:
@@ -170,10 +196,26 @@ def test_upsert_assets_skips_local_ip(monkeypatch) -> None:
     assert result == "job-1"
     assert created_ips == {"192.168.10.88"}
     assert db.scalar_calls == 1
-    assert db.executed
     assert job.summary_json["excluded_local_ip_count"] == 1
     assert job.summary_json["excluded_local_hosts"][0]["ip"] == "192.168.10.5"
     assert db.committed is True
+
+
+def test_purge_excluded_local_assets_keeps_runner_assets() -> None:
+    asset_with_runner = SimpleNamespace(id="asset-runner", ip="192.168.10.5", host_runner=SimpleNamespace(id="runner-1"))
+    plain_asset = SimpleNamespace(id="asset-plain", ip="192.168.10.6", host_runner=None)
+    db = _FakeDB(None, assets=[asset_with_runner, plain_asset])
+
+    removed = discovery_tasks._purge_excluded_local_assets(
+        db,
+        [
+            {"ip": "192.168.10.5"},
+            {"ip": "192.168.10.6"},
+        ],
+    )
+
+    assert removed == 1
+    assert db.added == [("deleted", plain_asset)]
 
 
 def test_upsert_asset_ports_strips_null_bytes_from_fingerprint_json() -> None:
@@ -206,6 +248,27 @@ def test_upsert_asset_ports_strips_null_bytes_from_fingerprint_json() -> None:
     assert added_ports[0].service_name == "mysql"
     assert added_ports[0].fingerprint_json["banner"] == "mysqlhandshake"
     assert added_ports[0].fingerprint_json["evidence"] == ["greetingpacket"]
+
+
+def test_upsert_asset_ports_closes_stale_ports_inside_scan_scope() -> None:
+    db = _FakeDB(None)
+    asset = Asset(id="asset-2", ip="192.168.10.90")
+    stale_port = AssetPort(asset_id=asset.id, port=22, protocol="tcp", state="open", fingerprint_json={})
+    asset.ports = [stale_port]
+
+    stats = discovery_tasks._upsert_asset_ports(
+        db,
+        asset,
+        {
+            "ports": [80],
+            "services": [{"port": 80, "service": "http", "fingerprint_json": {}}],
+            "scan_scope": {"protocol": "tcp", "scope_kind": "explicit", "ports": [22, 80], "scanned_port_count": 2},
+        },
+    )
+
+    assert stale_port.state == "closed"
+    assert stats["closed_port_count"] == 1
+    assert stats["reconciled_stale_port_count"] == 1
 
 
 def test_full_port_scan_updates_summary_and_creates_skeleton_ports(monkeypatch) -> None:

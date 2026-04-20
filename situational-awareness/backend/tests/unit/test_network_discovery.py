@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -70,6 +71,18 @@ def test_parse_nmap_full_scan_xml_output_returns_open_tcp_ports() -> None:
     assert parsed == [22]
 
 
+def test_parse_arp_scan_output_returns_ipv4_hosts() -> None:
+    parsed = AsyncNetworkDiscovery.parse_arp_scan_output(
+        """
+        10.10.0.2\t00:11:22:33:44:55\tVendor
+        Interface: eth0
+        10.10.0.3\t00:11:22:33:44:56\tVendor
+        """
+    )
+
+    assert parsed == ["10.10.0.2", "10.10.0.3"]
+
+
 def test_discover_live_hosts_with_nmap_builds_expected_command(monkeypatch) -> None:
     scanner = AsyncNetworkDiscovery(DiscoveryConfig(liveness_mode="nmap_icmp"))
     captured: dict[str, tuple[str, ...]] = {}
@@ -90,7 +103,20 @@ def test_discover_live_hosts_with_nmap_builds_expected_command(monkeypatch) -> N
     result = asyncio.run(scanner._discover_live_hosts_with_nmap("10.10.0.0/30"))
 
     assert result == []
-    assert captured["cmd"] == ("nmap", "-sn", "-PE", "-n", "-T5", "--min-rate", "100000", "10.10.0.0/30", "-oX", "-")
+    assert captured["cmd"] == (
+        "nmap",
+        "-sn",
+        "-n",
+        "-PE",
+        "-PS22,80,443,445,3389",
+        "-PA80,443,445,3389",
+        "-T4",
+        "--min-rate",
+        "100000",
+        "10.10.0.0/30",
+        "-oX",
+        "-",
+    )
 
 
 def test_discover_live_hosts_with_nmap_raises_when_nmap_missing(monkeypatch) -> None:
@@ -207,10 +233,49 @@ def test_discover_nmap_icmp_scans_services_only_for_live_hosts(monkeypatch) -> N
 
     results = asyncio.run(scanner.discover("10.10.0.0/30", include_services=True))
 
-    assert captured["hosts"] == [{"ip": "10.10.0.1"}]
+    assert captured["hosts"] == [
+        {
+            "ip": "10.10.0.1",
+            "discovery_sources": ["nmap_host_discovery"],
+            "discovery_evidence": ["nmap_host_discovery:10.10.0.1"],
+        }
+    ]
     assert len(results) == 1
     assert results[0].hostname == "svc.lab.example"
     assert results[0].ports == [443]
+
+
+def test_discover_multi_source_merges_arp_fping_and_nmap(monkeypatch) -> None:
+    scanner = AsyncNetworkDiscovery(DiscoveryConfig(liveness_mode="multi_source", enable_arp_discovery=True, enable_fping=True))
+
+    monkeypatch.setattr("app.scanner.network_discovery.find_local_ipv4_interface_for_network", lambda network: SimpleNamespace(name="eth0"))
+    monkeypatch.setattr(scanner, "_has_arp_scan", lambda: True)
+    monkeypatch.setattr(scanner, "_has_arping", lambda: False)
+    monkeypatch.setattr(scanner, "_has_fping", lambda: True)
+    monkeypatch.setattr(scanner, "_has_nmap", lambda: True)
+
+    async def fake_arp_scan(cidr: str, *, interface_name: str):
+        assert cidr == "10.10.0.0/30"
+        assert interface_name == "eth0"
+        return ["10.10.0.1"]
+
+    async def fake_fping(cidr: str):
+        assert cidr == "10.10.0.0/30"
+        return ["10.10.0.2"]
+
+    async def fake_nmap(cidr: str):
+        assert cidr == "10.10.0.0/30"
+        return ["10.10.0.1", "10.10.0.2"]
+
+    monkeypatch.setattr(scanner, "_discover_live_hosts_with_arp_scan", fake_arp_scan)
+    monkeypatch.setattr(scanner, "_discover_live_hosts_with_fping", fake_fping)
+    monkeypatch.setattr(scanner, "_discover_live_hosts_with_nmap", fake_nmap)
+
+    results = asyncio.run(scanner.discover("10.10.0.0/30", include_services=False))
+
+    assert [item.ip for item in results] == ["10.10.0.1", "10.10.0.2"]
+    assert results[0].discovery_sources == ["arp_scan", "nmap_host_discovery"]
+    assert results[1].discovery_sources == ["fping", "nmap_host_discovery"]
 
 
 def test_network_discovery_expands_scan_ports_in_top1000_mode(monkeypatch) -> None:

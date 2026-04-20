@@ -469,10 +469,10 @@ class RunnerTaskAssignmentRead(BaseModel):
     task_id: str
     asset_id: str
     session_id: str | None = None
-    task_type: Literal["remediation_execute"]
+    task_type: Literal["remediation_execute", "asset_scan"]
     summary: str
     execution_mode: Literal["apply"] = "apply"
-    plan: HostRemediationPlanRead
+    plan: dict[str, Any] = Field(default_factory=dict)
     steps: list[RunnerTaskStepRead] = Field(default_factory=list)
 
 

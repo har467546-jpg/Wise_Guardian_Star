@@ -21,6 +21,10 @@ def test_parse_port_csv_fallback_when_empty() -> None:
 
 def test_build_discovery_config_from_settings(monkeypatch) -> None:
     monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_LIVENESS_PORTS", "22,443,8443")
+    monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_LIVENESS_MODE", "multi_source")
+    monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_ENABLE_ARP_DISCOVERY", True)
+    monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_ENABLE_FPING", True)
+    monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_NMAP_HOST_DISCOVERY_PROFILE", "aggressive")
     monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_SERVICE_PORTS", "80,443,3306")
     monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_HIGH_BACKDOOR_PORTS", "31337,55555")
     monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_PORTSET_MODE", "top1000_plus_custom")
@@ -28,6 +32,10 @@ def test_build_discovery_config_from_settings(monkeypatch) -> None:
 
     cfg = discovery_tasks._build_discovery_config()
     assert cfg.liveness_ports == (22, 443, 8443)
+    assert cfg.liveness_mode == "multi_source"
+    assert cfg.enable_arp_discovery is True
+    assert cfg.enable_fping is True
+    assert cfg.nmap_host_discovery_profile == "aggressive"
     assert cfg.service_ports == (80, 443, 3306)
     assert cfg.high_backdoor_ports == (31337, 55555)
     assert cfg.portset_mode == "top1000_plus_custom"

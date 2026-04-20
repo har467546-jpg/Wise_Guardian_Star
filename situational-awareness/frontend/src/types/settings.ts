@@ -23,7 +23,10 @@ export type PlatformSettings = {
   remediation_stop_on_failure: boolean;
   remediation_prepare_backups_enabled: boolean;
   discovery_liveness_ports: string;
-  discovery_liveness_mode: "nmap_icmp" | "tcp_connect";
+  discovery_liveness_mode: "multi_source" | "nmap_icmp" | "tcp_connect";
+  discovery_enable_arp_discovery: boolean;
+  discovery_enable_fping: boolean;
+  discovery_nmap_host_discovery_profile: "balanced" | "aggressive";
   discovery_service_ports: string;
   discovery_high_backdoor_ports: string;
   discovery_portset_mode: "curated" | "top1000_plus_custom" | "full";
@@ -65,7 +68,10 @@ export type PlatformSettingsInput = {
   remediation_stop_on_failure: boolean;
   remediation_prepare_backups_enabled: boolean;
   discovery_liveness_ports: string;
-  discovery_liveness_mode: "nmap_icmp" | "tcp_connect";
+  discovery_liveness_mode: "multi_source" | "nmap_icmp" | "tcp_connect";
+  discovery_enable_arp_discovery: boolean;
+  discovery_enable_fping: boolean;
+  discovery_nmap_host_discovery_profile: "balanced" | "aggressive";
   discovery_service_ports: string;
   discovery_high_backdoor_ports: string;
   discovery_portset_mode: "curated" | "top1000_plus_custom" | "full";

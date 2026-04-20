@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from app.core.config import settings
+from app.utils.net import list_local_ipv4_addresses
 
 RUNTIME_LOCAL_ASSET_HINTS_PATH = Path(__file__).resolve().parents[2] / ".runtime" / "local_asset_hints.json"
 
@@ -61,6 +62,12 @@ def get_local_asset_matcher() -> LocalAssetMatcher:
             continue
         hostnames.add(name.lower())
         hostnames.add(name.split(".")[0].lower())
+
+    for local_ip in list_local_ipv4_addresses():
+        try:
+            ips.add(str(ipaddress.ip_address(local_ip)))
+        except ValueError:
+            continue
 
     matcher = LocalAssetMatcher(
         ips=frozenset(ips),

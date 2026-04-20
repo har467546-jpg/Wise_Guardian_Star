@@ -13,6 +13,15 @@ class DummyDB:
     def rollback(self) -> None:
         return None
 
+    def add(self, item) -> None:  # noqa: ARG002 - no-op fake
+        return None
+
+    def commit(self) -> None:
+        return None
+
+    def refresh(self, item) -> None:  # noqa: ARG002 - no-op fake
+        return None
+
 
 def _job(job_id: str) -> SimpleNamespace:
     return SimpleNamespace(
@@ -78,6 +87,45 @@ def test_create_discovery_job_creates_new_job(monkeypatch) -> None:
     assert result.status == "pending"
     assert result.task_id == "task-new"
     assert str(result.job.cidr) == "10.10.0.0/24"
+
+
+def test_create_discovery_job_with_runner_dispatch_skips_local_celery(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(discovery_endpoint, "get_active_job_by_cidr", lambda db, cidr: None)
+    monkeypatch.setattr(discovery_endpoint, "create_job", lambda **kwargs: _job("job-runner"))
+    monkeypatch.setattr(discovery_endpoint, "get_latest_task_run_for_scope", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        discovery_endpoint,
+        "resolve_runner_by_asset_for_read",
+        lambda db, asset_id: SimpleNamespace(asset_id=asset_id, install_status="installed", status="online"),
+    )
+    monkeypatch.setattr(discovery_endpoint, "create_task_run", lambda *args, **kwargs: SimpleNamespace(id="task-runner", result_json={}))
+    monkeypatch.setattr(
+        discovery_endpoint,
+        "run_asset_scan_task",
+        SimpleNamespace(delay=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not dispatch celery for runner jobs"))),
+    )
+
+    def _update_task_run(db, task, **kwargs):  # type: ignore[no-untyped-def]
+        observed["message"] = kwargs.get("message")
+        observed["result_json"] = kwargs.get("result_json")
+        return task
+
+    monkeypatch.setattr(discovery_endpoint, "update_task_run", _update_task_run)
+
+    response = Response()
+    result = discovery_endpoint.create_discovery_job(
+        payload=DiscoveryJobCreate(cidr="10.10.0.0/24", label="runner", runner_asset_id="asset-runner-1"),
+        response=response,
+        db=DummyDB(),
+        current_user=SimpleNamespace(id="user-1"),
+    )
+
+    assert response.status_code == 201
+    assert result.task_id == "task-runner"
+    assert observed["message"] == "等待扫描节点接单"
+    assert observed["result_json"]["context"]["runner_asset_id"] == "asset-runner-1"
 
 
 def test_create_discovery_job_normalizes_host_bits_before_lookup_and_create(monkeypatch) -> None:

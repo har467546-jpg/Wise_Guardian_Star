@@ -585,7 +585,7 @@ export function listPlatformLogs(params?: {
   return apiFetch<PlatformLogListResponse>(`/logs?${query.toString()}`);
 }
 
-export function createDiscoveryJob(payload: { cidr: string; label?: string }) {
+export function createDiscoveryJob(payload: { cidr: string; label?: string; runner_asset_id?: string }) {
   return apiFetch<DiscoveryJobCreateResponse>("/discovery/jobs", {
     method: "POST",
     body: JSON.stringify(payload),

@@ -235,17 +235,24 @@ NEXT_ALLOWED_DEV_ORIGINS=localhost,127.0.0.1,192.168.*.*,10.*.*.*,172.*.*.*
 ## 说明
 - 前端用户可见文案默认使用中文；仅保留 `IP / CIDR / CVE / CWE / YAML / JSON / SSH / nmap` 等必要技术缩写。
 - 当前扫描分层执行：
-  - `liveness` 默认模式：`nmap_icmp`
-  - `liveness` 默认命令：`nmap -sn -PE -n -T5 --min-rate 100000 <cidr> -oX -`
-  - 扫描阶段不再发起任何主动 DNS 查询；纯探活阶段默认只返回存活 IP
+  - `liveness` 默认模式：`multi_source`
+  - 同网段优先使用 `arp-scan`，缺失时回退 `arping`
+  - 跨网段和补充探活默认结合 `fping` 与 `nmap` 多探针主机发现
+  - 默认 `nmap` 主机发现命令会使用 `-PE + -PS + -PA` 组合，而不是仅依赖单一 ICMP Echo
+  - 扫描阶段不再发起任何主动 DNS 查询；纯探活阶段默认只返回存活 IP 和来源证据
   - `full_port_scan` 在 `full` 模式下优先使用 `nmap -Pn -n -T5 --min-rate 100000 --open -p- <ip> -oX -`
   - `liveness_ports` 仅在 `hybrid` 模式下生效，默认值：`22,80,443,8080,8443`
   - `service` 服务识别端口默认：`Top1000 TCP 端口 + 自定义重点端口 + 高位后门特征端口`
   - `high_backdoor` 后门特征高位端口默认：`1337,4444,...,65000`
+- 发现结果会保留 `discovery_sources` 与 `discovery_evidence`，用于说明主机是通过 `arp_scan / arping / fping / nmap_host_discovery / tcp_connect` 中哪些链路识别出来的。
+- 不再根据 `.1`、`.254` 或网段边界自动排除“网关候选”地址；只有命中平台本机或扫描节点本机的显式证据时才会被排除。
+- 端口状态已改为按本轮扫描范围做对账：本轮确认关闭的历史开放端口会收敛为 `closed`，不会长期保留脏 `open` 状态。
 - 命中后门特征端口时，平台会跳过版本识别并将版本字段置空，仅保留端口与服务名识别结果。
-- 若运行 `nmap_icmp` 模式时缺少 `nmap`、命令超时或 XML 解析失败，主机发现任务会直接失败，不会静默回退到逐 IP `ping`。
+- 多源发现模式下，任一单工具失败不会直接判整轮发现失败；只有全部已启用链路都不可用或全部执行失败时，发现任务才会失败。
 - 扫描阶段保留的主机名只来自被动证据，例如已有资产主机名、协议探测得到的 `hostname_hint`、TLS 证书或 HTTP 响应中的名称。
 - 本机资产排除不再依赖 hostname 的 DNS 反查；如需稳定排除平台自身，请显式配置 `LOCAL_ASSET_IPS` 或写入 runtime hints。
+- 若要在真实多网段环境中使用扫描节点，推荐复用现有 Host Runner，由扫描节点接单执行发现脚本并直接回传结果。
+- Docker 默认 `bridge` 网络仅适合演示或联调，不代表容器天然可见真实局域网；真实网络验收应在具备目标网段可见性的宿主机或扫描节点上执行。
 - 若容器内可用 `nmap`，低置信、仅端口猜测或缺少产品/版本的端口会自动触发定向 `-sV --version-intensity 7` XML 补扫。
 - `nmap -sV` 与 NSE 默认超时均为 `8` 秒，超时后仅跳过当前富化，不阻塞整轮扫描。
 - 服务识别优先使用被动 banner + 轻量协议探测，当前已覆盖 `ssh/ftp/http/https/redis/mysql/postgresql/smtp/pop3/imap/telnet/memcached/rpcbind/irc/java-rmi/ajp13/rexec/rlogin/rsh`，不足时再回退到 nmap。
@@ -254,6 +261,9 @@ NEXT_ALLOWED_DEV_ORIGINS=localhost,127.0.0.1,192.168.*.*,10.*.*.*,172.*.*.*
   - `DISCOVERY_TOP_PORTS_LIMIT`
   - `DISCOVERY_LIVENESS_PORTS`
   - `DISCOVERY_LIVENESS_MODE`
+  - `DISCOVERY_ENABLE_ARP_DISCOVERY`
+  - `DISCOVERY_ENABLE_FPING`
+  - `DISCOVERY_NMAP_HOST_DISCOVERY_PROFILE`
   - `DISCOVERY_NMAP_MIN_RATE`
   - `DISCOVERY_NMAP_LIVENESS_TIMEOUT_SECONDS`
   - `DISCOVERY_NMAP_FULL_SCAN_TIMEOUT_SECONDS`

@@ -36,6 +36,9 @@ const FIELD_TO_TAB_KEY: Record<string, SettingsTabKey> = {
   remediation_prepare_backups_enabled: "remediation-runner",
   discovery_liveness_ports: "scan-verify",
   discovery_liveness_mode: "scan-verify",
+  discovery_enable_arp_discovery: "scan-verify",
+  discovery_enable_fping: "scan-verify",
+  discovery_nmap_host_discovery_profile: "scan-verify",
   discovery_service_ports: "scan-verify",
   discovery_high_backdoor_ports: "scan-verify",
   discovery_portset_mode: "scan-verify",
@@ -95,7 +98,10 @@ const READ_ONLY_DEFAULTS: PlatformSettingsInput = {
   remediation_stop_on_failure: true,
   remediation_prepare_backups_enabled: true,
   discovery_liveness_ports: "22,80,443,8080,8443",
-  discovery_liveness_mode: "nmap_icmp",
+  discovery_liveness_mode: "multi_source",
+  discovery_enable_arp_discovery: true,
+  discovery_enable_fping: true,
+  discovery_nmap_host_discovery_profile: "balanced",
   discovery_service_ports: "22,80,443,3306,5432,6379,8080,8443",
   discovery_high_backdoor_ports: "1337,4444,5555,6666,31337",
   discovery_portset_mode: "full",
@@ -222,6 +228,9 @@ function toFormValues(payload: PlatformSettings): PlatformSettingsInput {
     remediation_prepare_backups_enabled: payload.remediation_prepare_backups_enabled,
     discovery_liveness_ports: payload.discovery_liveness_ports,
     discovery_liveness_mode: payload.discovery_liveness_mode,
+    discovery_enable_arp_discovery: payload.discovery_enable_arp_discovery,
+    discovery_enable_fping: payload.discovery_enable_fping,
+    discovery_nmap_host_discovery_profile: payload.discovery_nmap_host_discovery_profile,
     discovery_service_ports: payload.discovery_service_ports,
     discovery_high_backdoor_ports: payload.discovery_high_backdoor_ports,
     discovery_portset_mode: payload.discovery_portset_mode,
@@ -743,8 +752,20 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
                         label="存活探测模式"
                         disabled={disabled}
                         options={[
+                          { label: "多源联合", value: "multi_source" },
                           { label: "Nmap ICMP", value: "nmap_icmp" },
                           { label: "TCP Connect", value: "tcp_connect" },
+                        ]}
+                      />
+                      <SwitchField name="discovery_enable_arp_discovery" label="启用同网段 ARP 发现" disabled={disabled} />
+                      <SwitchField name="discovery_enable_fping" label="启用 FPing 批量探活" disabled={disabled} />
+                      <SelectField
+                        name="discovery_nmap_host_discovery_profile"
+                        label="Nmap 主机发现策略"
+                        disabled={disabled}
+                        options={[
+                          { label: "平衡模式", value: "balanced" },
+                          { label: "增强模式", value: "aggressive" },
                         ]}
                       />
                       <TextField name="discovery_service_ports" label="服务识别端口" disabled={disabled} textarea extra="使用逗号分隔端口" />

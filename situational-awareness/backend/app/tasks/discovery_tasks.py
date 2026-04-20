@@ -87,6 +87,12 @@ def discover_hosts(job_id: str) -> str:
             "hosts": filtered_hosts,
             "excluded_local_ip_count": len(excluded_local_hosts),
             "excluded_local_hosts": excluded_local_hosts,
+            "discovery_source_stats": _build_discovery_source_stats(filtered_hosts),
+            "baseline_diff_summary": _build_baseline_diff_summary(
+                baseline_hosts=[host.to_dict() for host in hosts],
+                accepted_hosts=filtered_hosts,
+                excluded_hosts=excluded_local_hosts,
+            ),
         }
         job.summary_json = sanitize_json_value(job.summary_json)
         db.add(job)
@@ -141,6 +147,9 @@ def full_port_scan(job_id: str) -> str:
                 "hostname": _normalize_hostname(scanned.hostname if scanned else None) or _normalize_hostname(host.get("hostname")),
                 "ports": scanned_ports,
                 "services": [],
+                "discovery_sources": _extract_string_list(host.get("discovery_sources")),
+                "discovery_evidence": _extract_string_list(host.get("discovery_evidence")),
+                "scan_scope": _build_host_scan_scope(scanner.scan_ports),
             }
             prepared_hosts.append(base_host)
 
@@ -154,6 +163,9 @@ def full_port_scan(job_id: str) -> str:
             "open_port_count": open_port_count,
             "scanned_port_count": len(scanner.scan_ports) * len(prepared_hosts),
             "service_probe_target_count": open_port_count,
+            "closed_port_count": 0,
+            "filtered_or_unknown_count": 0,
+            "reconciled_stale_port_count": 0,
         }
         summary["service_enrichment_stats"] = _empty_service_enrichment_stats()
         job.summary_json = sanitize_json_value(summary)
@@ -162,6 +174,7 @@ def full_port_scan(job_id: str) -> str:
         if ips:
             assets = db.scalars(select(Asset).where(Asset.ip.in_(ips))).all()
             assets_by_ip = {str(asset.ip): asset for asset in assets}
+            reconciliation_stats = _empty_port_scan_stats()
             for host in prepared_hosts:
                 ip = str(host.get("ip") or "").strip()
                 asset = assets_by_ip.get(ip)
@@ -171,8 +184,10 @@ def full_port_scan(job_id: str) -> str:
                 if hostname:
                     asset.hostname = hostname
                 asset.last_seen_at = datetime.now(timezone.utc)
-                _upsert_asset_ports(db, asset, host)
+                host_stats = _upsert_asset_ports(db, asset, host)
+                _merge_port_scan_stats(reconciliation_stats, host_stats)
                 db.add(asset)
+            summary["port_scan_stats"].update(reconciliation_stats)
 
         db.add(job)
         db.commit()
@@ -229,6 +244,9 @@ def probe_open_services(job_id: str) -> str:
                 "hostname": _normalize_hostname(scanned.hostname if scanned else None) or _normalize_hostname(host.get("hostname")),
                 "ports": open_ports,
                 "services": _enrich_python_services(scanned.services if scanned else [], identified_at),
+                "discovery_sources": _extract_string_list(host.get("discovery_sources")),
+                "discovery_evidence": _extract_string_list(host.get("discovery_evidence")),
+                "scan_scope": _normalize_scan_scope(host.get("scan_scope")),
             }
             prepared_hosts.append(base_host)
 
@@ -320,6 +338,9 @@ def probe_open_services(job_id: str) -> str:
                 "hostname": _normalize_hostname(host.get("hostname")) or _pick_hostname_from_services(merged_services),
                 "ports": merged_ports,
                 "services": sorted(merged_services, key=lambda item: int(item.get("port") or 0)),
+                "discovery_sources": _extract_string_list(host.get("discovery_sources")),
+                "discovery_evidence": _extract_string_list(host.get("discovery_evidence")),
+                "scan_scope": _normalize_scan_scope(host.get("scan_scope")),
             }
             merged_hosts.append(merged_host)
 
@@ -371,6 +392,9 @@ def probe_open_services(job_id: str) -> str:
                 "host_count": len(merged_hosts),
                 "open_port_count": sum(len(host.get("ports", [])) for host in merged_hosts),
                 "service_probe_target_count": service_probe_target_count,
+                "closed_port_count": 0,
+                "filtered_or_unknown_count": 0,
+                "reconciled_stale_port_count": 0,
             }
         )
         summary["port_scan_stats"] = port_scan_stats
@@ -401,6 +425,7 @@ def probe_open_services(job_id: str) -> str:
         if ips:
             assets = db.scalars(select(Asset).where(Asset.ip.in_(ips))).all()
             assets_by_ip = {str(asset.ip): asset for asset in assets}
+            reconciliation_stats = _empty_port_scan_stats()
             for host in merged_hosts:
                 ip = str(host.get("ip") or "").strip()
                 asset = assets_by_ip.get(ip)
@@ -410,12 +435,14 @@ def probe_open_services(job_id: str) -> str:
                 if hostname:
                     asset.hostname = hostname
                 asset.last_seen_at = datetime.now(timezone.utc)
-                _upsert_asset_ports(db, asset, host)
+                host_stats = _upsert_asset_ports(db, asset, host)
+                _merge_port_scan_stats(reconciliation_stats, host_stats)
                 snapshot = _build_network_initial_snapshot(asset, host)
                 if snapshot is not None:
                     db.add(snapshot)
                     network_initial_snapshot_count += 1
                 db.add(asset)
+            summary["port_scan_stats"].update(reconciliation_stats)
 
         summary["service_enrichment_stats"]["network_initial_snapshot_count"] = network_initial_snapshot_count
         job.summary_json = sanitize_json_value(summary)
@@ -594,6 +621,7 @@ def _filter_excluded_local_hosts(
     hosts: list[dict[str, Any]],
     *,
     cidr: str | None = None,
+    local_node_hints: dict[str, list[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     filtered: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
@@ -602,7 +630,7 @@ def _filter_excluded_local_hosts(
         hostname = _normalize_hostname(host.get("hostname"))
         if not ip:
             continue
-        exclusion_reason = _resolve_discovery_host_exclusion_reason(ip, hostname, cidr=cidr)
+        exclusion_reason = _resolve_discovery_host_exclusion_reason(ip, hostname, cidr=cidr, local_node_hints=local_node_hints)
         if exclusion_reason:
             excluded.append(
                 {
@@ -621,29 +649,36 @@ def _resolve_discovery_host_exclusion_reason(
     hostname: str | None,
     *,
     cidr: str | None = None,
+    local_node_hints: dict[str, list[str]] | None = None,
 ) -> str | None:
+    explicit_reason = _resolve_local_node_hint_reason(ip, hostname, local_node_hints)
+    if explicit_reason:
+        return explicit_reason
     is_local, local_hint = resolve_local_asset(ip, hostname)
     if is_local:
         return local_hint or "匹配平台本机资产排除策略"
-    return _resolve_gateway_candidate_reason(ip, cidr)
+    return None
 
 
 def _resolve_gateway_candidate_reason(ip: str, cidr: str | None) -> str | None:
-    if not cidr:
+    return None
+
+
+def _resolve_local_node_hint_reason(
+    ip: str,
+    hostname: str | None,
+    local_node_hints: dict[str, list[str]] | None,
+) -> str | None:
+    if not isinstance(local_node_hints, dict):
         return None
-    try:
-        network = ipaddress.ip_network(cidr, strict=False)
-        ip_obj = ipaddress.ip_address(ip)
-    except ValueError:
-        return None
-    if not isinstance(network, ipaddress.IPv4Network) or not isinstance(ip_obj, ipaddress.IPv4Address):
-        return None
-    if ip_obj not in network or network.num_addresses < 32 or network.num_addresses > 256:
-        return None
-    first_usable = ipaddress.IPv4Address(int(network.network_address) + 1)
-    last_usable = ipaddress.IPv4Address(int(network.broadcast_address) - 1)
-    if ip_obj == first_usable or ip_obj == last_usable:
-        return "命中网段边界网关候选地址"
+    hint_ips = {item for item in _extract_string_list(local_node_hints.get("ips"))}
+    if ip in hint_ips:
+        return "匹配扫描节点本机 IP"
+    normalized_hostname = _normalize_hostname(hostname)
+    if normalized_hostname:
+        hint_hostnames = {item.lower() for item in _extract_string_list(local_node_hints.get("hostnames"))}
+        if normalized_hostname.lower() in hint_hostnames or normalized_hostname.split(".")[0].lower() in hint_hostnames:
+            return "匹配扫描节点本机主机名"
     return None
 
 
@@ -651,8 +686,14 @@ def _purge_excluded_local_assets(db, excluded_local_hosts: list[dict[str, Any]])
     ips = _extract_ips(excluded_local_hosts)
     if not ips:
         return 0
-    result = db.execute(delete(Asset).where(Asset.ip.in_(ips)))
-    return int(getattr(result, "rowcount", 0) or 0)
+    assets = db.scalars(select(Asset).where(Asset.ip.in_(ips))).all()
+    removed = 0
+    for asset in assets:
+        if getattr(asset, "host_runner", None) is not None:
+            continue
+        db.delete(asset)
+        removed += 1
+    return removed
 
 
 def _normalize_hostname(value: Any) -> str | None:
@@ -716,6 +757,17 @@ def _derive_open_ports(host: dict[str, Any]) -> list[int]:
             if port is not None:
                 ports.add(port)
     return sorted(ports)
+
+
+def _extract_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            normalized.append(text)
+    return normalized
 
 
 def _build_nmap_targets(
@@ -946,6 +998,16 @@ def _build_discovery_config() -> DiscoveryConfig:
         ),
         portset_mode=str(settings.DISCOVERY_PORTSET_MODE or DEFAULT_DISCOVERY_CONFIG.portset_mode),
         top_ports_limit=max(1, int(settings.DISCOVERY_TOP_PORTS_LIMIT)),
+        enable_arp_discovery=bool(getattr(settings, "DISCOVERY_ENABLE_ARP_DISCOVERY", getattr(DEFAULT_DISCOVERY_CONFIG, "enable_arp_discovery", True))),
+        enable_fping=bool(getattr(settings, "DISCOVERY_ENABLE_FPING", getattr(DEFAULT_DISCOVERY_CONFIG, "enable_fping", True))),
+        nmap_host_discovery_profile=str(
+            getattr(
+                settings,
+                "DISCOVERY_NMAP_HOST_DISCOVERY_PROFILE",
+                getattr(DEFAULT_DISCOVERY_CONFIG, "nmap_host_discovery_profile", "balanced"),
+            )
+            or getattr(DEFAULT_DISCOVERY_CONFIG, "nmap_host_discovery_profile", "balanced")
+        ),
         full_scan_host_concurrency=max(1, int(getattr(settings, "DISCOVERY_FULL_SCAN_HOST_CONCURRENCY", DEFAULT_DISCOVERY_CONFIG.full_scan_host_concurrency))),
         service_probe_host_concurrency=max(1, int(getattr(settings, "DISCOVERY_SERVICE_PROBE_HOST_CONCURRENCY", DEFAULT_DISCOVERY_CONFIG.service_probe_host_concurrency))),
         port_concurrency=max(1, int(getattr(settings, "DISCOVERY_FULL_SCAN_PORT_CONCURRENCY", DEFAULT_DISCOVERY_CONFIG.port_concurrency))),
@@ -972,6 +1034,88 @@ def _empty_service_enrichment_stats() -> dict[str, int]:
         "nse_skipped_count": 0,
         "nse_error_count": 0,
         "network_initial_snapshot_count": 0,
+    }
+
+
+def _empty_port_scan_stats() -> dict[str, int]:
+    return {
+        "closed_port_count": 0,
+        "filtered_or_unknown_count": 0,
+        "reconciled_stale_port_count": 0,
+    }
+
+
+def _merge_port_scan_stats(target: dict[str, int], payload: dict[str, int]) -> None:
+    for key in ("closed_port_count", "filtered_or_unknown_count", "reconciled_stale_port_count"):
+        target[key] = int(target.get(key, 0) or 0) + int(payload.get(key, 0) or 0)
+
+
+def _build_host_scan_scope(scan_ports: tuple[int, ...] | list[int]) -> dict[str, Any]:
+    ports = sorted({int(port) for port in scan_ports if 1 <= int(port) <= 65535})
+    if ports and len(ports) == 65535 and ports[0] == 1 and ports[-1] == 65535:
+        return {
+            "protocol": "tcp",
+            "scope_kind": "all_tcp",
+            "scanned_port_count": 65535,
+        }
+    return {
+        "protocol": "tcp",
+        "scope_kind": "explicit",
+        "ports": ports,
+        "scanned_port_count": len(ports),
+    }
+
+
+def _normalize_scan_scope(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    protocol = str(value.get("protocol") or "tcp").strip().lower() or "tcp"
+    scope_kind = str(value.get("scope_kind") or "explicit").strip().lower() or "explicit"
+    normalized = {"protocol": protocol, "scope_kind": scope_kind}
+    if scope_kind == "all_tcp":
+        normalized["scanned_port_count"] = max(0, int(value.get("scanned_port_count") or 65535))
+        return normalized
+    normalized["ports"] = sorted({
+        port
+        for port in (_to_port(item) for item in (value.get("ports") if isinstance(value.get("ports"), list) else []))
+        if port is not None
+    })
+    normalized["scanned_port_count"] = max(0, int(value.get("scanned_port_count") or len(normalized["ports"])))
+    return normalized
+
+
+def _port_is_in_scope(port: int, scan_scope: dict[str, Any]) -> bool:
+    scope_kind = str(scan_scope.get("scope_kind") or "").strip().lower()
+    if scope_kind == "all_tcp":
+        return True
+    ports = scan_scope.get("ports") if isinstance(scan_scope.get("ports"), list) else []
+    return port in {item for item in (_to_port(raw) for raw in ports) if item is not None}
+
+
+def _build_discovery_source_stats(hosts: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for host in hosts:
+        for source in _extract_string_list(host.get("discovery_sources")):
+            counts[source] = int(counts.get(source, 0)) + 1
+    return dict(sorted(counts.items()))
+
+
+def _build_baseline_diff_summary(
+    *,
+    baseline_hosts: list[dict[str, Any]],
+    accepted_hosts: list[dict[str, Any]],
+    excluded_hosts: list[dict[str, Any]],
+) -> dict[str, int]:
+    baseline_count = len([item for item in baseline_hosts if isinstance(item, dict)])
+    accepted_count = len([item for item in accepted_hosts if isinstance(item, dict)])
+    excluded_count = len([item for item in excluded_hosts if isinstance(item, dict)])
+    unexplained_missing = max(0, baseline_count - accepted_count - excluded_count)
+    return {
+        "baseline_host_count": baseline_count,
+        "accepted_host_count": accepted_count,
+        "excluded_host_count": excluded_count,
+        "extra_host_count": 0,
+        "unexplained_missing_host_count": unexplained_missing,
     }
 
 
@@ -1036,13 +1180,12 @@ def _normalize_open_ports_and_services(host: dict[str, Any]) -> tuple[list[int],
     return open_ports, service_map
 
 
-def _upsert_asset_ports(db, asset: Asset, host: dict[str, Any]) -> None:
+def _upsert_asset_ports(db, asset: Asset, host: dict[str, Any]) -> dict[str, int]:
     open_ports, service_map = _normalize_open_ports_and_services(host)
-    if not open_ports:
-        return
-
+    stats = _empty_port_scan_stats()
     known: dict[tuple[int, str], AssetPort] = {(p.port, p.protocol): p for p in asset.ports}
     now = datetime.now(timezone.utc)
+    open_port_set = set(open_ports)
     for port in open_ports:
         service_data = service_map.get(port, {})
         key = (port, "tcp")
@@ -1071,6 +1214,22 @@ def _upsert_asset_ports(db, asset: Asset, host: dict[str, Any]) -> None:
                 last_seen_at=now,
             )
         )
+    scan_scope = _normalize_scan_scope(host.get("scan_scope"))
+    if scan_scope:
+        for existing in asset.ports:
+            if existing.protocol != "tcp":
+                continue
+            if existing.port in open_port_set:
+                continue
+            if not _port_is_in_scope(existing.port, scan_scope):
+                continue
+            previous_state = str(existing.state or "").strip().lower()
+            if previous_state == "open":
+                stats["reconciled_stale_port_count"] += 1
+            existing.state = "closed"
+            existing.last_seen_at = now
+            stats["closed_port_count"] += 1
+    return stats
 
 
 def _build_network_initial_snapshot(asset: Asset, host: dict[str, Any]) -> HostSnapshot | None:
@@ -1106,6 +1265,127 @@ def _build_network_initial_snapshot(asset: Asset, host: dict[str, Any]) -> HostS
         collection_status=collection_status,
         collected_at=datetime.now(timezone.utc),
     )
+
+
+def apply_runner_discovery_scan_result(job_id: str, scan_result: dict[str, Any]) -> dict[str, Any]:
+    with SessionLocal() as db:
+        job = db.get(DiscoveryJob, job_id)
+        if job is None:
+            return {}
+
+        raw_hosts = [
+            host
+            for host in (scan_result.get("hosts") if isinstance(scan_result.get("hosts"), list) else [])
+            if isinstance(host, dict)
+        ]
+        local_node_hints = scan_result.get("local_node_hints") if isinstance(scan_result.get("local_node_hints"), dict) else None
+        filtered_hosts, excluded_local_hosts = _filter_excluded_local_hosts(
+            raw_hosts,
+            cidr=job.cidr,
+            local_node_hints=local_node_hints,
+        )
+
+        summary = dict(job.summary_json or {}) if isinstance(job.summary_json, dict) else {}
+        summary["host_count"] = len(filtered_hosts)
+        summary["hosts"] = filtered_hosts
+        summary["excluded_local_ip_count"] = len(excluded_local_hosts)
+        summary["excluded_local_hosts"] = excluded_local_hosts
+        summary["discovery_source_stats"] = (
+            scan_result.get("discovery_source_stats")
+            if isinstance(scan_result.get("discovery_source_stats"), dict)
+            else _build_discovery_source_stats(filtered_hosts)
+        )
+        summary["baseline_diff_summary"] = _build_baseline_diff_summary(
+            baseline_hosts=raw_hosts,
+            accepted_hosts=filtered_hosts,
+            excluded_hosts=excluded_local_hosts,
+        )
+        summary["runner_scan_errors"] = [
+            item
+            for item in (scan_result.get("runner_scan_errors") if isinstance(scan_result.get("runner_scan_errors"), list) else [])
+            if isinstance(item, dict)
+        ]
+        port_scan_stats = {
+            "host_count": len(filtered_hosts),
+            "open_port_count": sum(len(_derive_open_ports(host)) for host in filtered_hosts),
+            "scanned_port_count": int(
+                (scan_result.get("port_scan_stats") or {}).get("scanned_port_count")
+                if isinstance(scan_result.get("port_scan_stats"), dict)
+                else 0
+            ),
+            "service_probe_target_count": sum(len(_derive_open_ports(host)) for host in filtered_hosts),
+            "closed_port_count": 0,
+            "filtered_or_unknown_count": 0,
+            "reconciled_stale_port_count": 0,
+        }
+        summary["port_scan_stats"] = port_scan_stats
+        summary["service_enrichment_stats"] = _empty_service_enrichment_stats()
+
+        _purge_excluded_local_assets(db, excluded_local_hosts)
+        assets_by_ip: dict[str, Asset] = {}
+        ips = _extract_ips(filtered_hosts)
+        if ips:
+            assets_by_ip = {str(asset.ip): asset for asset in db.scalars(select(Asset).where(Asset.ip.in_(ips))).all()}
+
+        reconciliation_stats = _empty_port_scan_stats()
+        network_initial_snapshot_count = 0
+        product_identified_count = 0
+        for host in filtered_hosts:
+            ip = str(host.get("ip") or "").strip()
+            if not ip:
+                continue
+            asset = assets_by_ip.get(ip)
+            if asset is None:
+                asset = Asset(
+                    ip=ip,
+                    hostname=_normalize_hostname(host.get("hostname")),
+                    status=AssetStatus.COLLECTING,
+                    first_seen_at=datetime.now(timezone.utc),
+                    last_seen_at=datetime.now(timezone.utc),
+                )
+                db.add(asset)
+                db.flush()
+                assets_by_ip[ip] = asset
+            else:
+                asset.hostname = _normalize_hostname(host.get("hostname")) or asset.hostname
+                asset.status = AssetStatus.COLLECTING
+                asset.last_seen_at = datetime.now(timezone.utc)
+            host_stats = _upsert_asset_ports(db, asset, host)
+            _merge_port_scan_stats(reconciliation_stats, host_stats)
+            product_identified_count += sum(
+                1
+                for item in host.get("services", [])
+                if isinstance(item, dict) and isinstance(item.get("product_name"), str) and item.get("product_name")
+            )
+            snapshot = _build_network_initial_snapshot(asset, host)
+            if snapshot is not None:
+                db.add(snapshot)
+                network_initial_snapshot_count += 1
+            db.add(asset)
+
+        summary["port_scan_stats"].update(reconciliation_stats)
+        summary["service_enrichment_stats"]["product_identified_count"] = product_identified_count
+        summary["service_enrichment_stats"]["network_initial_snapshot_count"] = network_initial_snapshot_count
+        summary["service_enrichment_stats"]["protocol_probe_hit_count"] = sum(
+            1
+            for host in filtered_hosts
+            for item in host.get("services", [])
+            if isinstance(item, dict) and "nmap" in {str(step).strip().lower() for step in (item.get("probe_chain") or []) if str(step).strip()}
+        )
+
+        job.summary_json = sanitize_json_value(summary)
+        job.status = DiscoveryJobStatus.COMPLETED
+        if job.started_at is None:
+            job.started_at = datetime.now(timezone.utc)
+        job.finished_at = datetime.now(timezone.utc)
+        db.add(job)
+        db.commit()
+
+        if ips:
+            assets = db.scalars(select(Asset).where(Asset.ip.in_(ips))).all()
+            for asset in assets:
+                evaluate_risks_for_asset.delay(asset.id)
+        return get_discovery_scan_stats(job_id)
 
 
 def get_service_enrichment_stats(job_id: str) -> dict[str, int]:
@@ -1155,7 +1435,15 @@ def get_discovery_scan_stats(job_id: str) -> dict[str, int]:
 
         port_stats = summary_json.get("port_scan_stats")
         if isinstance(port_stats, dict):
-            for key in ("host_count", "open_port_count", "scanned_port_count", "service_probe_target_count"):
+            for key in (
+                "host_count",
+                "open_port_count",
+                "scanned_port_count",
+                "service_probe_target_count",
+                "closed_port_count",
+                "filtered_or_unknown_count",
+                "reconciled_stale_port_count",
+            ):
                 try:
                     combined[key] = int(port_stats.get(key, 0))
                 except (TypeError, ValueError):

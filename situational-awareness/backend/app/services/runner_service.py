@@ -30,13 +30,14 @@ from app.core.config import settings
 from app.core.crypto import decrypt_text
 from app.db.models.asset import Asset
 from app.db.models.credential import SSHCredential
-from app.db.models.enums import CredentialAuthType, TaskExecutionStatus, TaskType
+from app.db.models.enums import CredentialAuthType, DiscoveryJobStatus, TaskExecutionStatus, TaskType
 from app.db.models.host_runner import HostRunner
 from app.db.models.remediation_message import RemediationMessage
 from app.db.models.remediation_session import RemediationSession
 from app.db.models.task_run import TaskRun
 from app.repositories.task_event_repo import create_task_event
 from app.repositories.task_repo import create_task_run, get_latest_task_run_for_scope, get_task_run, update_task_run
+from app.scanner.port_catalog import resolve_scan_ports
 from app.schemas.remediation import (
     HostRunnerRead,
     RunnerHeartbeatRequest,
@@ -62,7 +63,7 @@ from app.db.session import SessionLocal
 
 RUNNER_VERSION = "2.0.0"
 RUNNER_BUNDLE_DIR = Path(__file__).resolve().parents[1] / "runner_bundle"
-RUNNER_SUPPORTED_TASK_TYPES = {TaskType.REMEDIATION_EXECUTE, TaskType.RUNNER_INSTALL}
+RUNNER_SUPPORTED_TASK_TYPES = {TaskType.REMEDIATION_EXECUTE, TaskType.RUNNER_INSTALL, TaskType.ASSET_SCAN}
 _RUNNER_PRIMARY_ARCHES = {"x86_64", "amd64", "aarch64", "arm64"}
 _RUNNER_SUPPORTED_RUNTIME_KINDS = {"python_script", "shell_bundle"}
 _RUNNER_SUPPORTED_INSTALL_MODES = {"system", "user"}
@@ -927,6 +928,99 @@ def record_runner_heartbeat(db: Session, runner: HostRunner, payload: RunnerHear
     return serialize_host_runner(runner.asset_id, runner)
 
 
+def _task_targets_runner(task: TaskRun, runner: HostRunner) -> bool:
+    result_json = task.result_json if isinstance(task.result_json, dict) else {}
+    context = result_json.get("context") if isinstance(result_json.get("context"), dict) else {}
+    if task.task_type == TaskType.REMEDIATION_EXECUTE:
+        return task.scope_type == "asset" and task.scope_id == runner.asset_id
+    if task.task_type == TaskType.ASSET_SCAN:
+        return str(context.get("runner_asset_id") or "").strip() == runner.asset_id
+    return False
+
+
+def _build_runner_asset_scan_config() -> dict[str, Any]:
+    liveness_ports = [
+        int(item)
+        for item in str(getattr(settings, "DISCOVERY_LIVENESS_PORTS", "22,80,443,8080,8443")).split(",")
+        if str(item).strip().isdigit() and 1 <= int(str(item).strip()) <= 65535
+    ]
+    service_ports = [
+        int(item)
+        for item in str(getattr(settings, "DISCOVERY_SERVICE_PORTS", "")).split(",")
+        if str(item).strip().isdigit() and 1 <= int(str(item).strip()) <= 65535
+    ]
+    high_backdoor_ports = [
+        int(item)
+        for item in str(getattr(settings, "DISCOVERY_HIGH_BACKDOOR_PORTS", "")).split(",")
+        if str(item).strip().isdigit() and 1 <= int(str(item).strip()) <= 65535
+    ]
+    portset_mode = str(getattr(settings, "DISCOVERY_PORTSET_MODE", "full") or "full").strip().lower() or "full"
+    top_ports_limit = max(1, int(getattr(settings, "DISCOVERY_TOP_PORTS_LIMIT", 1000)))
+    scan_ports = list(
+        resolve_scan_ports(
+            curated_ports=tuple(service_ports),
+            high_backdoor_ports=tuple(high_backdoor_ports),
+            mode=portset_mode,
+            top_ports_limit=top_ports_limit,
+        )
+    )
+    if portset_mode == "full" or (scan_ports and len(scan_ports) == 65535):
+        rendered_scan_ports: list[int] = []
+    else:
+        rendered_scan_ports = scan_ports
+    return {
+        "liveness_mode": str(getattr(settings, "DISCOVERY_LIVENESS_MODE", "multi_source") or "multi_source"),
+        "liveness_ports": liveness_ports or [22, 80, 443, 8080, 8443],
+        "enable_arp_discovery": bool(getattr(settings, "DISCOVERY_ENABLE_ARP_DISCOVERY", True)),
+        "enable_fping": bool(getattr(settings, "DISCOVERY_ENABLE_FPING", True)),
+        "nmap_host_discovery_profile": str(getattr(settings, "DISCOVERY_NMAP_HOST_DISCOVERY_PROFILE", "balanced") or "balanced"),
+        "nmap_min_rate": max(1, int(getattr(settings, "DISCOVERY_NMAP_MIN_RATE", 100000))),
+        "nmap_liveness_timeout_seconds": max(1, int(getattr(settings, "DISCOVERY_NMAP_LIVENESS_TIMEOUT_SECONDS", 90))),
+        "nmap_full_scan_timeout_seconds": max(1, int(getattr(settings, "DISCOVERY_NMAP_FULL_SCAN_TIMEOUT_SECONDS", 90))),
+        "nmap_version_intensity": max(0, int(getattr(settings, "DISCOVERY_NMAP_VERSION_INTENSITY", 7))),
+        "scan_ports": rendered_scan_ports,
+        "portset_mode": portset_mode,
+        "top_ports_limit": top_ports_limit,
+        "high_backdoor_ports": high_backdoor_ports,
+    }
+
+
+def _build_runner_asset_scan_assignment(
+    db: Session,
+    runner: HostRunner,
+    task: TaskRun,
+) -> tuple[RunnerTaskAssignmentRead, str] | None:
+    result_json = task.result_json if isinstance(task.result_json, dict) else {}
+    context = result_json.get("context") if isinstance(result_json.get("context"), dict) else {}
+    job_id = str(task.scope_id or context.get("job_id") or "").strip()
+    if not job_id:
+        return None
+
+    from app.db.models.discovery_job import DiscoveryJob
+
+    job = db.get(DiscoveryJob, job_id)
+    if job is None:
+        return None
+
+    scan_config = _build_runner_asset_scan_config()
+    summary = f"扫描网段 {job.cidr}"
+    assignment = RunnerTaskAssignmentRead(
+        task_id=task.id,
+        asset_id=runner.asset_id,
+        session_id=None,
+        task_type="asset_scan",
+        summary=summary,
+        execution_mode="apply",
+        plan={
+            "cidr": str(job.cidr),
+            "runner_asset_id": runner.asset_id,
+            "scan_config": scan_config,
+        },
+        steps=[],
+    )
+    return assignment, _build_discovery_assignment_execution_script(task_id=task.id, cidr=str(job.cidr), scan_config=scan_config)
+
+
 def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1) -> RunnerPollResponse:
     assignments: list[RunnerTaskAssignmentRead] = []
     next_task_id: str | None = None
@@ -937,8 +1031,53 @@ def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1)
     for task in tasks:
         if len(assignments) >= max(1, max_tasks):
             break
+        if not _task_targets_runner(task, runner):
+            continue
         result_json = task.result_json if isinstance(task.result_json, dict) else {}
         context = result_json.get("context") if isinstance(result_json.get("context"), dict) else {}
+        if task.task_type == TaskType.ASSET_SCAN:
+            built = _build_runner_asset_scan_assignment(db, runner, task)
+            if built is None:
+                continue
+            assignment, execution_script = built
+            result_json.setdefault("context", {})
+            result_json["context"]["runner_id"] = runner.id
+            result_json["context"]["runner_status"] = _runner_status_value(runner)
+            update_task_run(
+                db,
+                task,
+                status=TaskExecutionStatus.RUNNING,
+                progress=max(5, task.progress),
+                message="扫描节点已接单，开始执行多源资产发现",
+                result_json=result_json,
+            )
+            create_task_event(
+                db,
+                task_run_id=task.id,
+                event_type="stage",
+                level="info",
+                stage_code="runner_dispatch",
+                stage_name="扫描节点接单",
+                message="扫描节点已获取待执行的真实网络发现任务",
+                progress=task.progress,
+                payload_json={"runner_id": runner.id},
+            )
+            if task.scope_type == "discovery_job" and task.scope_id:
+                from app.db.models.discovery_job import DiscoveryJob
+
+                job = db.get(DiscoveryJob, task.scope_id)
+                if job is not None:
+                    job.status = DiscoveryJobStatus.RUNNING
+                    if job.started_at is None:
+                        job.started_at = datetime.now(timezone.utc)
+                    db.add(job)
+                    db.commit()
+            assignments.append(assignment)
+            if next_task_id is None:
+                next_task_id = assignment.task_id
+                next_summary = assignment.summary
+                next_execution_script_b64 = base64.b64encode(execution_script.encode("utf-8")).decode("ascii")
+            continue
         if not context.get("session_id"):
             continue
         plan = result_json.get("plan") if isinstance(result_json.get("plan"), dict) else {}
@@ -1029,8 +1168,8 @@ def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1)
 
 def append_runner_task_events(db: Session, runner: HostRunner, task_id: str, batch: RunnerTaskEventBatch) -> None:
     task = get_task_run(db, task_id)
-    if task is None or task.task_type != TaskType.REMEDIATION_EXECUTE:
-        raise RuntimeError("修复任务不存在")
+    if task is None or task.task_type not in {TaskType.REMEDIATION_EXECUTE, TaskType.ASSET_SCAN}:
+        raise RuntimeError("Runner 任务不存在")
     runner.last_seen_at = datetime.now(timezone.utc)
     runner.status = "busy"
     db.add(runner)
@@ -1060,8 +1199,12 @@ def append_runner_task_events(db: Session, runner: HostRunner, task_id: str, bat
 
 def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload: RunnerTaskCompleteRequest) -> dict[str, Any]:
     task = get_task_run(db, task_id)
-    if task is None or task.task_type != TaskType.REMEDIATION_EXECUTE:
-        raise RuntimeError("修复任务不存在")
+    if task is None:
+        raise RuntimeError("Runner 任务不存在")
+    if task.task_type == TaskType.ASSET_SCAN:
+        return _complete_runner_asset_scan_task(db, runner, task, payload)
+    if task.task_type != TaskType.REMEDIATION_EXECUTE:
+        raise RuntimeError("Runner 任务不存在")
     result_json = task.result_json if isinstance(task.result_json, dict) else {}
     execution = dict(payload.execution or {})
     if payload.step_results:
@@ -1213,6 +1356,91 @@ def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload:
             committed = True
     if not committed:
         db.commit()
+    return result_json
+
+
+def _complete_runner_asset_scan_task(
+    db: Session,
+    runner: HostRunner,
+    task: TaskRun,
+    payload: RunnerTaskCompleteRequest,
+) -> dict[str, Any]:
+    result_json = task.result_json if isinstance(task.result_json, dict) else {}
+    execution = dict(payload.execution or {})
+    execution["execution_boundary"] = "runner_dispatch"
+    scan_result = execution.get("scan_result") if isinstance(execution.get("scan_result"), dict) else {}
+    context = result_json.get("context") if isinstance(result_json.get("context"), dict) else {}
+    job_id = str(task.scope_id or context.get("job_id") or "").strip()
+    scan_summary = {
+        "host_count": int(scan_result.get("host_count") or len(scan_result.get("hosts") or []))
+        if isinstance(scan_result.get("hosts"), list)
+        else int(scan_result.get("host_count") or 0),
+        "open_port_count": int(
+            scan_result.get("open_port_count")
+            or sum(
+                len(item.get("ports") or [])
+                for item in (scan_result.get("hosts") or [])
+                if isinstance(item, dict)
+            )
+        ),
+        "source_stats": scan_result.get("discovery_source_stats") if isinstance(scan_result.get("discovery_source_stats"), dict) else {},
+    }
+
+    if payload.status == "success" and job_id and scan_result:
+        from app.tasks.discovery_tasks import apply_runner_discovery_scan_result
+
+        scan_summary = apply_runner_discovery_scan_result(job_id, scan_result)
+        final_status = TaskExecutionStatus.SUCCESS
+        final_message = payload.message or "扫描节点已完成多源资产发现"
+    else:
+        final_status = TaskExecutionStatus.FAILURE
+        final_message = payload.message or "扫描节点执行发现任务失败"
+        if job_id:
+            from app.db.models.discovery_job import DiscoveryJob
+
+            job = db.get(DiscoveryJob, job_id)
+            if job is not None:
+                job.status = DiscoveryJobStatus.FAILED
+                job.finished_at = datetime.now(timezone.utc)
+                summary_json = dict(job.summary_json or {}) if isinstance(job.summary_json, dict) else {}
+                summary_json["runner_scan_failure"] = {"message": final_message}
+                job.summary_json = summary_json
+                db.add(job)
+
+    result_json.setdefault("context", {})
+    result_json["context"]["runner_id"] = runner.id
+    result_json["context"]["runner_status"] = "online"
+    result_json["execution"] = execution
+    result_json["scan_summary"] = scan_summary
+    if job_id:
+        result_json["context"]["job_id"] = job_id
+
+    update_task_run(
+        db,
+        task,
+        status=final_status,
+        progress=100,
+        message=final_message,
+        result_json=result_json,
+        commit=False,
+        refresh=False,
+    )
+    create_task_event(
+        db,
+        task_run_id=task.id,
+        event_type="success" if final_status == TaskExecutionStatus.SUCCESS else "failure",
+        level="info" if final_status == TaskExecutionStatus.SUCCESS else "error",
+        stage_code="runner_complete",
+        stage_name="扫描节点回传",
+        message=final_message,
+        progress=100,
+        payload_json={"scan_summary": scan_summary},
+    )
+    runner.last_seen_at = datetime.now(timezone.utc)
+    runner.status = "online"
+    runner.last_error = None if payload.status == "success" else final_message
+    db.add(runner)
+    db.commit()
     return result_json
 
 
@@ -1552,15 +1780,391 @@ def _build_assignment_execution_script(*, task_id: str, summary: str, steps: lis
     return "\n".join(lines) + "\n"
 
 
+def _build_discovery_assignment_execution_script(*, task_id: str, cidr: str, scan_config: dict[str, Any]) -> str:
+    encoded_config = _b64_encode_text(json.dumps(scan_config, ensure_ascii=False, separators=(",", ":")))
+    lines = [
+        "#!/bin/sh",
+        "set -eu",
+        f"TASK_ID={shlex.quote(task_id)}",
+        f"TARGET_CIDR={shlex.quote(cidr)}",
+        f"SCAN_CONFIG_B64={shlex.quote(encoded_config)}",
+        'PLATFORM_URL="${SA_RUNNER_PLATFORM_URL:-}"',
+        'RUNNER_TOKEN="${SA_RUNNER_TOKEN:-}"',
+        'HTTP_TOOL="${SA_RUNNER_HTTP_TOOL:-}"',
+        'resolve_python() {',
+        '  if command -v python3 >/dev/null 2>&1; then',
+        '    command -v python3',
+        '    return 0',
+        "  fi",
+        '  if command -v python >/dev/null 2>&1; then',
+        '    command -v python',
+        '    return 0',
+        "  fi",
+        "  return 1",
+        "}",
+        'post_failure_without_python() {',
+        '  message="扫描节点缺少 Python 运行时，无法执行真实网络发现脚本"',
+        '  payload="{\\"status\\":\\"failure\\",\\"message\\":\\"${message}\\",\\"execution\\":{\\"execution_boundary\\":\\"runner_dispatch\\"}}"',
+        '  url="${PLATFORM_URL%/}/api/v1/runner/tasks/${TASK_ID}/complete"',
+        '  if [ "${HTTP_TOOL:-}" = "curl" ] && command -v curl >/dev/null 2>&1; then',
+        '    curl -fsS --connect-timeout 5 --max-time 30 -X POST -H "Content-Type: application/json" -H "X-Runner-Token: ${RUNNER_TOKEN}" --data "${payload}" "${url}" >/dev/null || true',
+        '    return 0',
+        "  fi",
+        '  if command -v wget >/dev/null 2>&1; then',
+        '    wget -qO- --timeout=30 --header="Content-Type: application/json" --header="X-Runner-Token: ${RUNNER_TOKEN}" --post-data="${payload}" "${url}" >/dev/null || true',
+        "  fi",
+        "}",
+        'if ! PYTHON_BIN="$(resolve_python)"; then',
+        '  post_failure_without_python',
+        '  exit 0',
+        "fi",
+        'DISCOVERY_TASK_ID="${TASK_ID}" DISCOVERY_TARGET_CIDR="${TARGET_CIDR}" DISCOVERY_SCAN_CONFIG_B64="${SCAN_CONFIG_B64}" DISCOVERY_PLATFORM_URL="${PLATFORM_URL}" DISCOVERY_RUNNER_TOKEN="${RUNNER_TOKEN}" "${PYTHON_BIN}" - <<\'PY\'',
+        "import base64",
+        "import ipaddress",
+        "import json",
+        "import os",
+        "import re",
+        "import shutil",
+        "import socket",
+        "import subprocess",
+        "import sys",
+        "import urllib.request",
+        "from collections import defaultdict",
+        "from xml.etree import ElementTree as ET",
+        "",
+        "TASK_ID = os.environ['DISCOVERY_TASK_ID']",
+        "TARGET_CIDR = os.environ['DISCOVERY_TARGET_CIDR']",
+        "PLATFORM_URL = os.environ['DISCOVERY_PLATFORM_URL'].rstrip('/')",
+        "RUNNER_TOKEN = os.environ['DISCOVERY_RUNNER_TOKEN']",
+        "SCAN_CONFIG = json.loads(base64.b64decode(os.environ['DISCOVERY_SCAN_CONFIG_B64']).decode('utf-8'))",
+        "IP_LINE_RE = re.compile(r'^\\d+:\\s+(?P<name>\\S+)\\s+inet\\s+(?P<cidr>\\d+\\.\\d+\\.\\d+\\.\\d+/\\d+)\\b')",
+        "",
+        "def request_json(path, payload):",
+        "    body = json.dumps(payload, ensure_ascii=False).encode('utf-8')",
+        "    request = urllib.request.Request(f'{PLATFORM_URL}{path}', data=body, method='POST')",
+        "    request.add_header('Content-Type', 'application/json')",
+        "    request.add_header('X-Runner-Token', RUNNER_TOKEN)",
+        "    with urllib.request.urlopen(request, timeout=30) as response:",
+        "        raw = response.read().decode('utf-8')",
+        "    return json.loads(raw) if raw else {}",
+        "",
+        "def emit_event(event_type, message, *, stage_code, stage_name, progress=None, level='info', payload_json=None):",
+        "    request_json(f'/api/v1/runner/tasks/{TASK_ID}/events', {'events': [{'event_type': event_type, 'level': level, 'stage_code': stage_code, 'stage_name': stage_name, 'message': message, 'progress': progress, 'payload_json': payload_json or {}}]})",
+        "",
+        "def complete(status, message, execution):",
+        "    request_json(f'/api/v1/runner/tasks/{TASK_ID}/complete', {'status': status, 'message': message, 'execution': execution, 'backups': {}, 'step_results': []})",
+        "",
+        "def run_cmd(cmd, *, timeout, allow_codes=(0,)):",
+        "    process = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)",
+        "    if process.returncode not in allow_codes:",
+        "        stderr = (process.stderr or '').strip()",
+        "        command_text = ' '.join(cmd)",
+        "        raise RuntimeError(f'command failed rc={process.returncode}: {command_text} :: {stderr}')",
+        "    return process.stdout, process.stderr, process.returncode",
+        "",
+        "def list_local_ipv4_interfaces():",
+        "    try:",
+        "        stdout, _, _ = run_cmd(['ip', '-o', '-4', 'addr', 'show', 'up'], timeout=5)",
+        "    except Exception:",
+        "        return []",
+        "    items = []",
+        "    for raw_line in stdout.splitlines():",
+        "        match = IP_LINE_RE.match(raw_line.strip())",
+        "        if match is None:",
+        "            continue",
+        "        name = match.group('name').strip()",
+        "        cidr = match.group('cidr').strip()",
+        "        if not name or name == 'lo':",
+        "            continue",
+        "        try:",
+        "            interface = ipaddress.IPv4Interface(cidr)",
+        "        except ValueError:",
+        "            continue",
+        "        if interface.ip.is_loopback:",
+        "            continue",
+        "        items.append({'name': name, 'ip': str(interface.ip), 'network': str(interface.network), 'prefixlen': interface.network.prefixlen})",
+        "    return items",
+        "",
+        "def find_local_interface_for_network(cidr):",
+        "    target = ipaddress.ip_network(cidr, strict=False)",
+        "    if not isinstance(target, ipaddress.IPv4Network):",
+        "        return None",
+        "    candidates = []",
+        "    for entry in list_local_ipv4_interfaces():",
+        "        try:",
+        "            network = ipaddress.ip_network(entry['network'], strict=False)",
+        "        except ValueError:",
+        "            continue",
+        "        if target.subnet_of(network):",
+        "            candidates.append((network.prefixlen, entry))",
+        "    if not candidates:",
+        "        return None",
+        "    candidates.sort(key=lambda item: item[0], reverse=True)",
+        "    return candidates[0][1]",
+        "",
+        "def parse_nmap_ping_xml(output):",
+        "    root = ET.fromstring(output)",
+        "    hosts = []",
+        "    for host in root.findall('host'):",
+        "        status = host.find('status')",
+        "        if status is None or status.get('state') != 'up':",
+        "            continue",
+        "        address = next((item for item in host.findall('address') if item.get('addrtype') == 'ipv4'), None)",
+        "        if address is None:",
+        "            continue",
+        "        candidate = (address.get('addr') or '').strip()",
+        "        if not candidate:",
+        "            continue",
+        "        hosts.append(candidate)",
+        "    return sorted(set(hosts), key=ipaddress.ip_address)",
+        "",
+        "def parse_nmap_port_xml(ip, output):",
+        "    root = ET.fromstring(output)",
+        "    open_ports = []",
+        "    for host in root.findall('host'):",
+        "        address = next((item for item in host.findall('address') if item.get('addrtype') == 'ipv4'), None)",
+        "        if address is None or (address.get('addr') or '').strip() != ip:",
+        "            continue",
+        "        ports_node = host.find('ports')",
+        "        if ports_node is None:",
+        "            continue",
+        "        for port_node in ports_node.findall('port'):",
+        "            if port_node.get('protocol') != 'tcp':",
+        "                continue",
+        "            state_node = port_node.find('state')",
+        "            if state_node is None or state_node.get('state') != 'open':",
+        "                continue",
+        "            try:",
+        "                port = int(port_node.get('portid') or '')",
+        "            except ValueError:",
+        "                continue",
+        "            open_ports.append(port)",
+        "    return sorted(set(open_ports))",
+        "",
+        "def parse_nmap_service_xml(ip, output):",
+        "    root = ET.fromstring(output)",
+        "    services = []",
+        "    for host in root.findall('host'):",
+        "        address = next((item for item in host.findall('address') if item.get('addrtype') == 'ipv4'), None)",
+        "        if address is None or (address.get('addr') or '').strip() != ip:",
+        "            continue",
+        "        ports_node = host.find('ports')",
+        "        if ports_node is None:",
+        "            continue",
+        "        for port_node in ports_node.findall('port'):",
+        "            if port_node.get('protocol') != 'tcp':",
+        "                continue",
+        "            state_node = port_node.find('state')",
+        "            if state_node is None or state_node.get('state') != 'open':",
+        "                continue",
+        "            try:",
+        "                port = int(port_node.get('portid') or '')",
+        "            except ValueError:",
+        "                continue",
+        "            service_node = port_node.find('service')",
+        "            raw_name = (service_node.get('name') if service_node is not None else '') or 'unknown'",
+        "            raw_product = (service_node.get('product') if service_node is not None else '') or None",
+        "            raw_version = (service_node.get('version') if service_node is not None else '') or None",
+        "            raw_extrainfo = (service_node.get('extrainfo') if service_node is not None else '') or None",
+        "            raw_tunnel = (service_node.get('tunnel') if service_node is not None else '') or ''",
+        "            evidence = [f'nmap_service={raw_name}']",
+        "            if raw_product:",
+        "                evidence.append(f'nmap_product={raw_product}')",
+        "            if raw_version:",
+        "                evidence.append(f'nmap_version={raw_version}')",
+        "            if raw_extrainfo:",
+        "                evidence.append(f'nmap_extrainfo={raw_extrainfo}')",
+        "            services.append({",
+        "                'port': port,",
+        "                'service': raw_name or 'unknown',",
+        "                'version': raw_version,",
+        "                'probe_method': 'nmap',",
+        "                'transport_service': raw_name or 'unknown',",
+        "                'application_service': raw_product or raw_name or 'unknown',",
+        "                'product_name': raw_product,",
+        "                'product_version': raw_version,",
+        "                'tls_detected': raw_tunnel == 'ssl',",
+        "                'source': 'nmap',",
+        "                'confidence': 95 if raw_product and raw_version else 80,",
+        "                'reason': 'runner_nmap_service_scan',",
+        "                'evidence': evidence,",
+        "                'probe_chain': ['nmap'],",
+        "                'nmap_service': raw_name or None,",
+        "                'nmap_product': raw_product,",
+        "            })",
+        "    return services",
+        "",
+        "def parse_arp_scan_output(output):",
+        "    hosts = []",
+        "    for raw_line in output.splitlines():",
+        "        parts = raw_line.strip().split()",
+        "        if not parts:",
+        "            continue",
+        "        candidate = parts[0].strip()",
+        "        try:",
+        "            hosts.append(str(ipaddress.ip_address(candidate)))",
+        "        except ValueError:",
+        "            continue",
+        "    return sorted(set(hosts), key=ipaddress.ip_address)",
+        "",
+        "def merge_source(records, hosts, source):",
+        "    for ip in hosts:",
+        "        item = records.setdefault(ip, {'sources': set(), 'evidence': []})",
+        "        item['sources'].add(source)",
+        "        evidence = f'{source}:{ip}'",
+        "        if evidence not in item['evidence']:",
+        "            item['evidence'].append(evidence)",
+        "",
+        "def scan_host_discovery(cidr, config):",
+        "    records = {}",
+        "    errors = []",
+        "    local_interface = find_local_interface_for_network(cidr)",
+        "    if config.get('enable_arp_discovery') and local_interface is not None:",
+        "        if shutil.which('arp-scan'):",
+        "            try:",
+        "                stdout, _, rc = run_cmd(['arp-scan', '--interface', local_interface['name'], '--retry=1', '--timeout=250', '--ignoredups', '--plain', cidr], timeout=30, allow_codes=(0,1))",
+        "                merge_source(records, parse_arp_scan_output(stdout), 'arp_scan')",
+        "            except Exception as exc:",
+        "                errors.append(str(exc))",
+        "        elif shutil.which('arping'):",
+        "            network = ipaddress.ip_network(cidr, strict=False)",
+        "            if network.num_addresses <= 1024:",
+        "                for host in network.hosts():",
+        "                    process = subprocess.run(['arping', '-c', '1', '-w', '1', '-I', local_interface['name'], str(host)], capture_output=True, text=True, timeout=3, check=False)",
+        "                    if process.returncode == 0:",
+        "                        merge_source(records, [str(host)], 'arping')",
+        "            else:",
+        "                errors.append(f'arping 回退不支持大网段 {cidr}')",
+        "    if config.get('enable_fping') and shutil.which('fping'):",
+        "        try:",
+        "            stdout, _, rc = run_cmd(['fping', '-a', '-q', '-r0', '-g', cidr], timeout=max(5, int(config.get('nmap_liveness_timeout_seconds', 90))), allow_codes=(0,1))",
+        "            fping_hosts = []",
+        "            for raw_line in stdout.splitlines():",
+        "                candidate = raw_line.strip()",
+        "                if candidate:",
+        "                    fping_hosts.append(candidate)",
+        "            merge_source(records, fping_hosts, 'fping')",
+        "        except Exception as exc:",
+        "            errors.append(str(exc))",
+        "    if shutil.which('nmap'):",
+        "        cmd = ['nmap', '-sn', '-n', '-PE', '-PS22,80,443,445,3389', '-PA80,443,445,3389']",
+        "        if str(config.get('nmap_host_discovery_profile') or '').strip().lower() == 'aggressive':",
+        "            cmd.append('-PU53,161')",
+        "        cmd.extend(['-T4', '--min-rate', str(max(1, int(config.get('nmap_min_rate', 100000)))), cidr, '-oX', '-'])",
+        "        try:",
+        "            stdout, _, rc = run_cmd(cmd, timeout=max(5, int(config.get('nmap_liveness_timeout_seconds', 90))), allow_codes=(0,1))",
+        "            merge_source(records, parse_nmap_ping_xml(stdout), 'nmap_host_discovery')",
+        "        except Exception as exc:",
+        "            errors.append(str(exc))",
+        "    if not records and errors:",
+        "        raise RuntimeError('；'.join(errors))",
+        "    source_stats = defaultdict(int)",
+        "    for item in records.values():",
+        "        for source in item['sources']:",
+        "            source_stats[source] += 1",
+        "    return records, dict(sorted(source_stats.items())), local_interface",
+        "",
+        "def scan_ports_for_host(ip, config):",
+        "    scan_ports = [int(item) for item in (config.get('scan_ports') or []) if 1 <= int(item) <= 65535]",
+        "    if str(config.get('portset_mode') or '').strip().lower() == 'full' or len(scan_ports) == 65535:",
+        "        stdout, _, _ = run_cmd(['nmap', '-Pn', '-n', '-T4', '--min-rate', str(max(1, int(config.get('nmap_min_rate', 100000)))), '--open', '-p-', ip, '-oX', '-'], timeout=max(5, int(config.get('nmap_full_scan_timeout_seconds', 90))), allow_codes=(0,1))",
+        "        return parse_nmap_port_xml(ip, stdout), {'protocol': 'tcp', 'scope_kind': 'all_tcp', 'scanned_port_count': 65535}",
+        "    port_csv = ','.join(str(port) for port in scan_ports)",
+        "    stdout, _, _ = run_cmd(['nmap', '-Pn', '-n', '--open', '-p', port_csv, ip, '-oX', '-'], timeout=max(5, int(config.get('nmap_full_scan_timeout_seconds', 90))), allow_codes=(0,1))",
+        "    return parse_nmap_port_xml(ip, stdout), {'protocol': 'tcp', 'scope_kind': 'explicit', 'ports': scan_ports, 'scanned_port_count': len(scan_ports)}",
+        "",
+        "def scan_services_for_host(ip, open_ports, config):",
+        "    if not open_ports:",
+        "        return []",
+        "    port_csv = ','.join(str(port) for port in sorted(set(open_ports)))",
+        "    stdout, _, _ = run_cmd(['nmap', '-Pn', '-n', '-sV', '--version-intensity', str(max(0, int(config.get('nmap_version_intensity', 7)))), '-p', port_csv, ip, '-oX', '-'], timeout=max(5, int(config.get('nmap_full_scan_timeout_seconds', 90))), allow_codes=(0,1))",
+        "    return parse_nmap_service_xml(ip, stdout)",
+        "",
+        "def build_result(cidr, config):",
+        "    emit_event('stage', '扫描节点开始执行多源主机发现', stage_code='runner_discover_hosts', stage_name='Runner 主机发现', progress=10, payload_json={'cidr': cidr})",
+        "    records, source_stats, local_interface = scan_host_discovery(cidr, config)",
+        "    emit_event('stage', '主机探活完成，开始执行端口与服务扫描', stage_code='runner_scan_ports', stage_name='Runner 端口扫描', progress=40, payload_json={'host_count': len(records), 'source_stats': source_stats})",
+        "    hosts = []",
+        "    scan_errors = []",
+        "    for ip in sorted(records, key=ipaddress.ip_address):",
+        "        open_ports = []",
+        "        scan_scope = {'protocol': 'tcp', 'scope_kind': 'explicit', 'ports': [], 'scanned_port_count': 0}",
+        "        services = []",
+        "        host_error = None",
+        "        try:",
+        "            open_ports, scan_scope = scan_ports_for_host(ip, config)",
+        "        except Exception as exc:",
+        "            host_error = f'port_scan_failed: {exc}'",
+        "        if host_error is None and open_ports:",
+        "            try:",
+        "                services = scan_services_for_host(ip, open_ports, config)",
+        "            except Exception as exc:",
+        "                host_error = f'service_scan_failed: {exc}'",
+        "        host_entry = {",
+        "            'ip': ip,",
+        "            'hostname': None,",
+        "            'ports': open_ports,",
+        "            'services': services,",
+        "            'discovery_sources': sorted(records[ip]['sources']),",
+        "            'discovery_evidence': list(records[ip]['evidence']),",
+        "            'scan_scope': scan_scope,",
+        "        }",
+        "        if host_error:",
+        "            host_entry['scan_error'] = host_error",
+        "            scan_errors.append({'ip': ip, 'error': host_error})",
+        "        hosts.append(host_entry)",
+        "    local_hostnames = [name for name in {socket.gethostname(), socket.getfqdn()} if name]",
+        "    baseline_host_count = len(hosts)",
+        "    result = {",
+        "        'cidr': cidr,",
+        "        'hosts': hosts,",
+        "        'host_count': len(hosts),",
+        "        'open_port_count': sum(len(item.get('ports') or []) for item in hosts),",
+        "        'discovery_source_stats': source_stats,",
+        "        'baseline_diff_summary': {",
+        "            'baseline_host_count': baseline_host_count,",
+        "            'accepted_host_count': baseline_host_count,",
+        "            'excluded_host_count': 0,",
+        "            'extra_host_count': 0,",
+        "            'unexplained_missing_host_count': 0,",
+        "        },",
+        "        'port_scan_stats': {",
+        "            'host_count': len(hosts),",
+        "            'open_port_count': sum(len(item.get('ports') or []) for item in hosts),",
+        "            'scanned_port_count': sum(int((item.get('scan_scope') or {}).get('scanned_port_count') or 0) for item in hosts),",
+        "            'service_probe_target_count': sum(len(item.get('ports') or []) for item in hosts),",
+        "            'closed_port_count': 0,",
+        "            'filtered_or_unknown_count': 0,",
+        "            'reconciled_stale_port_count': 0,",
+        "        },",
+        "        'local_node_hints': {",
+        "            'ips': [item['ip'] for item in list_local_ipv4_interfaces()],",
+        "            'hostnames': sorted({name.lower() for name in local_hostnames}),",
+        "        },",
+        "        'runner_interface': local_interface,",
+        "        'runner_scan_errors': scan_errors,",
+        "    }",
+        "    emit_event('stage', '扫描节点已完成端口与服务识别，准备回传结果', stage_code='runner_complete_scan', stage_name='Runner 回传结果', progress=85, payload_json={'host_count': result['host_count'], 'open_port_count': result['open_port_count']})",
+        "    return result",
+        "",
+        "try:",
+        "    result = build_result(TARGET_CIDR, SCAN_CONFIG)",
+        "    complete('success', '扫描节点已完成多源资产发现', {'execution_boundary': 'runner_dispatch', 'scan_result': result, 'host_count': result.get('host_count', 0), 'open_port_count': result.get('open_port_count', 0)})",
+        "except Exception as exc:",
+        "    emit_event('failure', f'扫描节点执行失败: {exc}', stage_code='runner_scan_failed', stage_name='Runner 扫描失败', progress=100, level='error', payload_json={'error': str(exc)})",
+        "    complete('failure', f'扫描节点执行失败: {exc}', {'execution_boundary': 'runner_dispatch'})",
+        "PY",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def select_task_runs_for_runner(asset_id: str):
     from app.db.models.task_run import TaskRun
 
     return (
         select(TaskRun)
         .where(
-            TaskRun.task_type == TaskType.REMEDIATION_EXECUTE,
-            TaskRun.scope_type == "asset",
-            TaskRun.scope_id == asset_id,
+            TaskRun.task_type.in_([TaskType.REMEDIATION_EXECUTE, TaskType.ASSET_SCAN]),
             TaskRun.status == TaskExecutionStatus.PENDING,
         )
         .order_by(TaskRun.created_at.asc())

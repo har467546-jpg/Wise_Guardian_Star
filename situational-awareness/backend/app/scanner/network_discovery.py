@@ -4,11 +4,12 @@ import asyncio
 import ipaddress
 import logging
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from xml.etree import ElementTree as ET
 
 from app.scanner.port_catalog import resolve_scan_ports
 from app.scanner.port_scanner import AsyncPortScanner, PortScanResult, PortScannerConfig
+from app.utils.net import find_local_ipv4_interface_for_network
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +26,31 @@ class HostLiveness:
 
 
 @dataclass(slots=True)
+class HostDiscoveryRecord:
+    ip: str
+    sources: set[str] = field(default_factory=set)
+    evidence: list[str] = field(default_factory=list)
+
+    def merge(self, *, source: str, evidence: str | None = None) -> None:
+        normalized_source = source.strip().lower()
+        if normalized_source:
+            self.sources.add(normalized_source)
+        normalized_evidence = str(evidence or "").strip()
+        if normalized_evidence and normalized_evidence not in self.evidence:
+            self.evidence.append(normalized_evidence)
+
+    def to_host_payload(self) -> dict[str, object]:
+        return {
+            "ip": self.ip,
+            "discovery_sources": sorted(self.sources),
+            "discovery_evidence": list(self.evidence),
+        }
+
+
+@dataclass(slots=True)
 class DiscoveryConfig:
     liveness_ports: tuple[int, ...] = (22, 80, 443, 8080, 8443)
-    liveness_mode: str = "nmap_icmp"
+    liveness_mode: str = "multi_source"
     service_ports: tuple[int, ...] = (
         21,
         22,
@@ -108,6 +131,9 @@ class DiscoveryConfig:
     nmap_full_scan_timeout_seconds: int = 90
     tcp_connect_timeout: float = 0.8
     banner_timeout: float = 1.5
+    enable_arp_discovery: bool = True
+    enable_fping: bool = True
+    nmap_host_discovery_profile: str = "balanced"
     host_concurrency: int = 256
     full_scan_host_concurrency: int = 8
     service_probe_host_concurrency: int = 32
@@ -119,7 +145,9 @@ class DiscoveryResult:
     ip: str
     hostname: str | None
     ports: list[int]
-    services: list[dict[str, str | int | None]]
+    services: list[dict[str, object]]
+    discovery_sources: list[str] = field(default_factory=list)
+    discovery_evidence: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -127,6 +155,8 @@ class DiscoveryResult:
             "hostname": self.hostname,
             "ports": self.ports,
             "services": self.services,
+            "discovery_sources": list(self.discovery_sources),
+            "discovery_evidence": list(self.discovery_evidence),
         }
 
 
@@ -164,10 +194,10 @@ class AsyncNetworkDiscovery:
 
     async def discover(self, cidr: str, include_services: bool = True) -> list[DiscoveryResult]:
         network = ipaddress.ip_network(cidr, strict=False)
-        if self._liveness_mode == "nmap_icmp":
-            live_hosts = await self._discover_live_hosts_with_nmap(str(network))
+        if self._liveness_mode in {"nmap_icmp", "multi_source"}:
+            live_hosts = await self._discover_live_hosts_with_sources(str(network))
             if include_services:
-                return await self.scan_known_hosts([{"ip": ip} for ip in live_hosts])
+                return await self.scan_known_hosts([record.to_host_payload() for record in live_hosts])
             return await self._build_liveness_only_results(live_hosts)
         tasks = [asyncio.create_task(self._discover_host(str(host), include_services=include_services)) for host in network.hosts()]
         results = await asyncio.gather(*tasks)
@@ -218,6 +248,8 @@ class AsyncNetworkDiscovery:
             return await self._scan_host_services(
                 ip=str(host.get("ip") or "").strip(),
                 known_hostname=host.get("hostname") if isinstance(host.get("hostname"), str) else None,
+                discovery_sources=self._extract_host_list(host.get("discovery_sources")),
+                discovery_evidence=self._extract_host_list(host.get("discovery_evidence")),
             )
 
     async def _scan_known_host_ports_only_entry(self, host: dict[str, object]) -> DiscoveryResult | None:
@@ -225,6 +257,8 @@ class AsyncNetworkDiscovery:
             return await self._scan_host_ports(
                 ip=str(host.get("ip") or "").strip(),
                 known_hostname=host.get("hostname") if isinstance(host.get("hostname"), str) else None,
+                discovery_sources=self._extract_host_list(host.get("discovery_sources")),
+                discovery_evidence=self._extract_host_list(host.get("discovery_evidence")),
             )
 
     async def _scan_known_host_ports_only_with_nmap_entry(self, host: dict[str, object]) -> DiscoveryResult | None:
@@ -232,6 +266,8 @@ class AsyncNetworkDiscovery:
             return await self._scan_host_ports_with_nmap(
                 ip=str(host.get("ip") or "").strip(),
                 known_hostname=host.get("hostname") if isinstance(host.get("hostname"), str) else None,
+                discovery_sources=self._extract_host_list(host.get("discovery_sources")),
+                discovery_evidence=self._extract_host_list(host.get("discovery_evidence")),
             )
 
     async def _probe_known_open_ports_entry(self, host: dict[str, object]) -> DiscoveryResult | None:
@@ -251,6 +287,8 @@ class AsyncNetworkDiscovery:
                 ip=str(host.get("ip") or "").strip(),
                 open_ports=sorted(set(open_ports)),
                 known_hostname=host.get("hostname") if isinstance(host.get("hostname"), str) else None,
+                discovery_sources=self._extract_host_list(host.get("discovery_sources")),
+                discovery_evidence=self._extract_host_list(host.get("discovery_evidence")),
             )
 
     async def _discover_host(self, ip: str, *, include_services: bool) -> DiscoveryResult | None:
@@ -261,15 +299,33 @@ class AsyncNetworkDiscovery:
             tcp_alive = any(result.is_open for result in liveness_results)
             if not (icmp_alive or tcp_alive):
                 return None
+            discovery_sources: list[str] = []
+            discovery_evidence: list[str] = []
+            if icmp_alive:
+                discovery_sources.append("icmp_ping")
+                discovery_evidence.append("icmp_ping_success")
+            if tcp_alive:
+                discovery_sources.append("tcp_connect")
+                discovery_evidence.append(
+                    "tcp_connect_open_ports="
+                    + ",".join(str(result.port) for result in liveness_results if result.is_open)
+                )
 
             if include_services:
-                return await self._scan_host_services(ip, liveness_results=liveness_results)
+                return await self._scan_host_services(
+                    ip,
+                    liveness_results=liveness_results,
+                    discovery_sources=discovery_sources,
+                    discovery_evidence=discovery_evidence,
+                )
 
             return DiscoveryResult(
                 ip=ip,
                 hostname=None,
                 ports=[],
                 services=[],
+                discovery_sources=discovery_sources,
+                discovery_evidence=discovery_evidence,
             )
 
     async def _scan_host_ports(
@@ -277,6 +333,8 @@ class AsyncNetworkDiscovery:
         ip: str,
         *,
         known_hostname: str | None = None,
+        discovery_sources: list[str] | None = None,
+        discovery_evidence: list[str] | None = None,
     ) -> DiscoveryResult | None:
         if not ip:
             return None
@@ -286,6 +344,8 @@ class AsyncNetworkDiscovery:
             hostname=known_hostname,
             ports=[result.port for result in port_results if result.is_open],
             services=[],
+            discovery_sources=list(discovery_sources or []),
+            discovery_evidence=list(discovery_evidence or []),
         )
 
     async def _scan_host_ports_with_nmap(
@@ -293,11 +353,18 @@ class AsyncNetworkDiscovery:
         ip: str,
         *,
         known_hostname: str | None = None,
+        discovery_sources: list[str] | None = None,
+        discovery_evidence: list[str] | None = None,
     ) -> DiscoveryResult | None:
         if not ip:
             return None
         if not self._has_nmap():
-            return await self._scan_host_ports(ip, known_hostname=known_hostname)
+            return await self._scan_host_ports(
+                ip,
+                known_hostname=known_hostname,
+                discovery_sources=discovery_sources,
+                discovery_evidence=discovery_evidence,
+            )
 
         cmd = [
             "nmap",
@@ -324,12 +391,27 @@ class AsyncNetworkDiscovery:
             process.kill()
             await process.wait()
             logger.warning("nmap full port scan timeout for host=%s, fallback to python scanner", ip)
-            return await self._scan_host_ports(ip, known_hostname=known_hostname)
+            return await self._scan_host_ports(
+                ip,
+                known_hostname=known_hostname,
+                discovery_sources=discovery_sources,
+                discovery_evidence=discovery_evidence,
+            )
         except FileNotFoundError:
-            return await self._scan_host_ports(ip, known_hostname=known_hostname)
+            return await self._scan_host_ports(
+                ip,
+                known_hostname=known_hostname,
+                discovery_sources=discovery_sources,
+                discovery_evidence=discovery_evidence,
+            )
         except Exception as exc:  # pragma: no cover - runtime dependent
             logger.warning("nmap full port scan failed for host=%s: %s, fallback to python scanner", ip, exc)
-            return await self._scan_host_ports(ip, known_hostname=known_hostname)
+            return await self._scan_host_ports(
+                ip,
+                known_hostname=known_hostname,
+                discovery_sources=discovery_sources,
+                discovery_evidence=discovery_evidence,
+            )
 
         if process.returncode not in {0, 1}:
             logger.warning(
@@ -338,18 +420,30 @@ class AsyncNetworkDiscovery:
                 process.returncode,
                 stderr.decode("utf-8", errors="ignore").strip(),
             )
-            return await self._scan_host_ports(ip, known_hostname=known_hostname)
+            return await self._scan_host_ports(
+                ip,
+                known_hostname=known_hostname,
+                discovery_sources=discovery_sources,
+                discovery_evidence=discovery_evidence,
+            )
 
         open_ports = self.parse_nmap_full_scan_xml_output(ip, stdout.decode("utf-8", errors="ignore"))
         if open_ports is None:
             logger.warning("nmap full port scan XML parse failed for host=%s, fallback to python scanner", ip)
-            return await self._scan_host_ports(ip, known_hostname=known_hostname)
+            return await self._scan_host_ports(
+                ip,
+                known_hostname=known_hostname,
+                discovery_sources=discovery_sources,
+                discovery_evidence=discovery_evidence,
+            )
 
         return DiscoveryResult(
             ip=ip,
             hostname=known_hostname,
             ports=open_ports,
             services=[],
+            discovery_sources=list(discovery_sources or []),
+            discovery_evidence=list(discovery_evidence or []),
         )
 
     async def _scan_host_services(
@@ -358,6 +452,8 @@ class AsyncNetworkDiscovery:
         *,
         known_hostname: str | None = None,
         liveness_results: list[PortScanResult] | None = None,
+        discovery_sources: list[str] | None = None,
+        discovery_evidence: list[str] | None = None,
     ) -> DiscoveryResult | None:
         if not ip:
             return None
@@ -373,6 +469,8 @@ class AsyncNetworkDiscovery:
             hostname=hostname,
             ports=[result.port for result in port_results if result.is_open],
             services=[result.to_dict() for result in service_results],
+            discovery_sources=list(discovery_sources or []),
+            discovery_evidence=list(discovery_evidence or []),
         )
 
     async def _probe_host_open_ports(
@@ -381,6 +479,8 @@ class AsyncNetworkDiscovery:
         *,
         open_ports: list[int],
         known_hostname: str | None = None,
+        discovery_sources: list[str] | None = None,
+        discovery_evidence: list[str] | None = None,
     ) -> DiscoveryResult | None:
         if not ip:
             return None
@@ -392,6 +492,8 @@ class AsyncNetworkDiscovery:
             hostname=hostname,
             ports=sorted(open_ports),
             services=[result.to_dict() for result in service_results],
+            discovery_sources=list(discovery_sources or []),
+            discovery_evidence=list(discovery_evidence or []),
         )
 
     async def icmp_ping(self, ip: str) -> bool:
@@ -424,64 +526,118 @@ class AsyncNetworkDiscovery:
     async def tcp_host_probe(self, ip: str) -> list[PortScanResult]:
         return await self.port_scanner.probe_liveness_batch(ip, list(self._liveness_ports))
 
-    async def _build_liveness_only_results(self, live_hosts: list[str]) -> list[DiscoveryResult]:
-        tasks = [asyncio.create_task(self._build_liveness_only_result(ip)) for ip in live_hosts]
+    async def _build_liveness_only_results(self, live_hosts: list[HostDiscoveryRecord]) -> list[DiscoveryResult]:
+        tasks = [asyncio.create_task(self._build_liveness_only_result(record)) for record in live_hosts]
         if not tasks:
             return []
         results = await asyncio.gather(*tasks)
         return sorted(results, key=lambda item: ipaddress.ip_address(item.ip))
 
-    async def _build_liveness_only_result(self, ip: str) -> DiscoveryResult:
+    async def _build_liveness_only_result(self, record: HostDiscoveryRecord) -> DiscoveryResult:
         async with self._host_semaphore:
             return DiscoveryResult(
-                ip=ip,
+                ip=record.ip,
                 hostname=None,
                 ports=[],
                 services=[],
+                discovery_sources=sorted(record.sources),
+                discovery_evidence=list(record.evidence),
             )
 
-    async def _discover_live_hosts_with_nmap(self, cidr: str) -> list[str]:
-        if not self._has_nmap():
-            raise DiscoveryLivenessError("nmap 不可用，无法执行批量 ICMP 探活")
+    async def _discover_live_hosts_with_sources(self, cidr: str) -> list[HostDiscoveryRecord]:
+        network = ipaddress.ip_network(cidr, strict=False)
+        records: dict[str, HostDiscoveryRecord] = {}
+        errors: list[str] = []
+        attempted_sources = 0
 
-        cmd = [
-            "nmap",
-            "-sn",
-            "-PE",
-            "-n",
-            "-T5",
-            "--min-rate",
-            str(max(1, int(self.config.nmap_min_rate))),
-            cidr,
-            "-oX",
-            "-",
-        ]
-        timeout_seconds = max(1, int(self.config.nmap_liveness_timeout_seconds))
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        if self._liveness_mode == "nmap_icmp":
+            if not self._has_nmap():
+                raise DiscoveryLivenessError("nmap 不可用，无法执行批量 nmap 探活")
+            attempted_sources += 1
+            self._merge_host_candidates(
+                records,
+                await self._discover_live_hosts_with_nmap(str(network)),
+                source="nmap_host_discovery",
             )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=float(timeout_seconds))
-        except asyncio.TimeoutError as exc:
-            process.kill()
-            await process.wait()
-            raise DiscoveryLivenessError(f"nmap 批量 ICMP 探活超时（>{timeout_seconds}秒）") from exc
-        except FileNotFoundError as exc:
-            raise DiscoveryLivenessError("nmap 不可用，无法执行批量 ICMP 探活") from exc
-        except Exception as exc:  # pragma: no cover - runtime dependent
-            logger.warning("nmap liveness discovery failed for cidr=%s: %s", cidr, exc)
-            raise DiscoveryLivenessError(f"nmap 批量 ICMP 探活执行失败: {exc}") from exc
+            return sorted(records.values(), key=lambda item: ipaddress.ip_address(item.ip))
 
-        if process.returncode != 0:
-            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
-            message = f"nmap 批量 ICMP 探活失败，退出码={process.returncode}"
-            if stderr_text:
-                message = f"{message}: {stderr_text}"
-            raise DiscoveryLivenessError(message)
+        local_interface = find_local_ipv4_interface_for_network(network) if isinstance(network, ipaddress.IPv4Network) else None
+        if self.config.enable_arp_discovery and local_interface is not None:
+            attempted_sources += 1
+            arp_error: DiscoveryLivenessError | None = None
+            if self._has_arp_scan():
+                try:
+                    self._merge_host_candidates(
+                        records,
+                        await self._discover_live_hosts_with_arp_scan(str(network), interface_name=local_interface.name),
+                        source="arp_scan",
+                    )
+                except DiscoveryLivenessError as exc:
+                    arp_error = exc
+                    errors.append(str(exc))
+            if not self._has_arp_scan() and self._has_arping():
+                try:
+                    self._merge_host_candidates(
+                        records,
+                        await self._discover_live_hosts_with_arping(str(network), interface_name=local_interface.name),
+                        source="arping",
+                    )
+                except DiscoveryLivenessError as exc:
+                    arp_error = exc
+                    errors.append(str(exc))
+            if not self._has_arp_scan() and not self._has_arping():
+                errors.append(f"同网段 {network} 缺少 arp-scan/arping，可用 ARP 探活已跳过")
+            elif arp_error is not None and self._has_arping():
+                try:
+                    self._merge_host_candidates(
+                        records,
+                        await self._discover_live_hosts_with_arping(str(network), interface_name=local_interface.name),
+                        source="arping",
+                    )
+                except DiscoveryLivenessError as exc:
+                    errors.append(str(exc))
 
-        return self.parse_nmap_ping_xml_output(stdout.decode("utf-8", errors="ignore"))
+        if self.config.enable_fping and self._has_fping():
+            attempted_sources += 1
+            try:
+                self._merge_host_candidates(
+                    records,
+                    await self._discover_live_hosts_with_fping(str(network)),
+                    source="fping",
+                )
+            except DiscoveryLivenessError as exc:
+                errors.append(str(exc))
+
+        if self._has_nmap():
+            attempted_sources += 1
+            try:
+                self._merge_host_candidates(
+                    records,
+                    await self._discover_live_hosts_with_nmap(str(network)),
+                    source="nmap_host_discovery",
+                )
+            except DiscoveryLivenessError as exc:
+                errors.append(str(exc))
+
+        if attempted_sources == 0:
+            raise DiscoveryLivenessError("未找到可用的主机发现工具")
+        if not records and errors and attempted_sources == len(errors):
+            raise DiscoveryLivenessError("；".join(errors))
+        return sorted(records.values(), key=lambda item: ipaddress.ip_address(item.ip))
+
+    @staticmethod
+    def _merge_host_candidates(
+        records: dict[str, HostDiscoveryRecord],
+        hosts: list[str],
+        *,
+        source: str,
+    ) -> None:
+        for ip in hosts:
+            record = records.get(ip)
+            if record is None:
+                record = HostDiscoveryRecord(ip=ip)
+                records[ip] = record
+            record.merge(source=source, evidence=f"{source}:{ip}")
 
     @staticmethod
     def _pick_hostname(service_results: list[object]) -> str | None:
@@ -493,14 +649,30 @@ class AsyncNetworkDiscovery:
 
     @staticmethod
     def _normalize_liveness_mode(value: str | None) -> str:
-        normalized = (value or "nmap_icmp").strip().lower()
+        normalized = (value or "multi_source").strip().lower()
         if normalized == "icmp_only":
             return "nmap_icmp"
+        if normalized in {"hybrid", "tcp_connect"}:
+            return "tcp_connect"
+        if normalized not in {"multi_source", "nmap_icmp", "tcp_connect"}:
+            return "multi_source"
         return normalized
 
     @staticmethod
     def _has_nmap() -> bool:
         return shutil.which("nmap") is not None
+
+    @staticmethod
+    def _has_arp_scan() -> bool:
+        return shutil.which("arp-scan") is not None
+
+    @staticmethod
+    def _has_arping() -> bool:
+        return shutil.which("arping") is not None
+
+    @staticmethod
+    def _has_fping() -> bool:
+        return shutil.which("fping") is not None
 
     def _should_use_nmap_full_port_scan(self) -> bool:
         return bool(
@@ -538,6 +710,191 @@ class AsyncNetworkDiscovery:
                 continue
             live_hosts.add(ip)
         return sorted(live_hosts, key=ipaddress.ip_address)
+
+    async def _discover_live_hosts_with_nmap(self, cidr: str) -> list[str]:
+        if not self._has_nmap():
+            raise DiscoveryLivenessError("nmap 不可用，无法执行批量 nmap 探活")
+
+        cmd = [
+            "nmap",
+            "-sn",
+            "-n",
+            "-PE",
+            "-PS22,80,443,445,3389",
+            "-PA80,443,445,3389",
+        ]
+        if self.config.nmap_host_discovery_profile.strip().lower() == "aggressive":
+            cmd.append("-PU53,161")
+        cmd.extend(
+            [
+                "-T4",
+                "--min-rate",
+                str(max(1, int(self.config.nmap_min_rate))),
+                cidr,
+                "-oX",
+                "-",
+            ]
+        )
+        timeout_seconds = max(1, int(self.config.nmap_liveness_timeout_seconds))
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=float(timeout_seconds))
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise DiscoveryLivenessError(f"nmap 批量探活超时（>{timeout_seconds}秒）") from exc
+        except FileNotFoundError as exc:
+            raise DiscoveryLivenessError("nmap 不可用，无法执行批量探活") from exc
+        except Exception as exc:  # pragma: no cover - runtime dependent
+            logger.warning("nmap liveness discovery failed for cidr=%s: %s", cidr, exc)
+            raise DiscoveryLivenessError(f"nmap 批量探活执行失败: {exc}") from exc
+
+        if process.returncode not in {0, 1}:
+            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
+            message = f"nmap 批量探活失败，退出码={process.returncode}"
+            if stderr_text:
+                message = f"{message}: {stderr_text}"
+            raise DiscoveryLivenessError(message)
+
+        return self.parse_nmap_ping_xml_output(stdout.decode("utf-8", errors="ignore"))
+
+    async def _discover_live_hosts_with_fping(self, cidr: str) -> list[str]:
+        cmd = ["fping", "-a", "-q", "-r0", "-g", cidr]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=float(max(5, int(self.config.nmap_liveness_timeout_seconds))),
+            )
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise DiscoveryLivenessError("fping 批量探活超时") from exc
+        except FileNotFoundError as exc:
+            raise DiscoveryLivenessError("fping 不可用") from exc
+        except Exception as exc:  # pragma: no cover - runtime dependent
+            raise DiscoveryLivenessError(f"fping 批量探活失败: {exc}") from exc
+
+        if process.returncode not in {0, 1}:
+            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
+            raise DiscoveryLivenessError(f"fping 批量探活失败: {stderr_text or process.returncode}")
+
+        discovered: set[str] = set()
+        for raw_line in stdout.decode("utf-8", errors="ignore").splitlines():
+            candidate = raw_line.strip()
+            if not candidate:
+                continue
+            try:
+                discovered.add(str(ipaddress.ip_address(candidate)))
+            except ValueError:
+                continue
+        return sorted(discovered, key=ipaddress.ip_address)
+
+    async def _discover_live_hosts_with_arp_scan(self, cidr: str, *, interface_name: str) -> list[str]:
+        cmd = [
+            "arp-scan",
+            "--interface",
+            interface_name,
+            "--retry=1",
+            "--timeout=250",
+            "--ignoredups",
+            "--plain",
+            cidr,
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise DiscoveryLivenessError(f"arp-scan 扫描 {cidr} 超时") from exc
+        except FileNotFoundError as exc:
+            raise DiscoveryLivenessError("arp-scan 不可用") from exc
+        except Exception as exc:  # pragma: no cover - runtime dependent
+            raise DiscoveryLivenessError(f"arp-scan 执行失败: {exc}") from exc
+
+        if process.returncode not in {0, 1}:
+            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
+            raise DiscoveryLivenessError(f"arp-scan 执行失败: {stderr_text or process.returncode}")
+        return self.parse_arp_scan_output(stdout.decode("utf-8", errors="ignore"))
+
+    async def _discover_live_hosts_with_arping(self, cidr: str, *, interface_name: str) -> list[str]:
+        network = ipaddress.ip_network(cidr, strict=False)
+        if not isinstance(network, ipaddress.IPv4Network):
+            return []
+        if network.num_addresses > 1024:
+            raise DiscoveryLivenessError(f"arping 回退不支持大网段 {cidr}")
+
+        semaphore = asyncio.Semaphore(64)
+        tasks = [
+            asyncio.create_task(self._arping_one_host(semaphore, interface_name=interface_name, ip=str(host)))
+            for host in network.hosts()
+        ]
+        results = [item for item in await asyncio.gather(*tasks) if item]
+        return sorted(set(results), key=ipaddress.ip_address)
+
+    async def _arping_one_host(
+        self,
+        semaphore: asyncio.Semaphore,
+        *,
+        interface_name: str,
+        ip: str,
+    ) -> str | None:
+        async with semaphore:
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "arping",
+                    "-c",
+                    "1",
+                    "-w",
+                    "1",
+                    "-I",
+                    interface_name,
+                    ip,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except Exception:
+                return None
+            return ip if process.returncode == 0 else None
+
+    @staticmethod
+    def parse_arp_scan_output(output: str) -> list[str]:
+        discovered: set[str] = set()
+        for raw_line in output.splitlines():
+            parts = raw_line.strip().split()
+            if not parts:
+                continue
+            candidate = parts[0].strip()
+            try:
+                discovered.add(str(ipaddress.ip_address(candidate)))
+            except ValueError:
+                continue
+        return sorted(discovered, key=ipaddress.ip_address)
+
+    @staticmethod
+    def _extract_host_list(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                normalized.append(text)
+        return normalized
 
     @classmethod
     def parse_nmap_full_scan_xml_output(cls, ip: str, output: str) -> list[int] | None:

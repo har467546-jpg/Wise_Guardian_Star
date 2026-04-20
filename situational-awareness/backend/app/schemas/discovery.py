@@ -10,6 +10,7 @@ from app.schemas.common import ORMModel
 class DiscoveryJobCreate(BaseModel):
     cidr: IPvAnyNetwork
     label: str | None = None
+    runner_asset_id: str | None = None
 
 
 class DiscoveryJobRead(ORMModel):

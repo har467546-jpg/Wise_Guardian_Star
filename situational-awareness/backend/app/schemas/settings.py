@@ -88,6 +88,9 @@ class PlatformSettingsRead(BaseModel):
 
     discovery_liveness_ports: str
     discovery_liveness_mode: str
+    discovery_enable_arp_discovery: bool
+    discovery_enable_fping: bool
+    discovery_nmap_host_discovery_profile: str
     discovery_service_ports: str
     discovery_high_backdoor_ports: str
     discovery_portset_mode: str
@@ -132,7 +135,10 @@ class PlatformSettingsUpdate(BaseModel):
     remediation_prepare_backups_enabled: bool
 
     discovery_liveness_ports: str
-    discovery_liveness_mode: Literal["nmap_icmp", "tcp_connect"]
+    discovery_liveness_mode: Literal["multi_source", "nmap_icmp", "tcp_connect"]
+    discovery_enable_arp_discovery: bool
+    discovery_enable_fping: bool
+    discovery_nmap_host_discovery_profile: Literal["balanced", "aggressive"]
     discovery_service_ports: str
     discovery_high_backdoor_ports: str
     discovery_portset_mode: Literal["curated", "top1000_plus_custom", "full"]

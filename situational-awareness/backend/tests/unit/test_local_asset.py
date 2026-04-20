@@ -57,3 +57,16 @@ def test_get_local_asset_matcher_does_not_resolve_hostname_dns(tmp_path, monkeyp
 
     assert "scanner-host" in matcher.hostnames
     assert "scanner-host.local" in matcher.hostnames
+
+
+def test_get_local_asset_matcher_includes_local_interface_ips(tmp_path, monkeypatch) -> None:
+    runtime_path = tmp_path / "local_asset_hints.json"
+    monkeypatch.setattr(local_asset, "RUNTIME_LOCAL_ASSET_HINTS_PATH", runtime_path)
+    monkeypatch.setattr(local_asset.settings, "LOCAL_ASSET_IPS", "127.0.0.1")
+    monkeypatch.setattr(local_asset, "list_local_ipv4_addresses", lambda: ["192.168.130.137"])
+    local_asset.clear_local_asset_matcher_cache()
+
+    is_local, hint = local_asset.resolve_local_asset("192.168.130.137")
+
+    assert is_local is True
+    assert hint == "匹配平台本机 IP"
