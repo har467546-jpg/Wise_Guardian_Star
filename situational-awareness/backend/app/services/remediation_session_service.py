@@ -649,34 +649,50 @@ def process_remediation_session_ai_generation(
     )
     try:
         if "ai_plan_summary" in needs:
-            plan_content = ai_service.build_plan_summary(asset_detail=asset_detail, plan=plan)
-            _append_session_message(
+            plan_digest = str(needs["ai_plan_summary"]["digest"] or "").strip()
+            if not _has_ai_message_digest(
                 db,
-                session=session,
-                role="assistant",
+                session_id=session.id,
                 message_type="ai_plan_summary",
-                content=plan_content,
-                payload_json={
-                    "provider_mode": provider_mode,
-                    "plan_digest": needs["ai_plan_summary"]["digest"],
-                    "reason": reason or "auto",
-                },
-            )
+                payload_key="plan_digest",
+                digest=plan_digest,
+            ):
+                plan_content = ai_service.build_plan_summary(asset_detail=asset_detail, plan=plan)
+                _append_session_message(
+                    db,
+                    session=session,
+                    role="assistant",
+                    message_type="ai_plan_summary",
+                    content=plan_content,
+                    payload_json={
+                        "provider_mode": provider_mode,
+                        "plan_digest": plan_digest,
+                        "reason": reason or "auto",
+                    },
+                )
             summary_state["last_plan_digest"] = needs["ai_plan_summary"]["digest"]
         if "ai_blocker_analysis" in needs:
-            blocker_content = ai_service.build_blocker_analysis(asset_detail=asset_detail, plan=plan)
-            _append_session_message(
+            blocker_digest = str(needs["ai_blocker_analysis"]["digest"] or "").strip()
+            if not _has_ai_message_digest(
                 db,
-                session=session,
-                role="assistant",
+                session_id=session.id,
                 message_type="ai_blocker_analysis",
-                content=blocker_content,
-                payload_json={
-                    "provider_mode": provider_mode,
-                    "blocker_digest": needs["ai_blocker_analysis"]["digest"],
-                    "reason": reason or "auto",
-                },
-            )
+                payload_key="blocker_digest",
+                digest=blocker_digest,
+            ):
+                blocker_content = ai_service.build_blocker_analysis(asset_detail=asset_detail, plan=plan)
+                _append_session_message(
+                    db,
+                    session=session,
+                    role="assistant",
+                    message_type="ai_blocker_analysis",
+                    content=blocker_content,
+                    payload_json={
+                        "provider_mode": provider_mode,
+                        "blocker_digest": blocker_digest,
+                        "reason": reason or "auto",
+                    },
+                )
             summary_state["last_blocker_digest"] = needs["ai_blocker_analysis"]["digest"]
         if "ai_task_failure" in needs:
             failed_task = db.get(TaskRun, needs["ai_task_failure"]["task_id"])
@@ -790,6 +806,30 @@ def _prune_legacy_summary_messages(db: Session, *, session: RemediationSession) 
 
 def _has_message_type(session: RemediationSession, message_type: str) -> bool:
     return any(item.message_type == message_type for item in session.messages)
+
+
+def _has_ai_message_digest(
+    db: Session,
+    *,
+    session_id: str,
+    message_type: str,
+    payload_key: str,
+    digest: str,
+) -> bool:
+    normalized_digest = str(digest or "").strip()
+    if not normalized_digest:
+        return False
+    items = db.scalars(
+        select(RemediationMessage).where(
+            RemediationMessage.session_id == session_id,
+            RemediationMessage.message_type == message_type,
+        )
+    ).all()
+    for item in items:
+        payload = item.payload_json if isinstance(item.payload_json, dict) else {}
+        if str(payload.get(payload_key) or "").strip() == normalized_digest:
+            return True
+    return False
 
 
 def _has_task_failure_message(session: RemediationSession, failure_digest: str) -> bool:
@@ -983,6 +1023,7 @@ def _synchronize_session_runtime_state_with_plan(
         task_context = task.result_json.get("context") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("context"), dict) else {}
         task_execution = task.result_json.get("execution") if isinstance(task.result_json, dict) and isinstance(task.result_json.get("execution"), dict) else {}
         task_business_status = str((task.result_json or {}).get("business_status") or task_execution.get("business_status") or "").strip().lower()
+        task_execution_boundary = str(task_execution.get("execution_boundary") or "").strip().lower()
         running_stage_name = str(task_context.get("stage_name") or "").strip()
         task_execution_mode = str(task_execution.get("execution_mode") or "").strip().lower()
         if task.status in RUNNING_TASK_STATUSES:
@@ -1013,6 +1054,9 @@ def _synchronize_session_runtime_state_with_plan(
             elif task_business_status == BUSINESS_STATUS_VERIFIED_FAILED:
                 next_status = "failed"
                 content = f"阶段“{running_stage_name}”执行后复验失败，请查看任务输出。" if running_stage_name else "当前阶段执行后复验失败，请查看任务输出。"
+            elif task_execution_boundary == "runner_dispatch" and task_execution_mode != "dry_run":
+                next_status = "completed"
+                content = "Host Runner 已完成整机修复计划。"
             else:
                 content = f"阶段“{running_stage_name}”执行完成，工作台已更新到下一阶段。" if running_stage_name else "当前阶段执行完成，工作台已更新。"
             _append_session_audit_message(

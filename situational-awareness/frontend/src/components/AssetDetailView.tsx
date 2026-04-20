@@ -310,34 +310,6 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
         },
       },
       {
-        title: "识别摘要",
-        key: "fingerprint_summary",
-        render: (_: unknown, record: Asset["ports"][number]) => {
-          const payload = toRecord(record.fingerprint_json);
-          const confidence = Number(payload.confidence ?? 0);
-          const source = String(payload.source || "py");
-          const sourceLabel = source === "nmap" ? "nmap" : source === "ssh_probe" ? "SSH" : "内置识别";
-          const reason = String(payload.reason || "无说明");
-          const evidence = Array.isArray(payload.evidence) ? (payload.evidence as string[]) : [];
-          const isBackdoorCandidate = Boolean(payload.backdoor_candidate);
-          const nmapSkipped = Boolean(payload.nmap_skipped);
-          const tooltipLines = [reason, ...evidence.slice(0, 3)].filter(Boolean);
-          return (
-            <Tooltip title={tooltipLines.join("\n")}>
-              <div className="ui-cell-stack">
-                <div className="ui-chip-row ports-fingerprint-tags">
-                  <Tag color={confidence >= 80 ? "green" : confidence >= 70 ? "gold" : "orange"}>{confidence}%</Tag>
-                  <Tag>{sourceLabel}</Tag>
-                  {isBackdoorCandidate ? <Tag color="red">后门候选</Tag> : null}
-                  {nmapSkipped ? <Tag color="orange">跳过 nmap</Tag> : null}
-                </div>
-                {!isCompactLayout ? <OverflowText value={reason} block secondary /> : null}
-              </div>
-            </Tooltip>
-          );
-        },
-      },
-      {
         title: "NSE / 说明",
         key: "nse_summary",
         render: (_: unknown, record: Asset["ports"][number]) => {

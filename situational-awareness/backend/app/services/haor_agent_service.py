@@ -221,6 +221,22 @@ SUPPORTED_UI_ACTIONS = {
 }
 MAX_AGENT_LOOP_STEPS = 10
 MAX_UI_ACTION_BATCH = 6
+MAX_MODEL_DECISION_STEPS = 3
+MAX_MODEL_HISTORY_MESSAGES = 6
+MAX_MODEL_HISTORY_CHARS = 1800
+MAX_MODEL_TOOL_TRACE_ITEMS = 4
+MAX_MODEL_SECONDARY_ENTITIES = 6
+MAX_MODEL_VISIBLE_SECTIONS = 8
+MAX_MODEL_SEMANTIC_ACTIONS = 8
+MAX_MODEL_SEMANTIC_FORMS = 4
+MAX_MODEL_SELECTED_ROWS = 4
+MAX_MODEL_SELECTED_ENTITIES = 4
+MAX_MODEL_OPEN_PANELS = 4
+MAX_MODEL_FORMS = 2
+MAX_MODEL_VISIBLE_ACTIONS = 8
+MAX_MODEL_DOM_SNAPSHOT_NODES = 12
+MAX_MODEL_UI_RESULTS = 4
+MAX_MODEL_PLANNED_STEPS = 6
 MESSAGE_TURN_STALE_SECONDS = 120
 UI_FEEDBACK_STALE_SECONDS = 300
 
@@ -3472,15 +3488,17 @@ def append_agent_task_message(
     if session is None:
         return
     normalized_payload = payload_json if isinstance(payload_json, dict) else {}
+    session_browser_runtime = getattr(session, "browser_runtime_json", {})
+    session_route_context = getattr(session, "route_context_json", {})
     current_browser_runtime = _normalize_browser_runtime(
-        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+        session_browser_runtime if isinstance(session_browser_runtime, dict) else {}
     )
     current_phase = _sanitize_line(str(current_browser_runtime.get("phase") or ""), max_length=64)
     if current_phase in {"awaiting_ui_feedback", "resolving_ui_feedback", "recovering"}:
         browser_context = _normalize_browser_context(
             current_browser_runtime.get("last_browser_context")
             if isinstance(current_browser_runtime.get("last_browser_context"), dict)
-            else session.route_context_json if isinstance(session.route_context_json, dict) else {}
+            else session_route_context if isinstance(session_route_context, dict) else {}
         )
         _clear_browser_runtime(
             session,
@@ -3499,14 +3517,15 @@ def append_agent_task_message(
         )
     child_task = normalized_payload.get("child_task") if isinstance(normalized_payload.get("child_task"), dict) else {}
     task_id = _sanitize_line(
-        str(normalized_payload.get("task_id") or child_task.get("task_id") or session.last_task_id or ""),
+        str(normalized_payload.get("task_id") or child_task.get("task_id") or getattr(session, "last_task_id", "") or ""),
         max_length=64,
     ) or None
     if task_id:
         session.last_task_id = task_id
+    session_status = str(getattr(session, "status", "") or "").strip().lower()
     if watching is True:
         session.status = "running"
-    elif session.status == "running":
+    elif session_status == "running":
         session.status = "active"
     state_delta = sync_agent_task_watch_state(
         session,
@@ -4873,26 +4892,25 @@ def _compact_browser_context(browser_context: dict[str, Any]) -> dict[str, Any]:
         "query": sanitize_json_value(browser_context.get("query") if isinstance(browser_context.get("query"), dict) else {}),
         "selected_entities": sanitize_json_value(
             browser_context.get("selected_entities") if isinstance(browser_context.get("selected_entities"), list) else []
-        )[:8],
+        )[:MAX_MODEL_SELECTED_ENTITIES],
         "open_panels": sanitize_json_value(
             browser_context.get("open_panels") if isinstance(browser_context.get("open_panels"), list) else []
-        )[:6],
-        "forms": sanitize_json_value(browser_context.get("forms") if isinstance(browser_context.get("forms"), list) else [])[:4],
+        )[:MAX_MODEL_OPEN_PANELS],
+        "forms": sanitize_json_value(browser_context.get("forms") if isinstance(browser_context.get("forms"), list) else [])[
+            :MAX_MODEL_FORMS
+        ],
         "visible_actions": sanitize_json_value(
             browser_context.get("visible_actions") if isinstance(browser_context.get("visible_actions"), list) else []
-        )[:16],
-        "semantic_page_context": sanitize_json_value(
-            browser_context.get("semantic_page_context") if isinstance(browser_context.get("semantic_page_context"), dict) else {}
-        ),
+        )[:MAX_MODEL_VISIBLE_ACTIONS],
         "semantic_actions": sanitize_json_value(
             browser_context.get("semantic_actions") if isinstance(browser_context.get("semantic_actions"), list) else []
-        )[:20],
+        )[:MAX_MODEL_SEMANTIC_ACTIONS],
         "semantic_forms": sanitize_json_value(
             browser_context.get("semantic_forms") if isinstance(browser_context.get("semantic_forms"), list) else []
-        )[:8],
+        )[:MAX_MODEL_SEMANTIC_FORMS],
         "dom_snapshot": sanitize_json_value(
             browser_context.get("dom_snapshot") if isinstance(browser_context.get("dom_snapshot"), list) else []
-        )[:40],
+        )[:MAX_MODEL_DOM_SNAPSHOT_NODES],
     }
 
 
@@ -4912,7 +4930,7 @@ def _build_model_context_payload(
     objective_kind = browser_runtime.get("objective_kind") if isinstance(browser_runtime, dict) else None
     primary_target = _working_context_primary_target(working_context)
     recent_targets = working_context.get("recent_targets") if isinstance(working_context.get("recent_targets"), list) else []
-    semantic_page_context = _browser_semantic_page_context(browser_context)
+    semantic_page_context = _compact_semantic_page_context_for_model(_browser_semantic_page_context(browser_context))
     available_tools = [
         {
             "tool_name": "list_assets",
@@ -5051,7 +5069,7 @@ def _build_model_context_payload(
         "current_page_context": _compact_page_context(page_context),
         "semantic_page_context": sanitize_json_value(semantic_page_context),
         "current_browser_context": _compact_browser_context(browser_context),
-        "browser_runtime": sanitize_json_value(browser_runtime),
+        "browser_runtime": _compact_browser_runtime_for_model(browser_runtime),
         "pending_dialog_state": sanitize_json_value(dialog_state),
         "followup_hint": sanitize_json_value(followup_hint),
         "available_read_tools": available_tools,
@@ -5127,14 +5145,222 @@ def _build_model_response_contract() -> dict[str, Any]:
     }
 
 
-def _render_history_line(message: AgentMessage | Any) -> str | None:
+def _render_history_line(message: AgentMessage | Any, *, max_length: int = 4000) -> str | None:
     role = "assistant" if str(message.role or "").strip().lower() == "assistant" else "user"
-    content = sanitize_text(message.content, max_length=4000) or ""
+    content = sanitize_text(message.content, max_length=max_length) or ""
     if not content:
         return None
     message_type = str(message.message_type or "text").strip().lower() or "text"
     label = role if message_type == "text" else f"{role}/{message_type}"
     return f"{label}: {content}"
+
+
+def _select_model_history_lines(messages: list[AgentMessage | Any]) -> list[str]:
+    selected: list[str] = []
+    total_chars = 0
+    assistant_types = {"text", "clarifying", "plan", "error"}
+    fallback_line: str | None = None
+
+    for item in reversed(messages):
+        role = str(getattr(item, "role", "") or "").strip().lower()
+        message_type = str(getattr(item, "message_type", "") or "text").strip().lower() or "text"
+        rendered = _render_history_line(item, max_length=280)
+        if rendered and fallback_line is None:
+            fallback_line = rendered
+        if role == "assistant" and message_type not in assistant_types:
+            continue
+        if not rendered:
+            continue
+        next_total = total_chars + len(rendered)
+        if selected and (len(selected) >= MAX_MODEL_HISTORY_MESSAGES or next_total > MAX_MODEL_HISTORY_CHARS):
+            break
+        selected.append(rendered)
+        total_chars = next_total
+        if len(selected) >= MAX_MODEL_HISTORY_MESSAGES or total_chars >= MAX_MODEL_HISTORY_CHARS:
+            break
+
+    if not selected and fallback_line:
+        return [fallback_line]
+    return list(reversed(selected))
+
+
+def _compact_semantic_page_context_for_model(page_context: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = _normalize_semantic_page_context(page_context if isinstance(page_context, dict) else {})
+    return {
+        "page_kind": _sanitize_line(str(normalized.get("page_kind") or "unknown"), max_length=48) or "unknown",
+        "primary_entity": sanitize_json_value(
+            normalized.get("primary_entity") if isinstance(normalized.get("primary_entity"), dict) else {}
+        ),
+        "secondary_entities": sanitize_json_value(
+            normalized.get("secondary_entities") if isinstance(normalized.get("secondary_entities"), list) else []
+        )[:MAX_MODEL_SECONDARY_ENTITIES],
+        "visible_sections": sanitize_json_value(
+            normalized.get("visible_sections") if isinstance(normalized.get("visible_sections"), list) else []
+        )[:MAX_MODEL_VISIBLE_SECTIONS],
+        "semantic_actions": sanitize_json_value(
+            normalized.get("semantic_actions") if isinstance(normalized.get("semantic_actions"), list) else []
+        )[:MAX_MODEL_SEMANTIC_ACTIONS],
+        "semantic_forms": sanitize_json_value(
+            normalized.get("semantic_forms") if isinstance(normalized.get("semantic_forms"), list) else []
+        )[:MAX_MODEL_SEMANTIC_FORMS],
+        "active_dialog": sanitize_json_value(
+            normalized.get("active_dialog") if isinstance(normalized.get("active_dialog"), dict) else {}
+        ),
+        "selected_rows": sanitize_json_value(
+            normalized.get("selected_rows") if isinstance(normalized.get("selected_rows"), list) else []
+        )[:MAX_MODEL_SELECTED_ROWS],
+        "summary": sanitize_text(str(normalized.get("summary") or ""), max_length=240) or None,
+    }
+
+
+def _compact_model_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 2:
+        return sanitize_json_value(value)
+    if isinstance(value, list):
+        return [_compact_model_value(item, depth=depth + 1) for item in value[:3]]
+    if not isinstance(value, dict):
+        return sanitize_json_value(value)
+
+    prioritized_keys = (
+        "task_id",
+        "asset_id",
+        "finding_id",
+        "session_id",
+        "rule_id",
+        "status",
+        "task_type",
+        "business_status",
+        "message",
+        "summary",
+        "title",
+        "label",
+        "count",
+        "total",
+        "created_at",
+        "updated_at",
+        "started_at",
+        "finished_at",
+    )
+    compacted: dict[str, Any] = {}
+    for key in prioritized_keys:
+        if key not in value:
+            continue
+        compacted[key] = _compact_model_value(value.get(key), depth=depth + 1)
+
+    for list_key in ("items", "events", "rows", "assets", "findings", "sessions"):
+        list_value = value.get(list_key)
+        if isinstance(list_value, list) and list_value:
+            compacted[f"{list_key}_preview"] = [_compact_model_value(item, depth=depth + 1) for item in list_value[:2]]
+            if "total" not in compacted:
+                compacted["total"] = len(list_value)
+            break
+
+    for nested_key in ("timing", "result", "meta"):
+        nested_value = value.get(nested_key)
+        if isinstance(nested_value, dict) and nested_value:
+            compacted[nested_key] = _compact_model_value(nested_value, depth=depth + 1)
+
+    if not compacted:
+        for key, item in list(value.items())[:6]:
+            compacted[_sanitize_line(str(key), max_length=64) or str(key)] = _compact_model_value(item, depth=depth + 1)
+    return sanitize_json_value(compacted)
+
+
+def _compact_tool_traces_for_model(tool_traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for trace in tool_traces[-MAX_MODEL_TOOL_TRACE_ITEMS:]:
+        if not isinstance(trace, dict):
+            continue
+        item = {
+            "tool_name": _sanitize_line(str(trace.get("tool_name") or ""), max_length=64),
+            "arguments": sanitize_json_value(trace.get("arguments") if isinstance(trace.get("arguments"), dict) else {}),
+            "ok": False if trace.get("ok") is False else True,
+        }
+        if item["ok"]:
+            item["result"] = _compact_model_value(trace.get("result"))
+        else:
+            item["error"] = sanitize_text(str(trace.get("error") or ""), max_length=240) or None
+        compacted.append(item)
+    return compacted
+
+
+def _compact_ui_action_results_for_model(results: Any) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for item in _normalize_ui_action_results(results)[:MAX_MODEL_UI_RESULTS]:
+        compacted_item = {
+            "action_id": _sanitize_line(str(item.get("action_id") or ""), max_length=64) or None,
+            "action_type": _sanitize_line(str(item.get("action_type") or ""), max_length=32) or None,
+            "ok": bool(item.get("ok")),
+            "semantic_action_id": _sanitize_line(str(item.get("semantic_action_id") or ""), max_length=128) or None,
+            "target_node_id": _sanitize_line(str(item.get("target_node_id") or ""), max_length=64) or None,
+            "resolved_node_id": _sanitize_line(str(item.get("resolved_node_id") or ""), max_length=64) or None,
+            "message": sanitize_text(str(item.get("message") or ""), max_length=180) or None,
+            "resolved_target": sanitize_json_value(
+                item.get("resolved_target") if isinstance(item.get("resolved_target"), dict) else {}
+            ),
+            "attempt_count": max(1, min(int(item.get("attempt_count") or 1), 4)),
+        }
+        compacted.append(compacted_item)
+    return compacted
+
+
+def _compact_auto_executed_actions_for_model(actions: Any) -> list[dict[str, Any]]:
+    if not isinstance(actions, list):
+        return []
+    compacted: list[dict[str, Any]] = []
+    for item in actions[:MAX_MODEL_TOOL_TRACE_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        params = item.get("params") if isinstance(item.get("params"), dict) else {}
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        compacted.append(
+            {
+                "action_type": _sanitize_line(str(item.get("action_type") or ""), max_length=64) or None,
+                "title": sanitize_text(str(item.get("title") or ""), max_length=120) or None,
+                "summary": sanitize_text(str(item.get("summary") or ""), max_length=180) or None,
+                "child_task_id": _sanitize_line(str(item.get("child_task_id") or ""), max_length=64) or None,
+                "status": _sanitize_line(str(item.get("status") or payload.get("status") or ""), max_length=32) or None,
+                "asset_id": _sanitize_line(str(params.get("asset_id") or payload.get("asset_id") or ""), max_length=64) or None,
+                "session_id": _sanitize_line(str(payload.get("session_id") or ""), max_length=64) or None,
+            }
+        )
+    return compacted
+
+
+def _compact_browser_runtime_for_model(browser_runtime: dict[str, Any] | None) -> dict[str, Any]:
+    runtime = _normalize_browser_runtime(browser_runtime if isinstance(browser_runtime, dict) else {})
+    pending_secure_input = (
+        runtime.get("pending_secure_input") if isinstance(runtime.get("pending_secure_input"), dict) else {}
+    )
+    return {
+        "phase": _sanitize_line(str(runtime.get("phase") or ""), max_length=48) or "idle",
+        "step_count": max(0, min(int(runtime.get("step_count") or 0), MAX_AGENT_LOOP_STEPS)),
+        "current_objective": sanitize_text(str(runtime.get("current_objective") or ""), max_length=240) or None,
+        "objective_kind": _sanitize_line(str(runtime.get("objective_kind") or ""), max_length=32) or None,
+        "planned_steps": sanitize_json_value(
+            runtime.get("planned_steps") if isinstance(runtime.get("planned_steps"), list) else []
+        )[:MAX_MODEL_PLANNED_STEPS],
+        "step_cursor": max(0, min(int(runtime.get("step_cursor") or 0), MAX_AGENT_LOOP_STEPS)),
+        "pending_ui_actions": sanitize_json_value(
+            runtime.get("pending_ui_actions") if isinstance(runtime.get("pending_ui_actions"), list) else []
+        )[:MAX_UI_ACTION_BATCH],
+        "completed_ui_actions": _compact_ui_action_results_for_model(runtime.get("completed_ui_actions")),
+        "last_ui_results": _compact_ui_action_results_for_model(runtime.get("last_ui_results")),
+        "pending_secure_input": {
+            "kind": _sanitize_line(str(pending_secure_input.get("kind") or ""), max_length=64) or None,
+            "mode": _sanitize_line(str(pending_secure_input.get("mode") or ""), max_length=32) or None,
+            "asset_ids": sanitize_json_value(
+                pending_secure_input.get("asset_ids") if isinstance(pending_secure_input.get("asset_ids"), list) else []
+            )[:4],
+            "resume_goal_id": _sanitize_line(str(pending_secure_input.get("resume_goal_id") or ""), max_length=64) or None,
+            "blocker_summary": sanitize_text(str(pending_secure_input.get("blocker_summary") or ""), max_length=240) or None,
+        }
+        if pending_secure_input
+        else {},
+        "auto_executed_actions": _compact_auto_executed_actions_for_model(runtime.get("auto_executed_actions")),
+        "last_user_intent": sanitize_text(str(runtime.get("last_user_intent") or ""), max_length=240) or None,
+        "last_error": sanitize_text(str(runtime.get("last_error") or ""), max_length=240) or None,
+    }
 
 
 def _build_model_request(
@@ -5153,17 +5379,13 @@ def _build_model_request(
 ) -> LLMRequest:
     recent_messages = list(session.messages[-12:])
     latest_user_content = ""
-    history_lines: list[str] = []
     if recent_messages:
         last_message = recent_messages[-1]
         last_role = str(getattr(last_message, "role", "") or "").strip().lower()
         if last_role == "user":
             latest_user_content = sanitize_text(getattr(last_message, "content", ""), max_length=4000) or ""
             recent_messages = recent_messages[:-1]
-    for item in recent_messages:
-        rendered = _render_history_line(item)
-        if rendered:
-            history_lines.append(rendered)
+    history_lines = _select_model_history_lines(recent_messages)
 
     messages: list[LLMMessage] = [
         LLMMessage.from_text(
@@ -5226,7 +5448,7 @@ def _build_model_request(
                 "user",
                 "已执行的只读工具结果如下，请基于这些结果继续回答当前用户问题：\n"
                 + json.dumps(
-                    sanitize_json_value({"executed_read_tools": tool_traces[-8:]}),
+                    sanitize_json_value({"executed_read_tools": _compact_tool_traces_for_model(tool_traces)}),
                     ensure_ascii=False,
                     indent=2,
                 ),
@@ -5787,7 +6009,7 @@ def _run_agent_loop(
         watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
     )
     _emit_agent_state(stream_emitter, session, turn_id=turn_id)
-    for _ in range(MAX_AGENT_LOOP_STEPS):
+    for _ in range(MAX_MODEL_DECISION_STEPS):
         if resume_priority_decision is not None:
             decision = resume_priority_decision
             resume_priority_decision = None
@@ -6507,7 +6729,8 @@ def sync_agent_task_watch_state(
             "source": "task_watch",
         }
     )
-    current_context = session.working_context_json if isinstance(session.working_context_json, dict) else {}
+    session_working_context = getattr(session, "working_context_json", {})
+    current_context = session_working_context if isinstance(session_working_context, dict) else {}
     focus = _resolve_agent_focus(
         working_context=current_context,
         user_content=str(action_params.get("cidr") or ""),

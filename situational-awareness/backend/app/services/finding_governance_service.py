@@ -38,27 +38,37 @@ def ensure_governance_for_findings(db: Session, findings: list[RiskFinding], *, 
         return {}
     refresh_expired_waivers(db)
     rule_map = {rule.rule_id: rule for rule in rules}
-    intel_summaries = build_rule_intel_summary_map(db, list(rule_map.values()))
+    can_query_runtime = hasattr(db, "execute") or hasattr(db, "scalars")
+    can_persist = hasattr(db, "add") and hasattr(db, "flush")
+    intel_summaries = build_rule_intel_summary_map(db, list(rule_map.values())) if can_query_runtime else {}
     result: dict[str, FindingGovernance] = {}
     for finding in findings:
         snapshot = _build_priority_snapshot(
             finding,
             rule=rule_map.get(_yaml_rule_id(finding) or ""),
             intel_summary=intel_summaries.get(_yaml_rule_id(finding) or ""),
-            waivers=finding.waivers,
+            waivers=getattr(finding, "waivers", []) or [],
         )
-        governance = finding.governance or FindingGovernance(finding_id=finding.id)
-        if governance.owner_id is None and finding.asset and finding.asset.owner_id:
-            governance.owner_id = finding.asset.owner_id
+        governance = getattr(finding, "governance", None) or FindingGovernance(finding_id=str(getattr(finding, "id", "") or ""))
+        asset = getattr(finding, "asset", None)
+        if governance.owner_id is None and asset and getattr(asset, "owner_id", None):
+            governance.owner_id = asset.owner_id
         governance.priority_score = snapshot.priority_score
         governance.priority_tier = snapshot.priority_tier
         governance.priority_reason_json = snapshot.priority_reason
         governance.sla_due_at = snapshot.sla_due_at
-        governance.status = "waived" if snapshot.waiver_status != "none" else finding.status.value if hasattr(finding.status, "value") else str(finding.status)
+        finding_status = getattr(finding, "status", None)
+        governance.status = "waived" if snapshot.waiver_status != "none" else finding_status.value if hasattr(finding_status, "value") else str(finding_status)
+        if getattr(governance, "updated_at", None) is None:
+            governance.updated_at = datetime.now(UTC)
         finding.governance = governance
-        db.add(governance)
-        result[finding.id] = governance
-    db.flush()
+        if can_persist:
+            db.add(governance)
+        finding_id = str(getattr(finding, "id", "") or "")
+        if finding_id:
+            result[finding_id] = governance
+    if can_persist:
+        db.flush()
     return result
 
 
@@ -149,6 +159,8 @@ def recalculate_open_finding_priorities(db: Session, *, rules: list[RuleDefiniti
 
 
 def refresh_expired_waivers(db: Session) -> int:
+    if not hasattr(db, "scalars"):
+        return 0
     now = datetime.now(UTC)
     items = db.scalars(
         select(FindingWaiver).where(
@@ -160,14 +172,15 @@ def refresh_expired_waivers(db: Session) -> int:
     for item in items:
         item.status = "expired"
         item.updated_at = now
-        db.add(item)
-    if items:
+        if hasattr(db, "add"):
+            db.add(item)
+    if items and hasattr(db, "flush"):
         db.flush()
     return len(items)
 
 
 def resolve_waiver_status(finding: RiskFinding) -> str:
-    active = _active_waiver(finding.waivers)
+    active = _active_waiver(getattr(finding, "waivers", []) or [])
     if active is None:
         return "none"
     return active.waiver_type if active.status == "active" else "none"
@@ -224,13 +237,14 @@ def _build_priority_snapshot(
 
 
 def _asset_value_score(finding: RiskFinding) -> int:
-    asset = finding.asset
+    asset = getattr(finding, "asset", None)
     if asset is None:
         return 0
-    tag_names = {str(binding.tag.name or "").strip().lower() for binding in (asset.tags or []) if getattr(binding, "tag", None)}
+    asset_tags = getattr(asset, "tags", []) or []
+    tag_names = {str(binding.tag.name or "").strip().lower() for binding in asset_tags if getattr(binding, "tag", None)}
     if {"high-value", "critical", "production"} & tag_names:
         return 10
-    if asset.owner_id or tag_names:
+    if getattr(asset, "owner_id", None) or tag_names:
         return 5
     return 0
 

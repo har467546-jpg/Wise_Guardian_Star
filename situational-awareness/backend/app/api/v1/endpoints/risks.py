@@ -48,8 +48,9 @@ def _current_rules() -> list[RuleDefinition]:
 
 
 def _serialize_risk_finding_payload(finding: RiskFinding) -> dict[str, object]:
-    asset = finding.asset
-    governance = finding.governance
+    asset = getattr(finding, "asset", None)
+    governance = getattr(finding, "governance", None)
+    waivers = getattr(finding, "waivers", []) or []
     return {
         "id": finding.id,
         "asset_id": finding.asset_id,
@@ -95,7 +96,7 @@ def _serialize_risk_finding_payload(finding: RiskFinding) -> dict[str, object]:
                 "created_at": waiver.created_at,
                 "updated_at": waiver.updated_at,
             }
-            for waiver in finding.waivers
+            for waiver in waivers
         ],
     }
 
@@ -106,6 +107,11 @@ def _serialize_mobile_risk_finding(finding: RiskFinding) -> RiskFindingMobileRea
 
 def _serialize_risk_finding(finding: RiskFinding) -> RiskFindingRead:
     return RiskFindingRead.model_validate(_serialize_risk_finding_payload(finding))
+
+
+def _commit_if_supported(db: Session) -> None:
+    if hasattr(db, "commit"):
+        db.commit()
 
 
 @router.get("", response_model=RiskFindingPageResponse)
@@ -128,7 +134,7 @@ def get_risk_list(
     )
     if items:
         ensure_governance_for_findings(db, items, rules=_current_rules())
-        db.commit()
+        _commit_if_supported(db)
     return RiskFindingPageResponse(
         items=[_serialize_mobile_risk_finding(item) for item in items],
         meta=PageMeta(total=total, page=page, page_size=page_size),
@@ -145,7 +151,7 @@ def get_risk_detail(
     if finding is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="风险发现不存在")
     ensure_governance_for_findings(db, [finding], rules=_current_rules())
-    db.commit()
+    _commit_if_supported(db)
     return _serialize_mobile_risk_finding(finding)
 
 
@@ -158,7 +164,7 @@ def get_asset_risks(
     findings = list_findings_by_asset(db=db, asset_id=asset_id)
     if findings:
         ensure_governance_for_findings(db, findings, rules=_current_rules())
-        db.commit()
+        _commit_if_supported(db)
     return RiskFindingListResponse(items=[_serialize_risk_finding(item) for item in findings])
 
 

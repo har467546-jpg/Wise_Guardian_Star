@@ -540,7 +540,7 @@ class AppEmptyState extends StatelessWidget {
   }
 }
 
-class AsyncStateView extends StatelessWidget {
+class AsyncStateView extends StatelessWidget { // 封装异步态势图
   const AsyncStateView({
     super.key,
     required this.loading,
@@ -555,7 +555,7 @@ class AsyncStateView extends StatelessWidget {
   final Widget child;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) { // 封装通用的加载 - 报错 - 重试组件
     if (loading) {
       return const Center(
         child: Padding(

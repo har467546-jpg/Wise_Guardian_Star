@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 import httpx
 from types import SimpleNamespace
@@ -60,6 +61,13 @@ class _FakeMessageDB(_FakeRecoverDB):
 
     def flush(self) -> None:
         return None
+
+
+def _extract_model_context_payload(request) -> dict:
+    payload = request.messages[2].text_content()
+    prefix = "平台当前上下文如下：\n"
+    assert payload.startswith(prefix)
+    return json.loads(payload[len(prefix) :])
 
 
 def test_build_model_request_uses_structured_messages() -> None:
@@ -165,6 +173,159 @@ def test_build_model_request_serializes_datetime_tool_trace_context() -> None:
     assert any(base.isoformat() in message for message in serialized_messages)
     assert any('"task_type": "asset_scan"' in message for message in serialized_messages)
     assert any('"status": "success"' in message for message in serialized_messages)
+
+
+def test_build_model_request_compacts_browser_and_runtime_payload_for_model() -> None:
+    dom_snapshot = [
+        {"node_id": f"node-{index}", "tag_name": "button", "text": f"按钮 {index}", "is_interactive": True}
+        for index in range(20)
+    ]
+    visible_actions = [{"action_type": "click", "action_id": f"visible-{index}", "label": f"动作 {index}"} for index in range(12)]
+    semantic_actions = [
+        {
+            "semantic_action_id": f"semantic-{index}",
+            "label": f"语义动作 {index}",
+            "action_type": "click",
+        }
+        for index in range(14)
+    ]
+
+    request = haor_agent_service._build_model_request(
+        session=SimpleNamespace(messages=[SimpleNamespace(role="user", message_type="text", content="继续处理")]),
+        user=SimpleNamespace(role="admin"),
+        page_context={"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+        browser_context={
+            "pathname": "/tasks/task-1",
+            "origin": "https://example.test",
+            "title": "任务详情",
+            "query": {},
+            "task_id": "task-1",
+            "selected_entities": [{"kind": "task", "id": "task-1", "label": "任务 1"}] * 8,
+            "open_panels": [{"kind": "panel", "title": f"面板 {index}", "node_id": f"panel-{index}"} for index in range(6)],
+            "forms": [{"node_id": f"form-{index}", "name": f"表单 {index}"} for index in range(4)],
+            "visible_actions": visible_actions,
+            "semantic_actions": semantic_actions,
+            "semantic_forms": [{"semantic_form_id": f"form-{index}", "label": f"表单 {index}"} for index in range(6)],
+            "semantic_page_context": {
+                "page_kind": "task_detail",
+                "primary_entity": {"kind": "task", "id": "task-1", "label": "任务 task-1"},
+                "visible_sections": [{"section_id": f"section-{index}", "label": f"区块 {index}"} for index in range(12)],
+                "semantic_actions": semantic_actions,
+                "semantic_forms": [{"semantic_form_id": f"semantic-form-{index}", "label": f"语义表单 {index}"} for index in range(8)],
+                "selected_rows": [{"kind": "event", "id": f"event-{index}", "label": f"事件 {index}"} for index in range(8)],
+            },
+            "dom_snapshot": dom_snapshot,
+        },
+        browser_runtime={
+            "phase": "awaiting_ui_feedback",
+            "step_count": 4,
+            "current_objective": "查看任务详情",
+            "objective_kind": "inspect",
+            "planned_steps": [{"kind": "ui_action", "label": f"步骤 {index}"} for index in range(10)],
+            "pending_ui_actions": [{"action_type": "click", "action_id": f"pending-{index}"} for index in range(6)],
+            "completed_ui_actions": [{"action_type": "click", "action_id": f"done-{index}", "ok": True} for index in range(8)],
+            "last_ui_results": [{"action_type": "click", "action_id": f"result-{index}", "ok": True} for index in range(8)],
+            "last_browser_context": {"pathname": "/tasks/task-1", "dom_snapshot": dom_snapshot},
+            "semantic_page_context": {"page_kind": "task_detail", "semantic_actions": semantic_actions},
+            "last_user_intent": "继续处理任务",
+            "last_error": "上一轮页面动作失败",
+        },
+        working_context={"task_id": "task-1", "recent_targets": [{"task_id": "task-1"}]},
+        dialog_state={},
+        followup_hint={},
+        tool_traces=[],
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    context_payload = _extract_model_context_payload(request)
+    current_browser_context = context_payload["current_browser_context"]
+    browser_runtime = context_payload["browser_runtime"]
+    semantic_page_context = context_payload["semantic_page_context"]
+
+    assert "semantic_page_context" not in current_browser_context
+    assert len(current_browser_context["dom_snapshot"]) == haor_agent_service.MAX_MODEL_DOM_SNAPSHOT_NODES
+    assert len(current_browser_context["visible_actions"]) == haor_agent_service.MAX_MODEL_VISIBLE_ACTIONS
+    assert len(current_browser_context["semantic_actions"]) == haor_agent_service.MAX_MODEL_SEMANTIC_ACTIONS
+    assert len(semantic_page_context["visible_sections"]) == haor_agent_service.MAX_MODEL_VISIBLE_SECTIONS
+    assert len(semantic_page_context["semantic_forms"]) == haor_agent_service.MAX_MODEL_SEMANTIC_FORMS
+    assert "last_browser_context" not in browser_runtime
+    assert "semantic_page_context" not in browser_runtime
+    assert len(browser_runtime["planned_steps"]) == haor_agent_service.MAX_MODEL_PLANNED_STEPS
+    assert len(browser_runtime["completed_ui_actions"]) == haor_agent_service.MAX_MODEL_UI_RESULTS
+    assert len(browser_runtime["last_ui_results"]) == haor_agent_service.MAX_MODEL_UI_RESULTS
+
+
+def test_build_model_request_filters_noisy_history_messages() -> None:
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="assistant", message_type="action_update", content="我先去读取任务事件。"),
+            SimpleNamespace(role="assistant", message_type="clarifying", content="请确认要查看哪个任务。"),
+            SimpleNamespace(role="user", message_type="text", content="查看 task-1"),
+            SimpleNamespace(role="assistant", message_type="action_update", content="已定位到任务详情。"),
+            SimpleNamespace(role="user", message_type="text", content="继续"),
+        ]
+    )
+
+    request = haor_agent_service._build_model_request(
+        session=session,
+        user=SimpleNamespace(role="admin"),
+        page_context={"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+        browser_context={"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+        browser_runtime={},
+        working_context={"task_id": "task-1"},
+        dialog_state={},
+        followup_hint={},
+        tool_traces=[],
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    history_message = next(message.text_content() for message in request.messages if "最近会话记录如下" in message.text_content())
+
+    assert "assistant/clarifying: 请确认要查看哪个任务。" in history_message
+    assert "assistant/action_update" not in history_message
+
+
+def test_run_agent_loop_uses_compact_model_round_limit(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    call_count = {"value": 0}
+
+    def _fake_run_model_once(*args, **kwargs):  # type: ignore[no-untyped-def]
+        call_count["value"] += 1
+        return haor_agent_service._AgentModelDecision(
+            reply_markdown="继续读取任务详情",
+            conversation_state="answer",
+            read_tool_calls=[
+                haor_agent_service._ReadToolCall(tool_name="get_task_detail", arguments={"task_id": "task-1"})
+            ],
+        )
+
+    monkeypatch.setattr(haor_agent_service, "_run_model_once", _fake_run_model_once)
+    monkeypatch.setattr(haor_agent_service, "match_registered_playbook", lambda **kwargs: None)
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_execute_read_tool",
+        lambda db, *, tool_name, arguments: {"task_id": arguments["task_id"], "status": "success"},
+    )
+
+    decision, tool_traces = haor_agent_service._run_agent_loop(
+        db=_FakeUnitDB(),
+        session=SimpleNamespace(messages=[SimpleNamespace(role="user", message_type="text", content="继续查看 task-1")], working_context_json={}),
+        user=SimpleNamespace(role="admin"),
+        page_context={"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+        browser_context={"pathname": "/tasks/task-1", "query": {}, "task_id": "task-1"},
+        browser_runtime={},
+        working_context={},
+        dialog_state={},
+        followup_hint={},
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    assert call_count["value"] == haor_agent_service.MAX_MODEL_DECISION_STEPS
+    assert len(tool_traces) == haor_agent_service.MAX_MODEL_DECISION_STEPS
+    assert decision.read_tool_calls == []
+    assert "已达到只读工具调用上限" in decision.reply_markdown
 
 
 def test_parse_model_decision_allows_null_retryable_and_normalizes_it() -> None:
