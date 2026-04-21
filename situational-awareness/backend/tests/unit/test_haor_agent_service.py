@@ -1774,6 +1774,192 @@ def test_build_resume_hint_summary_decision_summarizes_scan_assets() -> None:
     assert "192.168.130.138 / target-1 / Ubuntu" in decision.reply_markdown
 
 
+def test_build_resume_hint_summary_decision_generates_remediation_report() -> None:
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_remediation_review",
+                        "working_context": {"asset_id": "asset-1", "task_id": "task-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "get_remediation_asset", "arguments": {"asset_id": "asset-1"}},
+                            {"tool_name": "get_task_detail", "arguments": {"task_id": "task-1"}},
+                        ],
+                        "suggested_reply_label": "复盘修复结果",
+                    }
+                }
+            )
+        ]
+    )
+
+    decision = haor_agent_service._build_resume_hint_summary_decision(
+        session=session,
+        tool_traces=[
+            {
+                "tool_name": "get_remediation_asset",
+                "arguments": {"asset_id": "asset-1"},
+                "ok": True,
+                "result": {
+                    "asset_id": "asset-1",
+                    "findings": [
+                        {"title": "匿名访问未关闭", "service_name": "ftp", "status": "open"},
+                        {"title": "管理端口对公网开放", "service_name": "ssh", "status": "open"},
+                    ],
+                },
+            },
+            {
+                "tool_name": "get_task_detail",
+                "arguments": {"task_id": "task-1"},
+                "ok": True,
+                "result": {
+                    "task_id": "task-1",
+                    "status": "success",
+                    "message": "阶段“配置加固”执行完成，但目标风险仍未全部关闭",
+                    "result_json": {
+                        "execution_status": "succeeded",
+                        "business_status": "verified_partial",
+                        "plan": {
+                            "blocked_reasons": ["缺少管理网段配置"],
+                            "steps": [
+                                {"step_id": "step-1", "title": "限制 SSH 监听范围"},
+                                {"step_id": "step-2", "title": "关闭匿名访问"},
+                                {"step_id": "step-3", "title": "重载 sshd"},
+                            ],
+                        },
+                        "execution": {
+                            "execution_mode": "apply",
+                            "stage_name": "配置加固",
+                            "submitted_steps": [
+                                {"step_id": "step-1"},
+                                {"step_id": "step-2"},
+                                {"step_id": "step-3"},
+                            ],
+                            "step_results": [
+                                {"step_id": "step-1", "title": "限制 SSH 监听范围", "status": "success"},
+                                {"step_id": "step-2", "title": "关闭匿名访问", "status": "success"},
+                                {"step_id": "step-3", "title": "重载 sshd", "status": "failed"},
+                            ],
+                            "success_count": 2,
+                            "failed_count": 1,
+                            "blocked_count": 0,
+                            "skipped_count": 0,
+                        },
+                        "reverify_summary": {
+                            "targeted_target_count": 2,
+                            "closed_target_count": 1,
+                            "open_target_count": 1,
+                            "other_open_finding_count": 2,
+                            "business_blockers": ["缺少管理网段配置，当前无法确认是否已收敛到管理网段"],
+                        },
+                        "targeted_finding_outcomes": [
+                            {"title": "SSH 对公网暴露", "service_name": "ssh", "status": "closed"},
+                            {"title": "匿名访问未关闭", "service_name": "ftp", "status": "open"},
+                        ],
+                    },
+                },
+            },
+        ],
+    )
+
+    assert decision is not None
+    assert decision.stop_reason == "resume_hint_remediation_gap_report"
+    assert "当前还不能输出最终修复报告" in decision.reply_markdown
+    assert "尚未达到“修复完毕”的状态" in decision.reply_markdown
+    assert "1. 本轮执行了哪些步骤" in decision.reply_markdown
+    assert "限制 SSH 监听范围" in decision.reply_markdown
+    assert "2. 哪些成功" in decision.reply_markdown
+    assert "成功 2 步，失败 1 步" in decision.reply_markdown
+    assert "3. 哪些风险已闭环" in decision.reply_markdown
+    assert "SSH 对公网暴露" in decision.reply_markdown
+    assert "4. 哪些仍未闭环" in decision.reply_markdown
+    assert "匿名访问未关闭" in decision.reply_markdown
+    assert "未纳入本轮的其余开放风险 2 条" in decision.reply_markdown
+    assert "5. 下一步建议" in decision.reply_markdown
+    assert "优先处理仍开放的目标风险，再补一次复验" in decision.reply_markdown
+    assert "6. 是否建议再复验 / 人工介入" in decision.reply_markdown
+    assert "建议再复验：是" in decision.reply_markdown
+    assert "建议人工介入：是" in decision.reply_markdown
+
+
+def test_build_resume_hint_summary_decision_outputs_final_report_only_when_verified_closed() -> None:
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_remediation_review",
+                        "working_context": {"asset_id": "asset-1", "task_id": "task-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "get_remediation_asset", "arguments": {"asset_id": "asset-1"}},
+                            {"tool_name": "get_task_detail", "arguments": {"task_id": "task-1"}},
+                        ],
+                        "suggested_reply_label": "输出最终修复报告",
+                    }
+                }
+            )
+        ]
+    )
+
+    decision = haor_agent_service._build_resume_hint_summary_decision(
+        session=session,
+        tool_traces=[
+            {
+                "tool_name": "get_remediation_asset",
+                "arguments": {"asset_id": "asset-1"},
+                "ok": True,
+                "result": {
+                    "asset": {
+                        "id": "asset-1",
+                        "ip": "172.16.27.139",
+                        "hostname": "metasploitable",
+                    },
+                    "findings": [],
+                },
+            },
+            {
+                "tool_name": "get_task_detail",
+                "arguments": {"task_id": "task-1"},
+                "ok": True,
+                "result": {
+                    "task_id": "task-1",
+                    "status": "success",
+                    "message": "阶段“配置加固”执行完成，目标风险已关闭",
+                    "result_json": {
+                        "execution_status": "succeeded",
+                        "business_status": "verified_closed",
+                        "execution": {
+                            "execution_mode": "apply",
+                            "stage_name": "配置加固",
+                            "submitted_steps": [{"step_id": "step-1"}],
+                            "step_results": [
+                                {"step_id": "step-1", "title": "关闭匿名访问", "status": "success"},
+                            ],
+                            "success_count": 1,
+                            "failed_count": 0,
+                        },
+                        "reverify_summary": {
+                            "targeted_target_count": 1,
+                            "closed_target_count": 1,
+                            "open_target_count": 0,
+                            "other_open_finding_count": 0,
+                        },
+                        "targeted_finding_outcomes": [
+                            {"title": "匿名访问未关闭", "service_name": "ftp", "status": "closed"},
+                        ],
+                    },
+                },
+            },
+        ],
+    )
+
+    assert decision is not None
+    assert decision.stop_reason == "resume_hint_remediation_report"
+    assert decision.objective == "输出最终修复报告"
+    assert "最终结论：本轮目标风险已经修复完毕" in decision.reply_markdown
+    assert "当前还不能输出最终修复报告" not in decision.reply_markdown
+
+
 def test_build_resume_hint_read_decision_does_not_hijack_maintenance_window_followup() -> None:
     session = SimpleNamespace(
         messages=[
@@ -1889,6 +2075,112 @@ def test_run_agent_loop_prefers_resume_hint_review_before_playbook(monkeypatch) 
     assert read_calls == [("get_remediation_asset", {"asset_id": "asset-1"})]
     assert tool_traces[0]["tool_name"] == "get_remediation_asset"
     assert model_flags == [(False, False)]
+
+
+def test_run_agent_loop_returns_remediation_report_after_resume_reads(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="assistant",
+                message_type="task_update",
+                content="修复任务已完成",
+                payload_json={
+                    "resume_hint": {
+                        "kind": "post_remediation_review",
+                        "working_context": {"asset_id": "asset-1", "task_id": "task-1"},
+                        "preferred_read_tools": [
+                            {"tool_name": "get_remediation_asset", "arguments": {"asset_id": "asset-1"}},
+                            {"tool_name": "get_task_detail", "arguments": {"task_id": "task-1"}},
+                        ],
+                        "suggested_reply_label": "复盘修复结果",
+                    }
+                },
+            ),
+            SimpleNamespace(role="user", message_type="text", content="继续，复盘这次自动修复结果"),
+        ],
+        working_context_json={"asset_id": "asset-1"},
+    )
+    user = SimpleNamespace(role="admin")
+    read_calls: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(haor_agent_service, "match_registered_playbook", lambda **kwargs: None)
+
+    def _fake_execute_read_tool(_db, *, tool_name, arguments):  # type: ignore[no-untyped-def]
+        read_calls.append((tool_name, arguments))
+        if tool_name == "get_remediation_asset":
+            return {
+                "asset_id": "asset-1",
+                "findings": [
+                    {"title": "匿名访问未关闭", "service_name": "ftp", "status": "open"},
+                ],
+            }
+        if tool_name == "get_task_detail":
+            return {
+                "task_id": "task-1",
+                "status": "success",
+                "message": "阶段“配置加固”执行完成，但目标风险仍未全部关闭",
+                "result_json": {
+                    "execution_status": "succeeded",
+                    "business_status": "verified_partial",
+                    "plan": {
+                        "steps": [
+                            {"step_id": "step-1", "title": "限制 SSH 监听范围"},
+                            {"step_id": "step-2", "title": "关闭匿名访问"},
+                        ],
+                    },
+                    "execution": {
+                        "execution_mode": "apply",
+                        "stage_name": "配置加固",
+                        "submitted_steps": [{"step_id": "step-1"}, {"step_id": "step-2"}],
+                        "step_results": [
+                            {"step_id": "step-1", "title": "限制 SSH 监听范围", "status": "success"},
+                            {"step_id": "step-2", "title": "关闭匿名访问", "status": "failed"},
+                        ],
+                        "success_count": 1,
+                        "failed_count": 1,
+                    },
+                    "reverify_summary": {
+                        "targeted_target_count": 1,
+                        "closed_target_count": 0,
+                        "open_target_count": 1,
+                        "business_blockers": ["缺少管理网段配置"],
+                    },
+                    "targeted_finding_outcomes": [
+                        {"title": "匿名访问未关闭", "service_name": "ftp", "status": "open"},
+                    ],
+                },
+            }
+        raise AssertionError(f"unexpected tool {tool_name}")
+
+    monkeypatch.setattr(haor_agent_service, "_execute_read_tool", _fake_execute_read_tool)
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_run_model_once",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("remediation report should short-circuit model")),
+    )
+
+    decision, tool_traces = haor_agent_service._run_agent_loop(
+        _FakeUnitDB(),
+        session=session,
+        user=user,
+        page_context={"pathname": "/assets/asset-1", "asset_id": "asset-1", "query": {}},
+        browser_context={"pathname": "/assets/asset-1", "asset_id": "asset-1", "query": {}, "semantic_page_context": {"page_kind": "generic"}},
+        browser_runtime={},
+        working_context={"asset_id": "asset-1"},
+        dialog_state={},
+        followup_hint={},
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    assert decision.stop_reason == "resume_hint_remediation_report"
+    assert "1. 本轮执行了哪些步骤" in decision.reply_markdown
+    assert "6. 是否建议再复验 / 人工介入" in decision.reply_markdown
+    assert read_calls == [
+        ("get_remediation_asset", {"asset_id": "asset-1"}),
+        ("get_task_detail", {"task_id": "task-1"}),
+    ]
+    assert [item["tool_name"] for item in tool_traces] == ["get_remediation_asset", "get_task_detail"]
 
 
 def test_reconcile_running_session_state_restores_active_after_canceled_task(monkeypatch) -> None:

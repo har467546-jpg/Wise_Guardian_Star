@@ -14,6 +14,8 @@ def list_assets(
     keyword: str | None = None,
     asset_status: AssetStatus | None = None,
     tag_id: str | None = None,
+    network_zone: str | None = None,
+    asset_category: str | None = None,
 ) -> tuple[list[Asset], int]:
     stmt: Select[tuple[Asset]] = select(Asset).options(joinedload(Asset.ports))
     count_stmt = select(func.count(Asset.id))
@@ -34,6 +36,10 @@ def list_assets(
             )
     if asset_status is not None:
         filters.append(Asset.status == asset_status)
+    if network_zone:
+        filters.append(Asset.network_zone == network_zone)
+    if asset_category:
+        filters.append(Asset.asset_category == asset_category)
     if tag_id:
         stmt = stmt.join(AssetTag, AssetTag.asset_id == Asset.id)
         count_stmt = count_stmt.join(AssetTag, AssetTag.asset_id == Asset.id)

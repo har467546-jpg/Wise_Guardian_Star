@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shlex
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,11 +35,13 @@ from app.services.remediation_business_service import (
     queue_remediation_reverify,
 )
 from app.services.remediation_evidence_service import build_remediation_evidence
+from app.services.remediation_service import _build_package_rollback_command
 from app.tasks.task_runtime import append_current_task_event, ensure_task_not_canceled
 
 STREAM_LINE_LIMIT = 120
 STREAM_LINE_LENGTH_LIMIT = 800
 OUTPUT_TAIL_LIMIT = 60
+_TRANSACTION_ID_PATTERN = re.compile(r"(?:SA_TRANSACTION_ID=|Transaction ID\s*:?\s*)(?P<tx>[A-Za-z0-9._:-]+)")
 
 
 def _stop_on_failure_enabled() -> bool:
@@ -115,6 +118,14 @@ class AsyncSSHRemediationExecutor:
             failed_count = sum(1 for item in step_results if item.get("status") == "failed")
             blocked_count = sum(1 for item in step_results if item.get("status") == "blocked")
             skipped_count = sum(1 for item in step_results if item.get("status") == "skipped")
+            rollback_artifacts = {
+                str(item.get("step_id") or "").strip(): dict(item.get("rollback_artifact") or {})
+                for item in step_results
+                if isinstance(item, dict)
+                and str(item.get("step_id") or "").strip()
+                and isinstance(item.get("rollback_artifact"), dict)
+                and item.get("rollback_artifact")
+            }
             return {
                 "execution_boundary": "template_generated",
                 "step_results": step_results,
@@ -124,6 +135,7 @@ class AsyncSSHRemediationExecutor:
                 "blocked_count": blocked_count,
                 "skipped_count": skipped_count,
                 "backup_map": backup_map,
+                "rollback_artifacts": rollback_artifacts,
             }
 
     async def _execute_step(
@@ -193,6 +205,16 @@ class AsyncSSHRemediationExecutor:
         )
         finished_at = datetime.now(timezone.utc)
         status = "success" if exit_status == 0 else "failed"
+        rollback_artifact = await self._build_step_rollback_artifact(
+            connection=connection,
+            context=context,
+            step=step,
+            backup_paths=backup_paths,
+            output_tail=output_tail,
+        )
+        rollback_command = str(step.get("rollback_command") or "").strip() or None
+        if isinstance(rollback_artifact, dict):
+            rollback_command = str(rollback_artifact.get("rollback_command") or rollback_command or "").strip() or rollback_command
         if status == "success":
             append_current_task_event(
                 event_type="stage",
@@ -201,6 +223,14 @@ class AsyncSSHRemediationExecutor:
                 message=f"步骤完成: {title}",
                 payload_json={"step_id": step_id, "status": status},
             )
+            if rollback_artifact:
+                append_current_task_event(
+                    event_type="artifact",
+                    stage_code="execute_steps",
+                    stage_name="执行修复步骤",
+                    message=f"已生成步骤回滚工件: {title}",
+                    payload_json={"step_id": step_id, "rollback_artifact": rollback_artifact},
+                )
         else:
             append_current_task_event(
                 event_type="failure",
@@ -215,6 +245,8 @@ class AsyncSSHRemediationExecutor:
             "title": title,
             "status": status,
             "generated_command": generated_command,
+            "rollback_command": rollback_command,
+            "rollback_artifact": rollback_artifact or {},
             "exit_status": exit_status,
             "backup_paths": backup_paths,
             "output_tail": output_tail,
@@ -222,6 +254,74 @@ class AsyncSSHRemediationExecutor:
             "finished_at": finished_at.isoformat(),
             "error": error,
         }
+
+    async def _build_step_rollback_artifact(
+        self,
+        *,
+        connection: Any,
+        context: RemediationExecutionContext,
+        step: dict[str, Any],
+        backup_paths: list[str],
+        output_tail: list[str],
+    ) -> dict[str, Any] | None:
+        if str(step.get("action_type") or "").strip().lower() != "upgrade_package":
+            return None
+        backup_plan = step.get("backup_plan") if isinstance(step.get("backup_plan"), dict) else {}
+        if str(backup_plan.get("kind") or "").strip().lower() != "package_context":
+            return None
+        targets = [str(item).strip() for item in backup_plan.get("targets", []) if str(item).strip()]
+        if not targets:
+            return None
+        package_name, manager_hint = _parse_package_context_target(targets[0])
+        if not package_name:
+            return None
+        before_context = _select_package_context_snapshot(backup_paths, package_name=package_name)
+        if not before_context:
+            return None
+        after_context = await self._capture_package_context(
+            connection=connection,
+            context=context,
+            package_name=package_name,
+            manager_hint=manager_hint,
+        )
+        rollback_version = str(before_context.get("version") or "").strip() or None
+        rollback_command = str(step.get("rollback_command") or "").strip() or _build_package_rollback_command(
+            manager=str(before_context.get("manager") or manager_hint or "").strip().lower(),
+            package_name=package_name,
+            rollback_version=rollback_version,
+        )
+        return {
+            "kind": "package_version_replay",
+            "package_name": package_name,
+            "manager": str(before_context.get("manager") or manager_hint or "").strip().lower() or None,
+            "rollback_version": rollback_version,
+            "rollback_command": rollback_command,
+            "transaction_id": _extract_package_transaction_id(output_tail),
+            "before": before_context,
+            "after": after_context,
+        }
+
+    async def _capture_package_context(
+        self,
+        *,
+        connection: Any,
+        context: RemediationExecutionContext,
+        package_name: str,
+        manager_hint: str | None,
+    ) -> dict[str, Any] | None:
+        actual = _wrap_remote_command(
+            command_body=_build_package_context_snapshot_command(
+                package_name=package_name,
+                manager_hint=manager_hint,
+            ),
+            privilege=context.effective_privilege,
+            sudo_password=_decrypt_optional(context.credential.sudo_secret_ciphertext),
+        )
+        result = await connection.run(actual, check=False)
+        line = str(getattr(result, "stdout", "") or "").strip()
+        if not line:
+            return None
+        return _select_package_context_snapshot(line.splitlines(), package_name=package_name)
 
     async def _prepare_backups(
         self,
@@ -270,6 +370,25 @@ class AsyncSSHRemediationExecutor:
                     line = str(getattr(result, "stdout", "") or "").strip()
                     if line:
                         snapshots.append(line)
+            return snapshots
+        if kind == "package_context":
+            snapshots: list[str] = []
+            for target in targets:
+                package_name, manager_hint = _parse_package_context_target(target)
+                if not package_name:
+                    continue
+                actual = _wrap_remote_command(
+                    command_body=_build_package_context_snapshot_command(
+                        package_name=package_name,
+                        manager_hint=manager_hint,
+                    ),
+                    privilege=context.effective_privilege,
+                    sudo_password=_decrypt_optional(context.credential.sudo_secret_ciphertext),
+                )
+                result = await connection.run(actual, check=False)
+                line = str(getattr(result, "stdout", "") or "").strip()
+                if line:
+                    snapshots.extend([item.strip() for item in line.splitlines() if item.strip()])
             return snapshots
         return []
 
@@ -470,6 +589,7 @@ def build_remediation_preview_result(
         "failed_count": 0,
         "blocked_count": 0,
         "skipped_count": 0,
+        "rollback_artifacts": {},
         "overall_status": "preview_ready",
         "final_message": "修复预演已生成，尚未执行任何主机变更",
         "execution_status": EXECUTION_STATUS_PREVIEW_ONLY,
@@ -554,6 +674,117 @@ def _build_copy_backup_command(target: str) -> str:
             'printf "%s" "$backup"',
         ]
     )
+
+
+def _parse_package_context_target(target: str) -> tuple[str | None, str | None]:
+    raw = str(target or "").strip()
+    if not raw:
+        return None, None
+    if ":" not in raw:
+        return raw, None
+    manager_hint, package_name = raw.split(":", 1)
+    normalized_manager = str(manager_hint or "").strip().lower() or None
+    normalized_package = str(package_name or "").strip() or None
+    return normalized_package, normalized_manager
+
+
+def _parse_package_context_snapshot_line(line: str) -> dict[str, Any] | None:
+    raw = str(line or "").strip()
+    if not raw:
+        return None
+    parts = raw.split("|")
+    if len(parts) < 5:
+        return None
+    manager, package_name, version, arch, state = [str(item or "").strip() for item in parts[:5]]
+    if not manager or not package_name:
+        return None
+    normalized_version = version or None
+    installed = normalized_version not in {None, "", "not-installed", "unresolved"}
+    return {
+        "manager": manager,
+        "package_name": package_name,
+        "version": normalized_version,
+        "arch": arch or None,
+        "state": state or None,
+        "installed": installed,
+    }
+
+
+def _select_package_context_snapshot(lines: list[str], *, package_name: str) -> dict[str, Any] | None:
+    normalized_name = str(package_name or "").strip().lower()
+    for line in lines:
+        parsed = _parse_package_context_snapshot_line(line)
+        if not parsed:
+            continue
+        if str(parsed.get("package_name") or "").strip().lower() == normalized_name:
+            return parsed
+    for line in lines:
+        parsed = _parse_package_context_snapshot_line(line)
+        if parsed:
+            return parsed
+    return None
+
+
+def _extract_package_transaction_id(output_tail: list[str]) -> str | None:
+    for line in reversed(output_tail):
+        match = _TRANSACTION_ID_PATTERN.search(str(line or "").strip())
+        if match:
+            value = str(match.group("tx") or "").strip()
+            if value:
+                return value
+    return None
+
+
+def _build_package_context_snapshot_command(*, package_name: str, manager_hint: str | None) -> str:
+    package_token = shlex.quote(package_name)
+    manager = str(manager_hint or "").strip().lower()
+    if manager == "dpkg":
+        return "\n".join(
+            [
+                f"if dpkg-query -W -f='dpkg|${{binary:Package}}|${{Version}}|${{Architecture}}|${{Status}}\\n' {package_token} 2>/dev/null; then",
+                "  exit 0",
+                "fi",
+                f"printf 'dpkg|%s|not-installed|||\\n' {package_token}",
+            ]
+        )
+    if manager == "rpm":
+        return "\n".join(
+            [
+                f"if rpm -q --queryformat 'rpm|%{{NAME}}|%{{EPOCHNUM}}:%{{VERSION}}-%{{RELEASE}}|%{{ARCH}}|installed\\n' {package_token} 2>/dev/null; then",
+                "  exit 0",
+                "fi",
+                f"printf 'rpm|%s|not-installed|||\\n' {package_token}",
+            ]
+        )
+    if manager == "apk":
+        return "\n".join(
+            [
+                f"if apk info -e {package_token} >/dev/null 2>&1; then",
+                f"  version=$(apk info -v {package_token} 2>/dev/null | head -n 1)",
+                f"  printf 'apk|%s|%s|||\\n' {package_token} \"$version\"",
+                "  exit 0",
+                "fi",
+                f"printf 'apk|%s|not-installed|||\\n' {package_token}",
+            ]
+        )
+    return "\n".join(
+        [
+            f"if command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W -f='dpkg|${{binary:Package}}|${{Version}}|${{Architecture}}|${{Status}}\\n' {package_token} 2>/dev/null; then",
+            "  exit 0",
+            "fi",
+            f"if command -v rpm >/dev/null 2>&1 && rpm -q --queryformat 'rpm|%{{NAME}}|%{{EPOCHNUM}}:%{{VERSION}}-%{{RELEASE}}|%{{ARCH}}|installed\\n' {package_token} 2>/dev/null; then",
+            "  exit 0",
+            "fi",
+            f"if command -v apk >/dev/null 2>&1 && apk info -e {package_token} >/dev/null 2>&1; then",
+            f"  version=$(apk info -v {package_token} 2>/dev/null | head -n 1)",
+            f"  printf 'apk|%s|%s|||\\n' {package_token} \"$version\"",
+            "  exit 0",
+            "fi",
+            f"printf 'unknown|%s|unresolved|||\\n' {package_token}",
+        ]
+    )
+
+
 def _extract_process_error(stderr: Any, output_tail: list[str]) -> str:
     if hasattr(stderr, "read"):
         return "命令执行失败，请查看流式日志"

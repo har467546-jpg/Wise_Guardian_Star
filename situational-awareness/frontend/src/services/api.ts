@@ -74,6 +74,17 @@ import {
   SettingsApplyResponse,
 } from "@/types/settings";
 import {
+  CampusDataSource,
+  CampusDataSourceTestResult,
+  CampusDataSourceWrite,
+  DiscoveryJobExecutionListResponse,
+  ScannerNodeAssignment,
+  ScannerNodeAssignmentWrite,
+  ScannerZone,
+  ScannerZoneListResponse,
+  ScannerZoneWrite,
+} from "@/types/campus";
+import {
   VulnIntelStatus,
   VulnLibraryStatus,
   VulnRule,
@@ -460,6 +471,8 @@ export function listAssets(params?: {
   pageSize?: number;
   keyword?: string;
   status?: "online" | "offline" | "collecting" | "unknown" | "all";
+  networkZone?: string;
+  assetCategory?: string;
 }) {
   const query = new URLSearchParams({
     page: String(params?.page ?? 1),
@@ -470,6 +483,12 @@ export function listAssets(params?: {
   }
   if (params?.status && params.status !== "all") {
     query.set("status", params.status);
+  }
+  if (params?.networkZone) {
+    query.set("network_zone", params.networkZone);
+  }
+  if (params?.assetCategory) {
+    query.set("asset_category", params.assetCategory);
   }
   return apiFetch<AssetListResponse>(`/assets?${query.toString()}`);
 }
@@ -585,11 +604,89 @@ export function listPlatformLogs(params?: {
   return apiFetch<PlatformLogListResponse>(`/logs?${query.toString()}`);
 }
 
-export function createDiscoveryJob(payload: { cidr: string; label?: string; runner_asset_id?: string }) {
+export function createDiscoveryJob(payload: { cidr: string; label?: string; runner_asset_id?: string; scanner_zone_id?: string }) {
   return apiFetch<DiscoveryJobCreateResponse>("/discovery/jobs", {
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export function listScannerZones(params?: { page?: number; pageSize?: number }) {
+  const query = new URLSearchParams({
+    page: String(params?.page ?? 1),
+    page_size: String(params?.pageSize ?? 50),
+  });
+  return apiFetch<ScannerZoneListResponse>(`/campus/zones?${query.toString()}`);
+}
+
+export function createScannerZone(payload: ScannerZoneWrite) {
+  return apiFetch<ScannerZone>("/campus/zones", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateScannerZone(zoneId: string, payload: ScannerZoneWrite) {
+  return apiFetch<ScannerZone>(`/campus/zones/${zoneId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listZoneNodes(zoneId: string) {
+  return apiFetch<ScannerNodeAssignment[]>(`/campus/zones/${zoneId}/nodes`);
+}
+
+export function createZoneNode(zoneId: string, payload: ScannerNodeAssignmentWrite) {
+  return apiFetch<ScannerNodeAssignment>(`/campus/zones/${zoneId}/nodes`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listCampusDataSources(zoneId?: string) {
+  const query = new URLSearchParams();
+  if (zoneId) {
+    query.set("zone_id", zoneId);
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return apiFetch<CampusDataSource[]>(`/campus/data-sources${suffix}`);
+}
+
+export function createCampusDataSource(payload: CampusDataSourceWrite) {
+  return apiFetch<CampusDataSource>("/campus/data-sources", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateCampusDataSource(sourceId: string, payload: CampusDataSourceWrite) {
+  return apiFetch<CampusDataSource>(`/campus/data-sources/${sourceId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function testCampusDataSource(sourceId: string) {
+  return apiFetch<CampusDataSourceTestResult>(`/campus/data-sources/${sourceId}/test`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export function collectCampusDataSource(sourceId: string) {
+  return apiFetch<CampusDataSourceTestResult>(`/campus/data-sources/${sourceId}/collect`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export function listDiscoveryJobExecutions(jobId: string, params?: { page?: number; pageSize?: number }) {
+  const query = new URLSearchParams({
+    page: String(params?.page ?? 1),
+    page_size: String(params?.pageSize ?? 100),
+  });
+  return apiFetch<DiscoveryJobExecutionListResponse>(`/campus/discovery-jobs/${jobId}/executions?${query.toString()}`);
 }
 
 export function listDiscoveryJobs(params?: { page?: number; pageSize?: number }) {

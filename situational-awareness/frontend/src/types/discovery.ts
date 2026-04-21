@@ -3,6 +3,7 @@ export type DiscoveryJob = {
   cidr: string;
   status: "pending" | "running" | "completed" | "failed";
   label: string | null;
+  scanner_zone_id?: string | null;
   started_at: string | null;
   finished_at: string | null;
   created_at: string;

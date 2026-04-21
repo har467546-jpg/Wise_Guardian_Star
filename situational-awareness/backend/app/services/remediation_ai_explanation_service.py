@@ -131,7 +131,7 @@ class RemediationAIExplanationService:
 
     def _generate(self, *, prompt: str, fallback: str) -> str:
         provider = getattr(self.gateway, "provider", None)
-        if isinstance(provider, MockProvider):
+        if isinstance(provider, MockProvider) or self.provider_mode() == "mock":
             return fallback
         try:
             request = LLMRequest.from_text(prompt, system_prompt=AI_EXPLANATION_SYSTEM_PROMPT)

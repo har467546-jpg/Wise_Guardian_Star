@@ -184,6 +184,25 @@ def test_build_network_initial_snapshot_summary() -> None:
     assert status == "success"
 
 
+def test_build_network_initial_snapshot_marks_dns_service_as_network_infrastructure() -> None:
+    summary, detail, status = build_network_initial_snapshot(
+        ip="192.168.10.2",
+        hostname="gateway.lab",
+        services=[
+            {
+                "port": 53,
+                "service": "dns",
+                "application_service": "dns",
+                "confidence": 80,
+            }
+        ],
+    )
+
+    assert status == "success"
+    assert summary["role_guess"] == "Network infrastructure node"
+    assert detail["ports"] == [53]
+
+
 def test_apply_port_risk_annotation_marks_backdoor_candidate() -> None:
     record = {"port": 31337, "service": "unknown", "version": "1.2.3"}
     annotated = apply_port_risk_annotation(record, {31337, 4444})

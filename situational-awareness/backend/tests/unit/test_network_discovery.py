@@ -355,7 +355,7 @@ def test_scan_known_hosts_ports_only_prefers_nmap_for_full_scan(monkeypatch) -> 
         "nmap",
         "-Pn",
         "-n",
-        "-T5",
+        "-T4",
         "--min-rate",
         "100000",
         "--open",
@@ -367,6 +367,49 @@ def test_scan_known_hosts_ports_only_prefers_nmap_for_full_scan(monkeypatch) -> 
     assert len(results) == 1
     assert results[0].ports == [22]
     assert results[0].hostname == "seed.lab.example"
+
+
+def test_scan_known_hosts_ports_only_prefers_nmap_for_large_explicit_portset(monkeypatch) -> None:
+    scanner = AsyncNetworkDiscovery(
+        DiscoveryConfig(
+            full_scan_host_concurrency=2,
+            portset_mode="top1000_plus_custom",
+            service_ports=tuple(range(1, 400)),
+        )
+    )
+    captured: dict[str, tuple[str, ...]] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b"""
+                <nmaprun>
+                  <host>
+                    <address addr=\"10.10.0.5\" addrtype=\"ipv4\" />
+                    <ports>
+                      <port protocol=\"tcp\" portid=\"22\"><state state=\"open\" /></port>
+                    </ports>
+                  </host>
+                </nmaprun>
+                """,
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*cmd, stdout=None, stderr=None):
+        captured["cmd"] = tuple(cmd)
+        return _FakeProcess()
+
+    monkeypatch.setattr(scanner, "_has_nmap", lambda: True)
+    monkeypatch.setattr("app.scanner.network_discovery.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+    results = asyncio.run(scanner.scan_known_hosts_ports_only([{"ip": "10.10.0.5"}]))
+
+    assert captured["cmd"][:7] == ("nmap", "-Pn", "-n", "-T4", "--min-rate", "100000", "--open")
+    assert "-p" in captured["cmd"]
+    assert "-p-" not in captured["cmd"]
+    assert results[0].ports == [22]
 
 
 def test_probe_known_open_ports_only_probes_supplied_open_ports(monkeypatch) -> None:

@@ -248,9 +248,84 @@ def test_run_agent_auto_followup_task_formats_remediation_completion(monkeypatch
     assert "修复会话 session-9" in str(captured["content"])
     payload_json = captured["payload_json"]
     assert isinstance(payload_json, dict)
-    assert payload_json["resume_hint"]["kind"] == "post_remediation_review"
+    assert payload_json["resume_hint"]["kind"] == "post_remediation_status"
     preferred_read_tools = payload_json["resume_hint"]["preferred_read_tools"]
     assert any(item["tool_name"] == "get_remediation_session" for item in preferred_read_tools)
+
+
+def test_run_agent_auto_followup_task_resumes_remediation_after_runner_install(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(id="session-1", user_id="user-1", current_goal_id="goal-1", messages=[], last_task_id=None)
+    db = _FakeDB(session)
+    captured: dict[str, object] = {}
+    followup_calls: list[dict[str, object]] = []
+    sync_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        agent_tasks,
+        "wait_for_child_task",
+        lambda task_id, interval_seconds=0.5: {
+            "task_id": task_id,
+            "status": "success",
+            "message": "Runner 安装完成",
+            "result_json": {},
+            "error_json": {},
+        },
+    )
+    monkeypatch.setattr(agent_tasks, "SessionLocal", _SessionLocalContext(db))
+    monkeypatch.setattr(
+        agent_tasks,
+        "execute_approved_action",
+        lambda db, *, action, session_user_id, platform_url: SimpleNamespace(
+            status="success",
+            summary="已准备修复会话 rem-session-1，但当前未自动执行。阻塞原因：当前主机尚未安装 Host Runner。",
+            child_task_id=None,
+            payload={
+                "asset_id": "asset-1",
+                "session_id": "rem-session-1",
+                "execution_ready": False,
+                "blocked_reasons": ["当前主机尚未安装 Host Runner"],
+            },
+        ),
+    )
+    monkeypatch.setattr(agent_tasks, "enqueue_auto_action_followup_task", lambda **kwargs: followup_calls.append(kwargs))
+    monkeypatch.setattr(agent_tasks, "sync_agent_task_watch_state", lambda *args, **kwargs: sync_calls.append(kwargs))
+
+    def _fake_append(db_obj, *, session_id, content, payload_json=None, message_type="task_update"):  # type: ignore[no-untyped-def]
+        captured["db"] = db_obj
+        captured["session_id"] = session_id
+        captured["content"] = content
+        captured["payload_json"] = payload_json
+        captured["message_type"] = message_type
+
+    monkeypatch.setattr(agent_tasks, "append_agent_task_message", _fake_append)
+
+    result = agent_tasks.run_agent_auto_followup_task.run(
+        "session-1",
+        "task-runner-1",
+        {
+            "action_type": "install_runner",
+            "params": {
+                "asset_id": "asset-1",
+                "resume_action": {
+                    "action_type": "create_or_resume_remediation_session",
+                    "title": "为资产 asset-1 准备修复会话",
+                    "reason": "Runner 安装完成后继续自动修复。",
+                    "params": {"asset_id": "asset-1", "submit_if_ready": True},
+                },
+            },
+        },
+    )
+
+    assert result == "task-runner-1"
+    assert db.committed is True
+    assert captured["message_type"] == "task_update"
+    assert "资产 asset-1 的 Runner 安装任务已完成。" in str(captured["content"])
+    payload_json = captured["payload_json"]
+    assert isinstance(payload_json, dict)
+    assert payload_json["resume_action_result"]["action_type"] == "create_or_resume_remediation_session"
+    assert payload_json["resume_hint"]["kind"] == "post_remediation_status"
+    assert followup_calls == []
+    assert sync_calls == []
 
 
 def test_run_agent_secure_post_verify_resume_task_reports_collection_refresh_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -14,8 +14,23 @@ class Asset(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     ip: Mapped[str] = mapped_column(INET, unique=True, index=True)
+    mac_address: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    vendor: Mapped[str | None] = mapped_column(String(255), nullable=True)
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
     os_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    network_zone: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    network_vlan: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    building: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    department: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    asset_category: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    device_role: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    device_assessment_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    identity_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_auth_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    is_infrastructure_device: Mapped[bool] = mapped_column(default=False)
+    is_iot: Mapped[bool] = mapped_column(default=False)
+    is_virtual_network_component: Mapped[bool] = mapped_column(default=False)
+    ipv6_addresses_json: Mapped[list] = mapped_column(JSONB, default=list)
     owner_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -34,6 +49,8 @@ class Asset(Base):
     credential_bindings = relationship("AssetCredentialBinding", back_populates="asset", cascade="all, delete-orphan")
     host_runner = relationship("HostRunner", back_populates="asset", uselist=False, cascade="all, delete-orphan")
     remediation_sessions = relationship("RemediationSession", back_populates="asset", cascade="all, delete-orphan")
+    scanner_node_assignments = relationship("ScannerNodeAssignment", back_populates="asset", cascade="all, delete-orphan")
+    campus_data_sources = relationship("CampusDataSource", back_populates="asset")
 
 
 class AssetPort(Base):

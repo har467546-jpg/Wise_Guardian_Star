@@ -143,12 +143,15 @@ def test_persist_collection_result_marks_asset_online() -> None:
         "password_authentication": True,
         "permit_empty_passwords": True,
     }
+    assert asset.device_assessment_json["asset_category"] == "general_endpoint"
     assert db.items[0].software_json["summary_json"]["local_privesc_exposure_count"] == 5
+    assert db.items[0].software_json["summary_json"]["device_assessment"]["assessment_source"] == "ssh_collection"
     assert db.items[0].software_json["summary_json"]["distro_aware_version_exposure_count"] == 0
     assert db.items[0].software_json["summary_json"]["distro_aware_inconclusive_count"] == 0
     assert db.items[0].software_json["summary_json"]["writable_exec_chain_count"] == 2
     assert db.items[0].software_json["summary_json"]["config_exposure_count"] == 3
     assert db.items[0].software_json["summary_json"]["service_config_exposure_count"] == 4
+    assert db.items[0].software_json["detail_json"]["device_assessment"]["asset_category"] == "general_endpoint"
     anchor_ports = [item for item in db.items if isinstance(item, AssetPort) and item.port == 22]
     assert len(anchor_ports) == 1
     assert "linux-kernel" in anchor_ports[0].fingerprint_json["service_aliases"]

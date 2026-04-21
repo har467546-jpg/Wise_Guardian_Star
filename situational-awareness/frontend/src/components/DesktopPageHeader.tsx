@@ -5,6 +5,7 @@ type HeaderMetaTone = "neutral" | "accent" | "success" | "warning" | "danger";
 type HeaderMetaItem = {
   label: string;
   value: ReactNode;
+  detail?: ReactNode;
   tone?: HeaderMetaTone;
 };
 
@@ -39,10 +40,11 @@ export default function DesktopPageHeader({
       </div>
       {meta.length ? (
         <div className="desktop-page-header-meta">
-          {meta.map((item) => (
-            <div key={`${item.label}-${String(item.value)}`} className={`desktop-page-header-chip${toneClassName(item.tone)}`}>
+          {meta.map((item, index) => (
+            <div key={`${item.label}-${index}`} className={`desktop-page-header-chip${toneClassName(item.tone)}`}>
               <span className="desktop-page-header-chip-label">{item.label}</span>
               <strong className="desktop-page-header-chip-value">{item.value}</strong>
+              {item.detail ? <span className="desktop-page-header-chip-detail">{item.detail}</span> : null}
             </div>
           ))}
         </div>

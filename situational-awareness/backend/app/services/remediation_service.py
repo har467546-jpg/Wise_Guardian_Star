@@ -31,6 +31,7 @@ from app.schemas.remediation import (
     RemediationWorkspaceRead,
 )
 from app.services.admin_cidr_service import get_admin_cidrs
+from app.utils.versioning import normalize_linux_distro_key, normalize_linux_distro_text, normalize_package_manager
 
 PROBE_SNAPSHOT_TYPE = "ssh_probe_baseline"
 NETWORK_INITIAL_SNAPSHOT_TYPE = "network_initial"
@@ -290,6 +291,13 @@ _ACTION_ADAPTER_CONTRACTS: dict[str, dict[str, Any]] = {
         "evidence_items": ["permission_snapshot_before", "command_preview", "permission_snapshot_after", "reverify_result"],
     },
 }
+
+
+def _is_runtime_backup_path(path: str) -> bool:
+    normalized = str(path or "").strip().lower()
+    if not normalized:
+        return False
+    return ".bak.sa." in normalized or normalized.endswith(".bak.sa") or normalized.endswith(".disabled.sa")
 _EXPLICIT_ADMIN_CIDR_SERVICES = {"samba"}
 
 
@@ -741,17 +749,17 @@ class RemediationCommandPlanner:
             probe_payload.get("package_manager"),
             self.runner_capabilities.get("package_manager"),
         ]:
-            value = str(candidate or "").strip().lower()
+            value = normalize_package_manager(candidate)
             if value:
-                return "dpkg" if value == "apt" else value
+                return value
         for item in self.packages:
-            value = str(item.get("manager") or "").strip().lower()
+            value = normalize_package_manager(item.get("manager"))
             if value:
                 return value
         for config in self.config_by_service.values():
             if not isinstance(config, dict):
                 continue
-            value = str(config.get("package_manager") or "").strip().lower()
+            value = normalize_package_manager(config.get("package_manager"))
             if value:
                 return value
         return None
@@ -807,6 +815,74 @@ class RemediationCommandPlanner:
             self._prefer_known_legacy_candidates(packages or []),
         )
 
+    def _resolve_package_metadata(self, package_name: str) -> dict[str, Any] | None:
+        normalized_name = package_name.strip().lower()
+        if not normalized_name:
+            return None
+        exact_matches = []
+        prefix_matches = []
+        for item in self.packages:
+            name = str(item.get("name") or "").strip().lower()
+            if not name:
+                continue
+            if name == normalized_name:
+                exact_matches.append(item)
+            elif name.startswith(f"{normalized_name}-"):
+                prefix_matches.append(item)
+        if exact_matches:
+            return dict(exact_matches[0])
+        if prefix_matches:
+            return dict(prefix_matches[0])
+        return None
+
+    def _resolve_current_package_version(self, package_name: str, *, service_name: str | None = None) -> str | None:
+        metadata = self._resolve_package_metadata(package_name)
+        if metadata is not None:
+            version = str(metadata.get("version") or "").strip()
+            if version:
+                return version
+        for candidate_key in [service_name, package_name]:
+            normalized_key = str(candidate_key or "").strip().lower()
+            if not normalized_key:
+                continue
+            config = self.config_by_service.get(normalized_key)
+            if not isinstance(config, dict):
+                continue
+            version = str(config.get("package_version_raw") or config.get("package_version") or "").strip()
+            if version:
+                return version
+        return None
+
+    def _resolved_distro_context(self) -> tuple[str | None, str | None]:
+        distro_name: str | None = None
+        distro_release: str | None = None
+        for config in self.config_by_service.values():
+            if not isinstance(config, dict):
+                continue
+            normalized_name = normalize_linux_distro_key(config.get("distro_name"))
+            normalized_release = str(config.get("distro_release") or "").strip() or None
+            if normalized_name and normalized_release:
+                return normalized_name, normalized_release
+            distro_name = distro_name or normalized_name
+            distro_release = distro_release or normalized_release
+
+        probe_payload = self.runner_capabilities.get("probe") if isinstance(self.runner_capabilities.get("probe"), dict) else {}
+        for raw in [
+            self.os_release,
+            self.summary_json.get("os"),
+            self.summary_json.get("os_name"),
+            self.detail_json.get("os"),
+            probe_payload.get("os_release_like"),
+            self.runner_capabilities.get("os_release_like"),
+            self.runner_capabilities.get("detected_os"),
+        ]:
+            normalized_name, normalized_release = normalize_linux_distro_text(raw)
+            if normalized_name and normalized_release:
+                return normalized_name, normalized_release
+            distro_name = distro_name or normalized_name
+            distro_release = distro_release or normalized_release
+        return distro_name, distro_release
+
     def build_steps(self) -> list[RemediationPlanStepRead]:
         steps: list[RemediationPlanStepRead] = []
         for index, action in enumerate(self.rendered_template.get("actions") or [], start=1):
@@ -847,6 +923,7 @@ class RemediationCommandPlanner:
                 "target_paths": target_paths,
                 "verify_items": _merge_string_lists(rendered.verify_items, action.get("verify_items")),
                 "rollback_hint": str(action.get("rollback_hint") or "").strip() or rendered.rollback_hint,
+                "rollback_command": str(action.get("rollback_command") or "").strip() or rendered.rollback_command,
             }
         )
         # Keep risky steps visible, but never auto-run a step which would cut off
@@ -863,8 +940,24 @@ class RemediationCommandPlanner:
     def _render_upgrade_package(self, *, step_id: str, action_type: str, title: str, params: dict[str, Any], requires_confirmation: bool) -> RemediationPlanStepRead:
         package_name = str(params.get("package_name") or params.get("service_name") or "").strip()
         service_name = str(params.get("service_name") or _service_name_from_finding(self.finding) or "").strip().lower()
-        manager = self._resolve_package_manager(package_name, str(params.get("package_manager") or "").strip().lower() or None)
-        fixed_version = self._resolve_fixed_version(params.get("fixed_versions"))
+        package_metadata = self._resolve_package_metadata(package_name)
+        resolved_package_name = str(package_metadata.get("name") or package_name).strip() if package_metadata else package_name
+        manager = self._resolve_package_manager(
+            resolved_package_name,
+            str(params.get("package_manager") or "").strip().lower() or None,
+        )
+        fixed_versions = params.get("fixed_versions") if isinstance(params.get("fixed_versions"), dict) else None
+        fixed_version = self._resolve_fixed_version(fixed_versions)
+        rollback_version = self._resolve_current_package_version(resolved_package_name, service_name=service_name)
+        rollback_command = (
+            _build_package_rollback_command(
+                manager=manager,
+                package_name=resolved_package_name,
+                rollback_version=rollback_version,
+            )
+            if rollback_version
+            else None
+        )
         if not package_name or not manager:
             return self._blocked_step(step_id, action_type, title, requires_confirmation, "未识别到稳定的软件包管理器或包名")
         fallback_strategy = None
@@ -877,14 +970,14 @@ class RemediationCommandPlanner:
                 render_reason = "已按旧版 Debian 自动解析路径渲染软件包升级命令"
         command = (
             _build_legacy_debian_package_upgrade_command(
-                original_package_name=package_name,
+                original_package_name=resolved_package_name,
                 candidates=fallback_candidates,
                 fixed_version=fixed_version,
             )
             if fallback_candidates and fallback_strategy
-            else _build_package_upgrade_command(manager=manager, package_name=package_name, fixed_version=fixed_version)
+            else _build_package_upgrade_command(manager=manager, package_name=resolved_package_name, fixed_version=fixed_version)
         )
-        return RemediationPlanStepRead(
+        step = RemediationPlanStepRead(
             step_id=step_id,
             action_type=action_type,
             title=title,
@@ -892,12 +985,22 @@ class RemediationCommandPlanner:
             execution_state="ready",
             generated_command=command,
             requires_confirmation=requires_confirmation,
-            backup_plan=RemediationBackupPlanRead(kind="package_context", note="执行前记录当前包版本与管理器信息"),
+            backup_plan=RemediationBackupPlanRead(
+                kind="package_context",
+                targets=[f"{manager}:{resolved_package_name}"],
+                note="执行前记录当前包版本、架构与包管理器上下文",
+            ),
             render_reason=render_reason,
             target_services=[service_name] if service_name else [],
             fallback_strategy=fallback_strategy,
             fallback_candidates=fallback_candidates,
+            rollback_command=rollback_command,
         )
+        if fixed_versions and not fixed_version:
+            step = _mark_step_apply_unsupported(step, "未从主机快照解析到明确的发行版修复版本，当前仅支持预演")
+        elif params.get("version_constraint") and not fixed_version:
+            step = _mark_step_apply_unsupported(step, "当前仅基于版本区间生成升级建议，尚未解析到精确目标版本")
+        return step
 
     def _render_reload_service(self, *, step_id: str, action_type: str, title: str, params: dict[str, Any], requires_confirmation: bool) -> RemediationPlanStepRead:
         service_name = str(params.get("service_name") or _service_name_from_finding(self.finding) or "").strip().lower()
@@ -1028,7 +1131,7 @@ class RemediationCommandPlanner:
         if (service_name, config_key) not in SUPPORTED_CONFIG_KEYS:
             return self._blocked_step(step_id, action_type, title, requires_confirmation, "当前配置整改项缺少自动修复适配器")
         target_value = params.get("target_value")
-        source_files = self._resolve_source_files(service_name)
+        source_files, observed_source_files = self._resolve_source_files_with_resolution(service_name)
         if not source_files:
             return self._blocked_step(step_id, action_type, title, requires_confirmation, "未从 SSH 深度检查结果中解析到稳定的配置文件路径")
         command = _render_config_command(
@@ -1045,7 +1148,7 @@ class RemediationCommandPlanner:
         if self._legacy_debian_enabled() and service_name == "ssh":
             fallback_strategy = _LEGACY_DEBIAN_FALLBACK_STRATEGY
             fallback_candidates, _ = self._legacy_service_candidates(service_name)
-        return RemediationPlanStepRead(
+        step = RemediationPlanStepRead(
             step_id=step_id,
             action_type=action_type,
             title=title,
@@ -1060,6 +1163,9 @@ class RemediationCommandPlanner:
             fallback_strategy=fallback_strategy,
             fallback_candidates=fallback_candidates,
         )
+        if not observed_source_files:
+            step = _mark_step_apply_unsupported(step, "当前仅回退到默认配置路径，正式执行前需先通过 SSH 深度采集确认真实路径")
+        return step
 
     def _render_remove_config(self, *, step_id: str, action_type: str, title: str, params: dict[str, Any], requires_confirmation: bool) -> RemediationPlanStepRead:
         return self._render_set_config(
@@ -1099,13 +1205,13 @@ class RemediationCommandPlanner:
         service_name = str(params.get("service_name") or _service_name_from_finding(self.finding) or "").strip().lower()
         config_key = str(params.get("config_key") or "").strip().lower()
         rule_id = str(params.get("rule_id") or _yaml_rule_id(self.finding) or "").strip()
-        source_files = self._resolve_source_files(service_name)
+        source_files, observed_source_files = self._resolve_source_files_with_resolution(service_name)
         command = _render_exposure_command(service_name=service_name, config_key=config_key, rule_id=rule_id, source_files=source_files)
         if not command:
             return self._blocked_step(step_id, action_type, title, requires_confirmation, "当前暴露面整改项无法稳定渲染为自动化命令")
         if not source_files and not (service_name == "tomcat" and "manager" in rule_id.lower()):
             return self._blocked_step(step_id, action_type, title, requires_confirmation, "未解析到可用于收敛暴露面的稳定配置文件或路径")
-        return RemediationPlanStepRead(
+        step = RemediationPlanStepRead(
             step_id=step_id,
             action_type=action_type,
             title=title,
@@ -1119,6 +1225,9 @@ class RemediationCommandPlanner:
             target_files=source_files,
             target_services=[service_name] if service_name else [],
         )
+        if source_files and not observed_source_files:
+            step = _mark_step_apply_unsupported(step, "当前仅回退到默认配置路径，正式执行前需先通过 SSH 深度采集确认真实路径")
+        return step
 
     def _render_restrict_network(self, *, step_id: str, action_type: str, title: str, params: dict[str, Any], requires_confirmation: bool) -> RemediationPlanStepRead:
         service_name = str(params.get("service_name") or _service_name_from_finding(self.finding) or "").strip().lower()
@@ -1133,7 +1242,7 @@ class RemediationCommandPlanner:
                 requires_confirmation,
                 "缺少管理网段配置，当前无法稳定收敛到管理网段",
             )
-        source_files = self._resolve_source_files(service_name)
+        source_files, observed_source_files = self._resolve_source_files_with_resolution(service_name)
         if not source_files:
             return self._blocked_step(step_id, action_type, title, requires_confirmation, "未解析到可用于收敛网络暴露面的稳定配置文件")
         command = _render_network_command(
@@ -1145,7 +1254,7 @@ class RemediationCommandPlanner:
         )
         if not command:
             return self._blocked_step(step_id, action_type, title, requires_confirmation, "当前网络收敛动作缺少稳定的自动执行适配器")
-        return RemediationPlanStepRead(
+        step = RemediationPlanStepRead(
             step_id=step_id,
             action_type=action_type,
             title=title,
@@ -1159,6 +1268,9 @@ class RemediationCommandPlanner:
             target_files=source_files,
             target_services=[service_name] if service_name else [],
         )
+        if not observed_source_files:
+            step = _mark_step_apply_unsupported(step, "当前仅回退到默认配置路径，正式执行前需先通过 SSH 深度采集确认真实路径")
+        return step
 
     def _render_toggle_feature(self, *, step_id: str, action_type: str, title: str, params: dict[str, Any], requires_confirmation: bool) -> RemediationPlanStepRead:
         feature_key = str(params.get("config_key") or params.get("feature_key") or "").strip().lower()
@@ -1284,38 +1396,43 @@ class RemediationCommandPlanner:
         )
 
     def _resolve_source_files(self, service_name: str) -> list[str]:
+        source_files, _ = self._resolve_source_files_with_resolution(service_name)
+        return source_files
+
+    def _resolve_source_files_with_resolution(self, service_name: str) -> tuple[list[str], bool]:
         service_config = self.config_by_service.get(service_name, {})
-        source_files = [str(item).strip() for item in service_config.get("source_files", []) if str(item).strip()]
+        source_files = [
+            str(item).strip()
+            for item in service_config.get("source_files", [])
+            if str(item).strip() and not _is_runtime_backup_path(str(item))
+        ]
         if service_name == "polkit":
             source_files.extend(
-                [str(item).strip() for item in service_config.get("rules_paths", []) if str(item).strip()]
+                [
+                    str(item).strip()
+                    for item in service_config.get("rules_paths", [])
+                    if str(item).strip() and not _is_runtime_backup_path(str(item))
+                ]
             )
         if source_files:
-            return list(dict.fromkeys(source_files))[:20]
-        return list(_DEFAULT_CONFIG_FILES.get(service_name, []))
+            return list(dict.fromkeys(source_files))[:20], True
+        return list(_DEFAULT_CONFIG_FILES.get(service_name, [])), False
 
     def _resolve_package_manager(self, package_name: str, preferred: str | None) -> str | None:
-        if preferred:
-            return preferred
-        normalized_name = package_name.strip().lower()
-        for item in self.packages:
-            name = str(item.get("name") or "").strip().lower()
-            if name == normalized_name or name.startswith(f"{normalized_name}-") or normalized_name in name:
-                manager = str(item.get("manager") or "").strip().lower()
-                if manager:
-                    return manager
-        managers = [str(item.get("manager") or "").strip().lower() for item in self.packages if str(item.get("manager") or "").strip()]
-        return managers[0] if managers else None
+        normalized_preferred = normalize_package_manager(preferred)
+        if normalized_preferred:
+            return normalized_preferred
+        metadata = self._resolve_package_metadata(package_name)
+        if metadata is not None:
+            manager = normalize_package_manager(metadata.get("manager"))
+            if manager:
+                return manager
+        return self._default_package_manager()
 
     def _resolve_fixed_version(self, fixed_versions: Any) -> str | None:
         if not isinstance(fixed_versions, dict):
             return None
-        distro_name = None
-        distro_release = None
-        for service_name in ("sudo", "polkit"):
-            config = self.config_by_service.get(service_name, {})
-            distro_name = str(config.get("distro_name") or "").strip().lower() or distro_name
-            distro_release = str(config.get("distro_release") or "").strip() or distro_release
+        distro_name, distro_release = self._resolved_distro_context()
         if not distro_name or not distro_release:
             return None
         distro_versions = fixed_versions.get(distro_name)
@@ -1373,7 +1490,22 @@ def _step_field(step: Any, field: str) -> Any:
     return getattr(step, field, None)
 
 
-def select_executable_plan_steps(steps: list[Any], *, submitted_step_ids: list[str] | None = None) -> list[Any]:
+def _step_apply_supported(step: Any) -> bool:
+    value = _step_field(step, "apply_supported")
+    return True if value is None else bool(value)
+
+
+def _step_apply_blocked_reason(step: Any) -> str | None:
+    value = str(_step_field(step, "apply_blocked_reason") or "").strip()
+    return value or None
+
+
+def select_executable_plan_steps(
+    steps: list[Any],
+    *,
+    submitted_step_ids: list[str] | None = None,
+    require_apply_supported: bool = False,
+) -> list[Any]:
     step_map: dict[str, Any] = {}
     duplicate_step_ids: set[str] = set()
     for step in steps:
@@ -1397,14 +1529,36 @@ def select_executable_plan_steps(steps: list[Any], *, submitted_step_ids: list[s
             raise RuntimeError(f"提交的修复步骤不存在：{missing_step_ids[0]}")
         selected_steps = [step_map[step_id] for step_id in normalized_ids]
     else:
-        selected_steps = [step for step in steps if str(_step_field(step, "execution_state") or "").strip().lower() == "ready"]
+        selected_steps = [
+            step
+            for step in steps
+            if str(_step_field(step, "execution_state") or "").strip().lower() == "ready"
+            and (not require_apply_supported or _step_apply_supported(step))
+        ]
 
     if not selected_steps:
+        if require_apply_supported:
+            ready_but_preview_only = [
+                step for step in steps if str(_step_field(step, "execution_state") or "").strip().lower() == "ready"
+            ]
+            if ready_but_preview_only:
+                reason = _step_apply_blocked_reason(ready_but_preview_only[0])
+                if reason:
+                    raise RuntimeError(reason)
+        blocked_steps = [step for step in steps if str(_step_field(step, "execution_state") or "").strip().lower() == "blocked"]
+        if blocked_steps:
+            reason = str(_step_field(blocked_steps[0], "blocked_reason") or "").strip()
+            if reason:
+                raise RuntimeError(reason)
         raise RuntimeError("当前没有可提交的执行步骤")
 
     for step in selected_steps:
         if str(_step_field(step, "execution_state") or "").strip().lower() == "ready":
-            continue
+            if not require_apply_supported or _step_apply_supported(step):
+                continue
+            title = str(_step_field(step, "title") or _step_field(step, "step_id") or "未知步骤").strip()
+            blocked_reason = _step_apply_blocked_reason(step)
+            raise RuntimeError(blocked_reason or f"步骤“{title}”当前仅支持预演")
         title = str(_step_field(step, "title") or _step_field(step, "step_id") or "未知步骤").strip()
         blocked_reason = str(_step_field(step, "blocked_reason") or "").strip()
         raise RuntimeError(blocked_reason or f"步骤“{title}”当前不可执行")
@@ -1490,9 +1644,7 @@ def _severity_sort_value(value: RiskSeverity | str | None) -> int:
 
 
 def _yaml_rule_id(finding: RiskFinding) -> str | None:
-    evidence = _evidence_dict(finding)
-    value = str(evidence.get("yaml_rule_id") or "").strip()
-    return value or None
+    return finding.resolved_yaml_rule_id()
 
 
 def _service_name_from_finding(finding: RiskFinding) -> str | None:
@@ -1651,6 +1803,19 @@ def _block_self_lock_step(step: RemediationPlanStepRead) -> RemediationPlanStepR
     )
 
 
+def _mark_step_apply_unsupported(step: RemediationPlanStepRead, reason: str) -> RemediationPlanStepRead:
+    normalized_reason = str(reason or "").strip()
+    if not normalized_reason:
+        return step
+    existing_reason = str(step.apply_blocked_reason or "").strip()
+    return step.model_copy(
+        update={
+            "apply_supported": False,
+            "apply_blocked_reason": existing_reason or normalized_reason,
+        }
+    )
+
+
 def _step_has_real_backup_target(step: RemediationPlanStepRead) -> bool:
     backup_plan = step.backup_plan
     return bool(backup_plan and backup_plan.targets)
@@ -1669,7 +1834,9 @@ def _decorate_step_with_enterprise_contract(step: RemediationPlanStepRead) -> Re
     contract = dict(_ACTION_ADAPTER_CONTRACTS.get(step.action_type, {}))
     backup_required = step.action_type in _BACKUP_REQUIRED_ACTION_TYPES
     backup_ready = _step_has_real_backup_target(step)
-    rollback_supported = backup_ready and step.action_type != "upgrade_package"
+    apply_supported = bool(step.apply_supported)
+    apply_blocked_reason = str(step.apply_blocked_reason or "").strip() or None
+    rollback_supported = backup_ready and (step.action_type != "upgrade_package" or bool(step.rollback_command))
     updates: dict[str, Any] = {
         "risk_level": contract.get("risk_level", "medium"),
         "idempotent": bool(contract.get("idempotent", False)),
@@ -1679,7 +1846,12 @@ def _decorate_step_with_enterprise_contract(step: RemediationPlanStepRead) -> Re
         "requires_maintenance_window": bool(contract.get("requires_maintenance_window", False)),
         "adapter_id": contract.get("adapter_id"),
         "adapter_version": REMEDIATION_ADAPTER_VERSION if contract else None,
+        "apply_supported": apply_supported,
+        "apply_blocked_reason": apply_blocked_reason,
     }
+    if step.execution_state == "blocked":
+        updates["apply_supported"] = False
+        updates["apply_blocked_reason"] = step.blocked_reason or apply_blocked_reason
     if backup_required and not backup_ready and step.execution_state == "ready":
         blocked_reason = "当前步骤缺少可验证的备份目标，已阻止自动执行"
         updates.update(
@@ -1690,6 +1862,8 @@ def _decorate_step_with_enterprise_contract(step: RemediationPlanStepRead) -> Re
                 "generated_command": None,
                 "render_reason": blocked_reason,
                 "rollback_supported": False,
+                "apply_supported": False,
+                "apply_blocked_reason": blocked_reason,
             }
         )
     return step.model_copy(update=updates)
@@ -2056,6 +2230,42 @@ def _build_package_upgrade_command(*, manager: str, package_name: str, fixed_ver
             ]
         )
     if manager in {"dnf", "yum", "rpm"}:
+        if fixed_version:
+            package_name_quoted = shlex.quote(package_name)
+            fixed_version_quoted = shlex.quote(fixed_version)
+            return "\n".join(
+                [
+                    f"SA_PACKAGE_NAME={package_name_quoted}",
+                    f"SA_FIXED_VERSION={fixed_version_quoted}",
+                    'SA_PACKAGE_TOKEN="${SA_PACKAGE_NAME}-${SA_FIXED_VERSION}"',
+                    "if command -v dnf >/dev/null 2>&1; then",
+                    '  dnf install -y "$SA_PACKAGE_TOKEN" || dnf upgrade -y "$SA_PACKAGE_TOKEN" || dnf update -y "$SA_PACKAGE_TOKEN"',
+                    "elif command -v yum >/dev/null 2>&1; then",
+                    '  yum install -y "$SA_PACKAGE_TOKEN" || yum update -y "$SA_PACKAGE_TOKEN"',
+                    "else",
+                    "  echo '未识别到 dnf/yum，无法自动执行 rpm 系精确版本升级' >&2",
+                    "  exit 1",
+                    "fi",
+                    'if command -v dnf >/dev/null 2>&1; then',
+                    '  SA_TX_ID=$(dnf history info last 2>/dev/null | sed -n "s/^Transaction ID[[:space:]]*:[[:space:]]*//p" | head -n 1)',
+                    'elif command -v yum >/dev/null 2>&1; then',
+                    '  SA_TX_ID=$(yum history info last 2>/dev/null | sed -n "s/^Transaction ID[[:space:]]*:[[:space:]]*//p" | head -n 1)',
+                    "fi",
+                    'if [ -n "${SA_TX_ID:-}" ]; then',
+                    '  echo "SA_TRANSACTION_ID=${SA_TX_ID}"',
+                    "fi",
+                    'if command -v rpm >/dev/null 2>&1; then',
+                    '  SA_INSTALLED_VERSION=$(rpm -q --queryformat "%{EPOCHNUM}:%{VERSION}-%{RELEASE}" "$SA_PACKAGE_NAME" 2>/dev/null || true)',
+                    '  if [ "$SA_INSTALLED_VERSION" = "0:${SA_FIXED_VERSION}" ]; then',
+                    '    SA_INSTALLED_VERSION="$SA_FIXED_VERSION"',
+                    "  fi",
+                    '  if [ "$SA_INSTALLED_VERSION" != "$SA_FIXED_VERSION" ]; then',
+                    '    echo "rpm 精确版本校验失败：期望 $SA_FIXED_VERSION，实际 ${SA_INSTALLED_VERSION:-unknown}" >&2',
+                    "    exit 1",
+                    "  fi",
+                    "fi",
+                ]
+            )
         return "\n".join(
             [
                 "if command -v dnf >/dev/null 2>&1; then",
@@ -2066,11 +2276,66 @@ def _build_package_upgrade_command(*, manager: str, package_name: str, fixed_ver
                 "  echo '未识别到 dnf/yum，无法自动执行 rpm 系升级' >&2",
                 "  exit 1",
                 "fi",
+                'if command -v dnf >/dev/null 2>&1; then',
+                '  SA_TX_ID=$(dnf history info last 2>/dev/null | sed -n "s/^Transaction ID[[:space:]]*:[[:space:]]*//p" | head -n 1)',
+                'elif command -v yum >/dev/null 2>&1; then',
+                '  SA_TX_ID=$(yum history info last 2>/dev/null | sed -n "s/^Transaction ID[[:space:]]*:[[:space:]]*//p" | head -n 1)',
+                "fi",
+                'if [ -n "${SA_TX_ID:-}" ]; then',
+                '  echo "SA_TRANSACTION_ID=${SA_TX_ID}"',
+                "fi",
             ]
         )
     if manager == "apk":
         return f"apk add --no-cache --upgrade {shlex.quote(package_name)}"
     return ""
+
+
+def _build_package_rollback_command(*, manager: str, package_name: str, rollback_version: str | None) -> str | None:
+    normalized_version = str(rollback_version or "").strip()
+    if not normalized_version:
+        return None
+    if manager == "dpkg":
+        return "\n".join(
+            [
+                "export DEBIAN_FRONTEND=noninteractive",
+                "export APT_LISTCHANGES_FRONTEND=none",
+                "export NEEDRESTART_MODE=a",
+                "apt-get update",
+                f"apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold {shlex.quote(f'{package_name}={normalized_version}')}",
+            ]
+        )
+    if manager in {"dnf", "yum", "rpm"}:
+        package_name_quoted = shlex.quote(package_name)
+        rollback_version_quoted = shlex.quote(normalized_version)
+        return "\n".join(
+            [
+                f"SA_PACKAGE_NAME={package_name_quoted}",
+                f"SA_ROLLBACK_VERSION={rollback_version_quoted}",
+                'SA_PACKAGE_TOKEN="${SA_PACKAGE_NAME}-${SA_ROLLBACK_VERSION}"',
+                "if command -v dnf >/dev/null 2>&1; then",
+                '  dnf downgrade -y "$SA_PACKAGE_TOKEN" || dnf install -y "$SA_PACKAGE_TOKEN" --allowerasing',
+                "elif command -v yum >/dev/null 2>&1; then",
+                '  yum downgrade -y "$SA_PACKAGE_TOKEN" || yum install -y "$SA_PACKAGE_TOKEN"',
+                "else",
+                "  echo '未识别到 dnf/yum，无法自动执行 rpm 系版本回滚' >&2",
+                "  exit 1",
+                "fi",
+                'if command -v rpm >/dev/null 2>&1; then',
+                '  SA_INSTALLED_VERSION=$(rpm -q --queryformat "%{EPOCHNUM}:%{VERSION}-%{RELEASE}" "$SA_PACKAGE_NAME" 2>/dev/null || true)',
+                '  if [ "$SA_INSTALLED_VERSION" = "0:${SA_ROLLBACK_VERSION}" ]; then',
+                '    SA_INSTALLED_VERSION="$SA_ROLLBACK_VERSION"',
+                "  fi",
+                '  if [ "$SA_INSTALLED_VERSION" != "$SA_ROLLBACK_VERSION" ]; then',
+                '    echo "rpm 回滚版本校验失败：期望 $SA_ROLLBACK_VERSION，实际 ${SA_INSTALLED_VERSION:-unknown}" >&2',
+                "    exit 1",
+                "  fi",
+                "fi",
+            ]
+        )
+    if manager == "apk":
+        return f"apk add --no-cache {shlex.quote(f'{package_name}={normalized_version}')}"
+    return None
 
 
 def _build_service_control_command(action: str, service_name: str, *, allow_missing: bool = False) -> str:

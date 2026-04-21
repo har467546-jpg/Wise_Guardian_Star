@@ -19,6 +19,20 @@ import StatusTag from "@/components/StatusTag";
 const PAGE_SIZE = 24;
 const SEARCH_DEBOUNCE_MS = 300;
 
+const DEVICE_ROLE_LABELS: Record<string, string> = {
+  gateway_dns: "网关设备 / DNS",
+  gateway: "网关设备",
+  dns_resolver: "DNS 服务",
+  dhcp_dns: "DHCP / DNS",
+  dhcp_service: "DHCP",
+  network_infrastructure: "基础设施",
+};
+
+function formatDeviceRole(value: string | null | undefined): string {
+  const normalized = String(value || "").trim();
+  return DEVICE_ROLE_LABELS[normalized] || normalized;
+}
+
 type StatusFilter = "all" | Asset["status"];
 type BulkAction = "delete" | "collect" | "verify" | null;
 
@@ -50,15 +64,22 @@ const AssetSquareCard = memo(function AssetSquareCard({
   onDelete,
 }: AssetSquareCardProps) {
   const portsText = formatPorts(asset);
+  const infrastructureLabel = asset.is_infrastructure_device
+    ? formatDeviceRole(asset.device_role) || "基础设施"
+    : "";
+  const hostname = String(asset.hostname || "").trim();
   return (
     <Card key={asset.id} className={`asset-square-card ${selected ? "asset-square-card-selected" : ""} ${asset.is_local ? "asset-square-card-local" : ""}`} bordered>
       <div className="asset-square-card-content">
         <Space style={{ width: "100%", justifyContent: "space-between", alignItems: "flex-start" }}>
           <div className="ui-cell-stack" style={{ flex: 1 }}>
             <Typography.Text strong className="asset-square-ip mono-text">{asset.ip}</Typography.Text>
-            <OverflowText value={asset.hostname || "未识别主机名"} block secondary />
+            {hostname ? <OverflowText value={hostname} block secondary /> : null}
           </div>
           <Space size={6}>
+            {infrastructureLabel ? (
+              <Tag color="cyan">{infrastructureLabel}</Tag>
+            ) : null}
             {asset.is_local ? (
               <Tooltip title={asset.local_hint || "平台所在主机"}>
                 <Tag color="magenta">本机</Tag>

@@ -215,7 +215,7 @@ class AsyncNetworkDiscovery:
         return sorted(discovered, key=lambda item: item.ip)
 
     async def scan_known_hosts_ports_only(self, hosts: list[dict[str, object]]) -> list[DiscoveryResult]:
-        if self._should_use_nmap_full_port_scan():
+        if self._should_use_nmap_port_scan():
             tasks = [
                 asyncio.create_task(self._scan_known_host_ports_only_with_nmap_entry(host))
                 for host in hosts
@@ -366,15 +366,28 @@ class AsyncNetworkDiscovery:
                 discovery_evidence=discovery_evidence,
             )
 
+        port_args: list[str] = []
+        if self._should_use_nmap_full_port_scan():
+            port_args.extend(["-p-"])
+        else:
+            if not self._scan_ports:
+                return await self._scan_host_ports(
+                    ip,
+                    known_hostname=known_hostname,
+                    discovery_sources=discovery_sources,
+                    discovery_evidence=discovery_evidence,
+                )
+            port_args.extend(["-p", ",".join(str(port) for port in self._scan_ports)])
+
         cmd = [
             "nmap",
             "-Pn",
             "-n",
-            "-T5",
+            "-T4",
             "--min-rate",
             str(max(1, int(self.config.nmap_min_rate))),
             "--open",
-            "-p-",
+            *port_args,
             ip,
             "-oX",
             "-",
@@ -681,6 +694,15 @@ class AsyncNetworkDiscovery:
             and len(self._scan_ports) == 65535
             and self._scan_ports[0] == 1
             and self._scan_ports[-1] == 65535
+        )
+
+    def _should_use_nmap_port_scan(self) -> bool:
+        return bool(
+            self._has_nmap()
+            and (
+                self._should_use_nmap_full_port_scan()
+                or len(self._scan_ports) >= 256
+            )
         )
 
     @classmethod

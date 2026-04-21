@@ -11,6 +11,7 @@ class DiscoveryJobCreate(BaseModel):
     cidr: IPvAnyNetwork
     label: str | None = None
     runner_asset_id: str | None = None
+    scanner_zone_id: str | None = None
 
 
 class DiscoveryJobRead(ORMModel):
@@ -18,6 +19,7 @@ class DiscoveryJobRead(ORMModel):
     cidr: IPvAnyNetwork
     status: DiscoveryJobStatus
     label: str | None
+    scanner_zone_id: str | None = None
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime

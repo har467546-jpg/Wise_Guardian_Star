@@ -60,3 +60,7 @@ docker restart sa-backend sa-worker
 3. 重启 `sa-backend` 与 `sa-worker`
 4. 回到漏洞库页面重新点击“同步情报”
 5. 若 schema 已就绪但仍失败，再检查容器外网连通性，以及 NVD / CISA KEV / EPSS 上游是否超时
+
+## 7. 风险链路真实联调记录
+- 2026-04-21 的真实靶机联调记录见：
+  - `docs/risk-integration-validation-2026-04-21.md`

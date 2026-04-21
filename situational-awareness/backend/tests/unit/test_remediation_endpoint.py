@@ -1,8 +1,15 @@
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.api.deps import get_current_user
 from app.api.v1.endpoints import remediation as remediation_endpoint
@@ -19,10 +26,71 @@ from app.db.models.remediation_session import RemediationSession
 from app.db.models.snapshot import HostSnapshot
 from app.db.models.task_run import TaskRun
 from app.db.models.user import User
-from app.db.session import SessionLocal, engine
+import app.db.session as db_session_module
+import app.main as app_main_module
 from app.main import create_app
 from app.rules.rule_store import RuleStore
 from app.services.remediation_session_service import process_remediation_session_ai_generation
+
+SessionLocal = db_session_module.SessionLocal
+engine = db_session_module.engine
+_OPEN_TEST_CLIENTS: list[TestClient] = []
+_OPEN_TEST_ENGINES = []
+
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "JSON"
+
+
+@compiles(INET, "sqlite")
+def _compile_inet_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "TEXT"
+
+
+@compiles(CIDR, "sqlite")
+def _compile_cidr_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "TEXT"
+
+
+def _install_test_database() -> None:
+    global SessionLocal, engine
+
+    test_engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    test_session_local = sessionmaker(
+        bind=test_engine,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+        class_=Session,
+    )
+
+    db_session_module.engine = test_engine
+    db_session_module.SessionLocal = test_session_local
+    app_main_module.engine = test_engine
+    app_main_module.SessionLocal = test_session_local
+    remediation_endpoint.SessionLocal = test_session_local
+
+    SessionLocal = test_session_local
+    engine = test_engine
+    _OPEN_TEST_ENGINES.append(test_engine)
+
+
+def _cleanup_test_resources() -> None:
+    while _OPEN_TEST_CLIENTS:
+        _OPEN_TEST_CLIENTS.pop().close()
+    while _OPEN_TEST_ENGINES:
+        _OPEN_TEST_ENGINES.pop().dispose()
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_clients_and_engines():  # type: ignore[no-untyped-def]
+    yield
+    _cleanup_test_resources()
 
 
 def _override_user(role: UserRole):
@@ -47,6 +115,8 @@ def _run_session_ai(session_id: str, *, reason: str | None = None, force: bool =
 
 
 def _build_client(tmp_path, role: UserRole = UserRole.ADMIN) -> TestClient:
+    _install_test_database()
+    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     settings.LLM_PROVIDER = "mock"
     rule_path = tmp_path / "risk_rules.yaml"
@@ -132,8 +202,15 @@ def _build_client(tmp_path, role: UserRole = UserRole.ADMIN) -> TestClient:
         db.commit()
 
     app = create_app()
+    @asynccontextmanager
+    async def _noop_lifespan(_app):
+        yield
+
+    app.router.lifespan_context = _noop_lifespan
     app.dependency_overrides[get_current_user] = _override_user(role)
-    return TestClient(app)
+    client = TestClient(app)
+    _OPEN_TEST_CLIENTS.append(client)
+    return client
 
 
 def _create_asset_context(

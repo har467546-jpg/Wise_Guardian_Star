@@ -45,6 +45,12 @@ export type PlatformSettings = {
   discovery_nse_timeout_seconds: number;
   discovery_nse_host_concurrency: number;
   discovery_nse_enable_vuln_scripts: boolean;
+  campus_default_portset_mode: "curated" | "top1000_plus_custom" | "full";
+  campus_allow_full_scan_default: boolean;
+  campus_zone_host_concurrency_limit: number;
+  campus_zone_nmap_min_rate: number;
+  campus_dhcp_default_interval_seconds: number;
+  campus_snmp_default_interval_seconds: number;
   risk_active_verify_connect_timeout_seconds: number;
   risk_active_verify_read_timeout_seconds: number;
   risk_active_verify_max_concurrency: number;
@@ -90,6 +96,12 @@ export type PlatformSettingsInput = {
   discovery_nse_timeout_seconds: number;
   discovery_nse_host_concurrency: number;
   discovery_nse_enable_vuln_scripts: boolean;
+  campus_default_portset_mode: "curated" | "top1000_plus_custom" | "full";
+  campus_allow_full_scan_default: boolean;
+  campus_zone_host_concurrency_limit: number;
+  campus_zone_nmap_min_rate: number;
+  campus_dhcp_default_interval_seconds: number;
+  campus_snmp_default_interval_seconds: number;
   risk_active_verify_connect_timeout_seconds: number;
   risk_active_verify_read_timeout_seconds: number;
   risk_active_verify_max_concurrency: number;

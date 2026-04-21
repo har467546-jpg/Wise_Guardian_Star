@@ -133,6 +133,25 @@ def test_parse_apache_config_extracts_source_files_from_grep_output() -> None:
     assert apache["webdav_enabled"] is True
 
 
+def test_parse_apache_config_ignores_runtime_backup_source_files() -> None:
+    apache = parse_service_config(
+        "apache",
+        "/etc/apache2/sites-enabled/000-default.conf.bak.sa.20260421074824:Options Indexes FollowSymLinks\n"
+        "/etc/apache2/sites-enabled/000-default.conf:Options Indexes FollowSymLinks\n",
+    )
+
+    assert apache["source_files"] == ["/etc/apache2/sites-enabled/000-default.conf"]
+
+
+def test_parse_apache_config_ignores_runtime_backup_content_when_no_live_source_remains() -> None:
+    apache = parse_service_config(
+        "apache",
+        "/etc/apache2/sites-enabled/000-default.conf.bak.sa.20260421074824:Options Indexes FollowSymLinks\n",
+    )
+
+    assert apache == {}
+
+
 def test_parse_postgresql_config_extracts_auth_and_listener_flags() -> None:
     parsed = parse_service_config(
         "postgresql",

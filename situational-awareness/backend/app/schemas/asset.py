@@ -21,8 +21,23 @@ class AssetPortRead(ORMModel):
 class AssetRead(ORMModel):
     id: str
     ip: IPvAnyAddress
+    mac_address: str | None = None
+    vendor: str | None = None
     hostname: str | None
     os_name: str | None
+    network_zone: str | None = None
+    network_vlan: str | None = None
+    building: str | None = None
+    department: str | None = None
+    asset_category: str | None = None
+    device_role: str | None = None
+    device_assessment_json: dict[str, Any] = Field(default_factory=dict)
+    identity_source: str | None = None
+    last_auth_time: datetime | None = None
+    is_infrastructure_device: bool = False
+    is_iot: bool = False
+    is_virtual_network_component: bool = False
+    ipv6_addresses_json: list[str] = []
     status: AssetStatus
     is_local: bool = False
     local_hint: str | None = None

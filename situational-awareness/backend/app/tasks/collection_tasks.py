@@ -34,6 +34,7 @@ from app.scanner.nmap_nse import (
     select_nse_scripts_for_record,
 )
 from app.scanner.service_enrichment import is_nmap_enrichment_blocked
+from app.services.device_assessment_service import apply_device_assessment_to_asset, build_asset_device_assessment
 from app.tasks.task_runtime import get_current_task_run_id, log_task_warning, set_task_progress
 from app.tasks.verify_tasks import run_risk_verify_task
 
@@ -744,8 +745,10 @@ def _enqueue_followup_risk_verify_tasks(db: Session, asset_ids: list[str]) -> li
 
 
 def _persist_collection_result(db: Session, asset: Asset, result: SSHCollectResult) -> HostSnapshot:
-    summary_json = _build_collection_summary(result)
-    detail_json = _build_collection_detail(result)
+    assessment = _build_collection_device_assessment(asset=asset, result=result)
+    effective_assessment = apply_device_assessment_to_asset(asset, assessment)
+    summary_json = _build_collection_summary(result, device_assessment=effective_assessment)
+    detail_json = _build_collection_detail(result, device_assessment=effective_assessment)
     snapshot = HostSnapshot(
         asset_id=asset.id,
         hostname=result.hostname,
@@ -789,7 +792,24 @@ def _persist_collection_result(db: Session, asset: Asset, result: SSHCollectResu
     return snapshot
 
 
-def _build_collection_summary(result: SSHCollectResult) -> dict[str, Any]:
+def _build_collection_device_assessment(asset: Asset, result: SSHCollectResult) -> dict[str, Any] | None:
+    service_config_keys = sorted(result.service_configs) if isinstance(result.service_configs, dict) else []
+    implicit_ports = [22] if result.status in {"success", "partial"} and result.authorization else []
+    return build_asset_device_assessment(
+        asset=asset,
+        ports=[*implicit_ports],
+        service_records=[item for item in result.services if isinstance(item, dict)],
+        service_config_keys=service_config_keys,
+        raw_evidence=[error.message for error in result.errors if getattr(error, "message", None)],
+        assessment_source="ssh_collection",
+    )
+
+
+def _build_collection_summary(
+    result: SSHCollectResult,
+    *,
+    device_assessment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     authorization = result.authorization if isinstance(result.authorization, dict) else {}
     host_checks = result.host_checks if isinstance(result.host_checks, dict) else {}
     service_configs = result.service_configs if isinstance(result.service_configs, dict) else {}
@@ -819,11 +839,17 @@ def _build_collection_summary(result: SSHCollectResult) -> dict[str, Any]:
         "error_count": len(result.errors),
     }
     summary.update(build_local_privilege_summary(service_configs))
+    if device_assessment:
+        summary["device_assessment"] = device_assessment
     return summary
 
 
-def _build_collection_detail(result: SSHCollectResult) -> dict[str, Any]:
-    return {
+def _build_collection_detail(
+    result: SSHCollectResult,
+    *,
+    device_assessment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    detail = {
         "authorization": result.authorization,
         "cpu": result.cpu,
         "memory": result.memory,
@@ -833,6 +859,9 @@ def _build_collection_detail(result: SSHCollectResult) -> dict[str, Any]:
         "host_checks": result.host_checks,
         "errors": [error.to_dict() for error in result.errors],
     }
+    if device_assessment:
+        detail["device_assessment"] = device_assessment
+    return detail
 
 
 def _build_sudo_risk_summary(sudoers: dict[str, Any]) -> str:

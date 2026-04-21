@@ -72,7 +72,7 @@ SERVICE_CONFIG_COLLECTION_PLANS: dict[str, ServiceConfigCollectionPlan] = {
             "sh -lc '"
             "for d in /etc/apache2 /etc/httpd /usr/local/apache2/conf; do "
             "if [ -d \"$d\" ]; then "
-            "grep -RH -Eiv \"^[[:space:]]*(#|$)\" \"$d\" 2>/dev/null | "
+            "grep -RH --exclude=\"*.bak.sa*\" --exclude=\"*.disabled.sa\" -Eiv \"^[[:space:]]*(#|$)\" \"$d\" 2>/dev/null | "
             "grep -Ei \"(Options[[:space:]].*Indexes|Dav[[:space:]]+On)\" || true; "
             "fi; "
             "done'"
@@ -84,7 +84,7 @@ SERVICE_CONFIG_COLLECTION_PLANS: dict[str, ServiceConfigCollectionPlan] = {
             "sh -lc '"
             "for d in /etc/nginx /usr/local/nginx/conf; do "
             "if [ -d \"$d\" ]; then "
-            "grep -R -Eiv \"^[[:space:]]*(#|$)\" \"$d\" 2>/dev/null | "
+            "grep -R --exclude=\"*.bak.sa*\" --exclude=\"*.disabled.sa\" -Eiv \"^[[:space:]]*(#|$)\" \"$d\" 2>/dev/null | "
             "grep -Ei \"(autoindex[[:space:]]+on|dav_methods[[:space:]])\" || true; "
             "fi; "
             "done'"
@@ -177,24 +177,25 @@ def detect_collectable_services(
 
 def parse_service_config(service: str, raw: str | None) -> dict[str, Any]:
     normalized = service.strip().lower()
+    cleaned_raw = _strip_runtime_backup_lines(raw)
     if normalized == "ssh":
-        return _parse_ssh_config(raw)
+        return _parse_ssh_config(cleaned_raw)
     if normalized == "redis":
-        return _parse_redis_config(raw)
+        return _parse_redis_config(cleaned_raw)
     if normalized == "vsftpd":
-        return _parse_vsftpd_config(raw)
+        return _parse_vsftpd_config(cleaned_raw)
     if normalized == "samba":
-        return _parse_samba_config(raw)
+        return _parse_samba_config(cleaned_raw)
     if normalized == "tomcat":
-        return _parse_bool_flags(raw, {"manager_exposed", "sample_apps_enabled", "default_credentials"})
+        return _parse_bool_flags(cleaned_raw, {"manager_exposed", "sample_apps_enabled", "default_credentials"})
     if normalized == "apache":
-        return _parse_httpd_config(raw, webdav_token=r"\bDav\s+On\b")
+        return _parse_httpd_config(cleaned_raw, webdav_token=r"\bDav\s+On\b")
     if normalized == "nginx":
-        return _parse_nginx_config(raw)
+        return _parse_nginx_config(cleaned_raw)
     if normalized == "postgresql":
-        return _parse_postgresql_config(raw)
+        return _parse_postgresql_config(cleaned_raw)
     if normalized == "mysql":
-        return _parse_mysql_config(raw)
+        return _parse_mysql_config(cleaned_raw)
     return {}
 
 
@@ -417,17 +418,40 @@ def _parse_bool(raw: str | None) -> bool | None:
     return None
 
 
+def _is_runtime_backup_path(path: str) -> bool:
+    normalized = str(path or "").strip().lower()
+    if not normalized:
+        return False
+    return ".bak.sa." in normalized or normalized.endswith(".bak.sa") or normalized.endswith(".disabled.sa")
+
+
+def _strip_runtime_backup_lines(raw: str | None) -> str:
+    kept: list[str] = []
+    for line in (raw or "").splitlines():
+        normalized = line.strip()
+        if normalized.startswith("source_file="):
+            path = normalized.split("=", 1)[1].strip()
+            if _is_runtime_backup_path(path):
+                continue
+        elif ":" in normalized:
+            prefix = normalized.split(":", 1)[0].strip()
+            if prefix.startswith("/") and _is_runtime_backup_path(prefix):
+                continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _extract_source_files(raw: str | None) -> list[str]:
     seen: list[str] = []
     for line in (raw or "").splitlines():
         normalized = line.strip()
         if normalized.startswith("source_file="):
             path = normalized.split("=", 1)[1].strip()
-            if path and path not in seen:
+            if path and not _is_runtime_backup_path(path) and path not in seen:
                 seen.append(path)
             continue
         if ":" in normalized:
             prefix = normalized.split(":", 1)[0].strip()
-            if prefix.startswith("/") and prefix not in seen:
+            if prefix.startswith("/") and not _is_runtime_backup_path(prefix) and prefix not in seen:
                 seen.append(prefix)
     return seen[:20]

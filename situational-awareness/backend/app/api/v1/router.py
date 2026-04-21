@@ -4,6 +4,7 @@ from app.api.v1.endpoints import (
     agent,
     assets,
     auth,
+    campus,
     collection,
     dashboard,
     discovery,
@@ -23,6 +24,7 @@ api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 api_router.include_router(agent.router, prefix="/agent", tags=["agent"])
 api_router.include_router(discovery.router, prefix="/discovery", tags=["discovery"])
+api_router.include_router(campus.router, prefix="/campus", tags=["campus"])
 api_router.include_router(mobile.router, prefix="/mobile", tags=["mobile"])
 api_router.include_router(monitoring.router, prefix="/monitoring", tags=["monitoring"])
 api_router.include_router(assets.router, prefix="/assets", tags=["assets"])

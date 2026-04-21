@@ -83,6 +83,7 @@ def test_poll_runner_assignments_includes_asset_scan_tasks(monkeypatch) -> None:
 
     monkeypatch.setattr(runner_service, "update_task_run", lambda db, task, **kwargs: task)
     monkeypatch.setattr(runner_service, "create_task_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner_service, "update_discovery_execution_from_task", lambda *args, **kwargs: None)
     monkeypatch.setattr(runner_service, "_build_discovery_assignment_execution_script", lambda **kwargs: "echo discovery")
 
     response = runner_service.poll_runner_assignments(db, runner, max_tasks=1)
@@ -143,3 +144,57 @@ def test_complete_runner_task_routes_asset_scan_results(monkeypatch) -> None:
     assert result["scan_summary"]["host_count"] == 2
     assert result["context"]["runner_id"] == "runner-2"
     assert db.committed is True
+
+
+def test_complete_runner_task_prefers_context_job_id_for_discovery_execution(monkeypatch) -> None:
+    task = SimpleNamespace(
+        id="task-scan-3",
+        task_type=TaskType.ASSET_SCAN,
+        scope_type="discovery_execution",
+        scope_id="execution-1",
+        status=TaskExecutionStatus.RUNNING,
+        progress=50,
+        message=None,
+        result_json={"context": {"job_id": "job-real", "runner_asset_id": "asset-runner-3", "parent_task_id": "parent-task"}},
+    )
+    runner = SimpleNamespace(
+        id="runner-3",
+        asset_id="asset-runner-3",
+        status="busy",
+        install_status="installed",
+        last_seen_at=None,
+        last_error=None,
+    )
+    db = _FakeDB()
+
+    monkeypatch.setattr(runner_service, "get_task_run", lambda db, task_id: task if task_id == "task-scan-3" else None)
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        runner_service,
+        "update_discovery_execution_from_task",
+        lambda db, **kwargs: observed.update({"execution_status": kwargs.get("status")}) or None,
+    )
+    monkeypatch.setattr(
+        runner_service,
+        "aggregate_campus_discovery_job",
+        lambda db, job_id: observed.update({"job_id": job_id}) or {"host_count": 1, "port_scan_stats": {"open_port_count": 0}, "discovery_source_stats": {}},
+    )
+    monkeypatch.setattr(
+        runner_service,
+        "update_task_run",
+        lambda db, task, **kwargs: setattr(task, "status", kwargs.get("status")) or task,
+    )
+    monkeypatch.setattr(runner_service, "create_task_event", lambda *args, **kwargs: None)
+
+    runner_service.complete_runner_task(
+        db,
+        runner,
+        "task-scan-3",
+        RunnerTaskCompleteRequest(
+            status="success",
+            execution={"scan_result": {"hosts": [{"ip": "10.10.0.5"}]}},
+            message="runner scan ok",
+        ),
+    )
+
+    assert observed["job_id"] == "job-real"

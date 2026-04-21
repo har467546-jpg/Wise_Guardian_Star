@@ -673,9 +673,98 @@ def run_agent_auto_followup_task(
                     "agent_result": "followup_deduped",
                     "child_task_id": child_task_id,
                     "action_type": normalized_action_type,
-                    "terminal_status": child_terminal_status,
+                "terminal_status": child_terminal_status,
                 },
             )
+            return child_task_id
+        action_params = normalized_action.get("params") if isinstance(normalized_action.get("params"), dict) else {}
+        resume_action = action_params.get("resume_action") if isinstance(action_params.get("resume_action"), dict) else {}
+        if (
+            normalized_action_type == "install_runner"
+            and child_terminal_status == TaskExecutionStatus.SUCCESS.value
+            and resume_action
+        ):
+            asset_id = str(action_params.get("asset_id") or "").strip() or "目标资产"
+            try:
+                resume_result = execute_approved_action(
+                    db,
+                    action=resume_action,
+                    session_user_id=getattr(session, "user_id", ""),
+                    platform_url="",
+                )
+            except Exception as exc:
+                append_agent_task_message(
+                    db,
+                    session_id=session_id,
+                    content=(
+                        f"资产 {asset_id} 的 Runner 安装任务已完成，"
+                        f"但自动续接修复失败：{sanitize_text(str(exc), max_length=280) or '未知错误'}"
+                    ),
+                    payload_json={
+                        "task_id": child_task_id,
+                        "terminal_status": child_terminal_status,
+                        "auto_followup": True,
+                        "action": normalized_action,
+                        "child_task": child_summary,
+                        "resume_action": resume_action,
+                    },
+                    message_type="error",
+                )
+                db.commit()
+                return child_task_id
+
+            resumed_action = {
+                "action_type": resume_action.get("action_type"),
+                "title": resume_action.get("title"),
+                "status": resume_result.status,
+                "summary": resume_result.summary,
+                "params": deepcopy(resume_action.get("params") if isinstance(resume_action.get("params"), dict) else {}),
+                "payload": resume_result.payload or {},
+                "child_task_id": resume_result.child_task_id,
+            }
+            resume_child_summary = {
+                "task_id": resume_result.child_task_id,
+                "status": TaskExecutionStatus.SUCCESS.value if resume_result.status == "success" else resume_result.status,
+                "message": resume_result.summary,
+                "result_json": resume_result.payload or {},
+                "error_json": {},
+            }
+            resume_hint = build_auto_action_task_followup_content(resumed_action, resume_child_summary)[2]
+            append_agent_task_message(
+                db,
+                session_id=session_id,
+                content=f"资产 {asset_id} 的 Runner 安装任务已完成。{resume_result.summary}",
+                payload_json={
+                    "task_id": child_task_id,
+                    "terminal_status": child_terminal_status,
+                    "auto_followup": True,
+                    "action": normalized_action,
+                    "child_task": child_summary,
+                    "resume_action": resume_action,
+                    "resume_action_result": resumed_action,
+                    "resume_hint": {
+                        **resume_hint,
+                        "goal_id": getattr(session, "current_goal_id", None),
+                    },
+                },
+                message_type="task_update",
+            )
+            if resume_result.child_task_id:
+                session.last_task_id = resume_result.child_task_id
+                sync_agent_task_watch_state(
+                    session,
+                    task_id=resume_result.child_task_id,
+                    status=resume_result.status,
+                    message=resume_result.summary,
+                    action=resumed_action,
+                    watching=True,
+                )
+                enqueue_auto_action_followup_task(
+                    session_id=session_id,
+                    child_task_id=resume_result.child_task_id,
+                    action=resumed_action,
+                )
+            db.commit()
             return child_task_id
         message_type, content, resume_hint = build_auto_action_task_followup_content(normalized_action, child_summary)
         append_agent_task_message(

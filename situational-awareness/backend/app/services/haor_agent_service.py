@@ -4159,15 +4159,34 @@ def _scan_asset_brief(item: dict[str, Any]) -> str:
     return " / ".join(parts)
 
 
-def _build_resume_hint_summary_decision(
-    *,
-    session: AgentSession | Any | None,
-    tool_traces: list[dict[str, Any]],
-) -> _AgentModelDecision | None:
-    recent_resume_hint = _latest_resume_hint(session)
-    if _sanitize_line(str(recent_resume_hint.get("kind") or ""), max_length=64) != "post_scan_analysis":
-        return None
+def _format_resume_hint_brief_list(items: list[str], *, limit: int = 3) -> str:
+    cleaned = [
+        sanitize_text(item, max_length=120, single_line=True) or ""
+        for item in items
+        if sanitize_text(item, max_length=120, single_line=True)
+    ]
+    if not cleaned:
+        return ""
+    preview = "；".join(cleaned[:limit])
+    remainder = len(cleaned) - min(len(cleaned), limit)
+    if remainder > 0:
+        return f"{preview}；另有 {remainder} 项未展开" if preview else f"另有 {remainder} 项未展开"
+    return preview
 
+
+def _remediation_outcome_brief(item: dict[str, Any]) -> str:
+    title = sanitize_text(
+        str(item.get("title") or item.get("current_title") or item.get("rule_id") or "未命名风险"),
+        max_length=120,
+        single_line=True,
+    ) or "未命名风险"
+    service_name = sanitize_text(str(item.get("service_name") or ""), max_length=64, single_line=True) or ""
+    if service_name:
+        return f"{title}（{service_name}）"
+    return title
+
+
+def _build_scan_resume_hint_summary_decision(tool_traces: list[dict[str, Any]]) -> _AgentModelDecision | None:
     assets_result = _latest_successful_tool_result(tool_traces, tool_name="list_assets")
     task_result = _latest_successful_tool_result(tool_traces, tool_name="get_task_detail")
     items = assets_result.get("items") if isinstance(assets_result.get("items"), list) else []
@@ -4212,6 +4231,249 @@ def _build_resume_hint_summary_decision(
         objective="分析扫描结果",
         stop_reason="resume_hint_scan_summary",
     )
+
+
+def _build_remediation_resume_hint_summary_decision(tool_traces: list[dict[str, Any]]) -> _AgentModelDecision | None:
+    task_result = _latest_successful_tool_result(tool_traces, tool_name="get_task_detail")
+    remediation_session = _latest_successful_tool_result(tool_traces, tool_name="get_remediation_session")
+    remediation_asset = _latest_successful_tool_result(tool_traces, tool_name="get_remediation_asset")
+    if not task_result and not remediation_session:
+        return None
+
+    result_json = task_result.get("result_json") if isinstance(task_result.get("result_json"), dict) else {}
+    execution = result_json.get("execution") if isinstance(result_json.get("execution"), dict) else {}
+    reverify_summary = result_json.get("reverify_summary") if isinstance(result_json.get("reverify_summary"), dict) else {}
+    plan = result_json.get("plan") if isinstance(result_json.get("plan"), dict) else {}
+    if not plan and isinstance(remediation_session.get("plan"), dict):
+        plan = remediation_session.get("plan")
+
+    plan_steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    step_titles = {
+        _sanitize_line(str(item.get("step_id") or ""), max_length=128): sanitize_text(
+            str(item.get("title") or item.get("step_id") or ""),
+            max_length=120,
+            single_line=True,
+        )
+        or ""
+        for item in plan_steps
+        if isinstance(item, dict) and _sanitize_line(str(item.get("step_id") or ""), max_length=128)
+    }
+
+    step_results = execution.get("step_results") if isinstance(execution.get("step_results"), list) else []
+    submitted_steps = execution.get("submitted_steps") if isinstance(execution.get("submitted_steps"), list) else []
+    submitted_labels: list[str] = []
+    for item in submitted_steps:
+        if not isinstance(item, dict):
+            continue
+        step_id = _sanitize_line(str(item.get("step_id") or ""), max_length=128)
+        if not step_id:
+            continue
+        title = step_titles.get(step_id) or sanitize_text(str(item.get("title") or step_id), max_length=120, single_line=True) or step_id
+        if title not in submitted_labels:
+            submitted_labels.append(title)
+    if not submitted_labels:
+        for item in step_results:
+            if not isinstance(item, dict):
+                continue
+            title = sanitize_text(str(item.get("title") or item.get("step_id") or ""), max_length=120, single_line=True) or ""
+            if title and title not in submitted_labels:
+                submitted_labels.append(title)
+
+    success_labels = [
+        sanitize_text(str(item.get("title") or item.get("step_id") or ""), max_length=120, single_line=True) or ""
+        for item in step_results
+        if isinstance(item, dict) and str(item.get("status") or "").strip().lower() == "success"
+    ]
+    success_labels = [item for item in success_labels if item]
+    failed_labels = [
+        sanitize_text(str(item.get("title") or item.get("step_id") or ""), max_length=120, single_line=True) or ""
+        for item in step_results
+        if isinstance(item, dict) and str(item.get("status") or "").strip().lower() in {"failed", "blocked"}
+    ]
+    failed_labels = [item for item in failed_labels if item]
+
+    targeted_outcomes = result_json.get("targeted_finding_outcomes") if isinstance(result_json.get("targeted_finding_outcomes"), list) else []
+    closed_outcomes = [
+        _remediation_outcome_brief(item)
+        for item in targeted_outcomes
+        if isinstance(item, dict) and str(item.get("status") or "").strip().lower() == "closed"
+    ]
+    open_outcomes = [
+        _remediation_outcome_brief(item)
+        for item in targeted_outcomes
+        if isinstance(item, dict) and str(item.get("status") or "").strip().lower() == "open"
+    ]
+    asset_findings = remediation_asset.get("findings") if isinstance(remediation_asset.get("findings"), list) else []
+    open_asset_findings = [
+        _remediation_outcome_brief(item)
+        for item in asset_findings
+        if isinstance(item, dict) and str(item.get("status") or "").strip().lower() == "open"
+    ]
+
+    targeted_total = int(reverify_summary.get("targeted_target_count") or len(targeted_outcomes))
+    closed_total = int(reverify_summary.get("closed_target_count") or len(closed_outcomes))
+    open_total = int(reverify_summary.get("open_target_count") or len(open_outcomes))
+    other_open_total_raw = reverify_summary.get("other_open_finding_count")
+    other_open_total = int(other_open_total_raw) if isinstance(other_open_total_raw, int) else None
+    business_blockers = [
+        sanitize_text(str(item), max_length=160, single_line=True) or ""
+        for item in (reverify_summary.get("business_blockers") or [])
+        if sanitize_text(str(item), max_length=160, single_line=True)
+    ]
+    business_status = _sanitize_line(
+        str(result_json.get("business_status") or execution.get("business_status") or ""),
+        max_length=64,
+    ).lower()
+    execution_status = _sanitize_line(
+        str(result_json.get("execution_status") or execution.get("execution_status") or ""),
+        max_length=64,
+    ).lower()
+    task_timing = task_result.get("timing") if isinstance(task_result.get("timing"), dict) else {}
+    stage_name = sanitize_text(
+        str(execution.get("stage_name") or task_timing.get("current_stage_name") or ""),
+        max_length=120,
+        single_line=True,
+    ) or ""
+    task_message = sanitize_text(str(task_result.get("message") or ""), max_length=180) or ""
+    task_status = _sanitize_line(str(task_result.get("status") or ""), max_length=64).lower()
+    success_count = int(execution.get("success_count") or len(success_labels))
+    failed_count = int(execution.get("failed_count") or 0)
+    blocked_count = int(execution.get("blocked_count") or 0)
+    skipped_count = int(execution.get("skipped_count") or 0)
+    preview_only = execution_status == "preview_only" or _sanitize_line(
+        str(execution.get("execution_mode") or ""),
+        max_length=32,
+    ).lower() == "dry_run"
+    plan_blocked_reasons = [
+        sanitize_text(str(item), max_length=160, single_line=True) or ""
+        for item in (plan.get("blocked_reasons") or [])
+        if sanitize_text(str(item), max_length=160, single_line=True)
+    ]
+
+    section_one = []
+    if stage_name:
+        section_one.append(f"- 阶段：{stage_name}")
+    if submitted_labels:
+        section_one.append(f"- 步骤：{_format_resume_hint_brief_list(submitted_labels, limit=4)}")
+    elif task_message:
+        section_one.append(f"- 执行摘要：{task_message}")
+    else:
+        section_one.append("- 执行摘要：当前只拿到修复状态，未拿到更细的步骤明细。")
+
+    section_two = []
+    if preview_only:
+        section_two.append("- 本轮为预演，未执行任何主机变更。")
+    else:
+        counts_line = f"- 成功 {success_count} 步，失败 {failed_count} 步，阻塞 {blocked_count} 步，跳过 {skipped_count} 步。"
+        section_two.append(counts_line)
+    if success_labels:
+        section_two.append(f"- 已成功：{_format_resume_hint_brief_list(success_labels, limit=4)}")
+    elif task_status == TaskExecutionStatus.SUCCESS.value and task_message:
+        section_two.append(f"- 任务结果：{task_message}")
+    if failed_labels:
+        section_two.append(f"- 异常步骤：{_format_resume_hint_brief_list(failed_labels, limit=3)}")
+
+    section_three = []
+    if targeted_total > 0:
+        section_three.append(f"- 本轮目标风险 {targeted_total} 条，已闭环 {closed_total} 条。")
+    if closed_outcomes:
+        section_three.append(f"- 已闭环项：{_format_resume_hint_brief_list(closed_outcomes, limit=3)}")
+    elif targeted_total > 0 and closed_total <= 0:
+        section_three.append("- 当前还没有确认闭环的目标风险。")
+    else:
+        section_three.append("- 当前没有拿到可确认闭环的目标风险明细。")
+
+    section_four = []
+    if open_total > 0:
+        section_four.append(f"- 目标风险仍未闭环 {open_total} 条。")
+    else:
+        section_four.append("- 当前未看到仍未闭环的目标风险。")
+    if open_outcomes:
+        section_four.append(f"- 未闭环项：{_format_resume_hint_brief_list(open_outcomes, limit=3)}")
+    elif open_total > 0 and open_asset_findings:
+        section_four.append(f"- 当前开放风险示例：{_format_resume_hint_brief_list(open_asset_findings, limit=3)}")
+    if other_open_total is not None and other_open_total > 0:
+        section_four.append(f"- 未纳入本轮的其余开放风险 {other_open_total} 条。")
+    if business_blockers:
+        section_four.append(f"- 业务阻塞：{_format_resume_hint_brief_list(business_blockers, limit=2)}")
+
+    next_steps: list[str] = []
+    if preview_only:
+        next_steps.append("先确认维护窗口、变更单和执行边界，再发起正式修复。")
+    elif business_status == "pending_reverify":
+        next_steps.append("等待自动复验完成后再看最终闭环结果。")
+    elif business_status == "verified_closed":
+        next_steps.append("可以进入归档或抽样确认，不必继续扩大修复范围。")
+    elif business_status == "verified_partial":
+        next_steps.append("优先处理仍开放的目标风险，再补一次复验。")
+    elif business_status == "verified_failed" or failed_count > 0 or task_status == TaskExecutionStatus.FAILURE.value:
+        next_steps.append("先定位失败步骤或复验异常，再决定重试、回滚或切换成人工处置。")
+    else:
+        next_steps.append("建议继续核对当前修复会话与任务明细，确认是否还有未收敛项。")
+    if plan_blocked_reasons:
+        next_steps.append(f"需要先补齐阻塞条件：{_format_resume_hint_brief_list(plan_blocked_reasons, limit=2)}。")
+
+    suggest_reverify = False
+    reverify_reason = "当前结果已经稳定，不需要再发起复验。"
+    if preview_only:
+        reverify_reason = "当前仅完成预演，需先正式执行后再复验。"
+    elif business_status in {"pending_reverify", "verified_partial", "verified_failed"}:
+        suggest_reverify = True
+        if business_status == "pending_reverify":
+            reverify_reason = "系统已进入复验阶段，建议等待复验完成并再次确认。"
+        elif business_status == "verified_partial":
+            reverify_reason = "仍有目标风险未闭环，补修后应再次复验。"
+        else:
+            reverify_reason = "本轮执行或复验失败，修正后需要重新复验。"
+
+    suggest_manual = False
+    manual_reason = "当前自动链路可以继续收敛，不需要额外人工介入。"
+    if preview_only:
+        suggest_manual = True
+        manual_reason = "正式执行前需要人工确认维护窗口、变更单或审批条件。"
+    elif business_status == "verified_partial" and business_blockers:
+        suggest_manual = True
+        manual_reason = "存在业务阻塞，建议人工确认外部条件后再继续。"
+    elif business_status == "verified_failed" or failed_count > 0 or task_status == TaskExecutionStatus.FAILURE.value:
+        suggest_manual = True
+        manual_reason = "已出现执行失败，建议人工定位失败点并决定是否回滚。"
+
+    report_intro = "我已把这次自动修复整理成固定结构的复盘报告。"
+    if task_message:
+        report_intro = f"{report_intro}{task_message}。"
+    reply = "\n\n".join(
+        [
+            report_intro,
+            "1. 本轮执行了哪些步骤\n" + "\n".join(section_one),
+            "2. 哪些成功\n" + "\n".join(section_two),
+            "3. 哪些风险已闭环\n" + "\n".join(section_three),
+            "4. 哪些仍未闭环\n" + "\n".join(section_four),
+            "5. 下一步建议\n" + "\n".join(f"- {item}" for item in next_steps),
+            "6. 是否建议再复验 / 人工介入\n"
+            + f"- 建议再复验：{'是' if suggest_reverify else '否'}。{reverify_reason}\n"
+            + f"- 建议人工介入：{'是' if suggest_manual else '否'}。{manual_reason}",
+        ]
+    )
+    return _AgentModelDecision(
+        reply_markdown=reply,
+        conversation_state="answer",
+        objective="复盘修复结果",
+        stop_reason="resume_hint_remediation_report",
+    )
+
+
+def _build_resume_hint_summary_decision(
+    *,
+    session: AgentSession | Any | None,
+    tool_traces: list[dict[str, Any]],
+) -> _AgentModelDecision | None:
+    recent_resume_hint = _latest_resume_hint(session)
+    resume_kind = _sanitize_line(str(recent_resume_hint.get("kind") or ""), max_length=64)
+    if resume_kind == "post_scan_analysis":
+        return _build_scan_resume_hint_summary_decision(tool_traces)
+    if resume_kind == "post_remediation_review":
+        return _build_remediation_resume_hint_summary_decision(tool_traces)
+    return None
 
 
 def _build_short_resume_fallback_decision(
@@ -5623,9 +5885,7 @@ def _build_mock_model_decision(
 
 
 def _risk_rule_id(finding: RiskFinding) -> str | None:
-    evidence = finding.evidence_json if isinstance(finding.evidence_json, dict) else {}
-    rule_id = str(evidence.get("yaml_rule_id") or "").strip()
-    return rule_id or None
+    return finding.resolved_yaml_rule_id()
 
 
 def _serialize_asset(asset: Asset) -> dict[str, Any]:
@@ -5664,7 +5924,7 @@ def _serialize_finding_summary(finding: RiskFinding) -> dict[str, Any]:
         "title": finding.title,
         "severity": finding.severity.value if hasattr(finding.severity, "value") else str(finding.severity),
         "status": finding.status.value if hasattr(finding.status, "value") else str(finding.status),
-        "rule_id": finding.rule_id or _risk_rule_id(finding),
+        "rule_id": _risk_rule_id(finding) or finding.rule_id,
         "service_name": finding.asset_port.service_name if finding.asset_port else None,
         "detected_at": finding.detected_at.isoformat() if finding.detected_at else None,
         "resolved_at": finding.resolved_at.isoformat() if finding.resolved_at else None,
@@ -8328,6 +8588,7 @@ def _build_message_action_payload(
     label: str,
     message_text: str | None = None,
     pathname: str | None = None,
+    asset_id: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "kind": _sanitize_line(kind, max_length=32) or "navigate",
@@ -8337,6 +8598,8 @@ def _build_message_action_payload(
         payload["message_text"] = sanitize_text(message_text, max_length=240) or ""
     if pathname:
         payload["pathname"] = sanitize_text(pathname, max_length=255, single_line=True) or ""
+    if asset_id:
+        payload["asset_id"] = _sanitize_line(asset_id, max_length=64) or ""
     return payload
 
 
@@ -8361,9 +8624,10 @@ def _build_remediation_guidance_payload(
         return guidance
     if "runner" in blocker_categories:
         guidance["recommended_action"] = _build_message_action_payload(
-            kind="send_message",
+            kind="install_runner_and_resume",
             label="继续安装 Runner 后走自动修复",
             message_text=f"继续为资产 {asset_id} 安装 Runner，然后继续自动修复",
+            asset_id=asset_id,
         )
         guidance["post_verify_action"] = "runner_required"
         if "render" in blocker_categories:

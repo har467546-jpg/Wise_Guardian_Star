@@ -449,6 +449,8 @@ def _guess_os_from_services(services: list[dict[str, Any]]) -> str | None:
 def _guess_role(ports: list[int], service_names: list[str]) -> str:
     port_set = set(ports)
     name_set = set(service_names)
+    if port_set & {53, 67, 68, 69, 123, 161, 162} or name_set.intersection({"dns", "domain", "dnsmasq", "dhcp", "dhcpd", "ntp", "snmp"}):
+        return "Network infrastructure node"
     if port_set & DB_PORTS or name_set.intersection({"mysql", "postgresql"}):
         return "Database node"
     if port_set & CACHE_PORTS or "redis" in name_set:

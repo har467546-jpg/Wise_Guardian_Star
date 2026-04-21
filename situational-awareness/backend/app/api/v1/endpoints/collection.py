@@ -37,6 +37,7 @@ from app.schemas.collection import (
     CollectRunRequest,
     CollectRunResponse,
 )
+from app.services.device_assessment_service import resolve_asset_device_assessment
 from app.tasks.collect_tasks import run_asset_collect_task, run_batch_collect_task
 
 router = APIRouter()
@@ -599,7 +600,7 @@ def _pick_latest_collection_snapshot(snapshots: list[HostSnapshot]) -> HostSnaps
     return collection_snapshots[0]
 
 
-def _build_latest_collection_payload(snapshot: HostSnapshot) -> tuple[dict, dict]:
+def _build_latest_collection_payload(snapshot: HostSnapshot, *, asset: Asset | None = None) -> tuple[dict, dict]:
     summary_json = {}
     detail_json = {}
     if isinstance(snapshot.software_json, dict):
@@ -639,6 +640,10 @@ def _build_latest_collection_payload(snapshot: HostSnapshot) -> tuple[dict, dict
         }
         service_configs = detail_json.get("service_configs") if isinstance(detail_json.get("service_configs"), dict) else {}
         summary_json.update(build_local_privilege_summary(service_configs))
+    assessment = resolve_asset_device_assessment(asset) if asset is not None else None
+    if assessment:
+        summary_json.setdefault("device_assessment", assessment)
+        detail_json.setdefault("device_assessment", assessment)
     return summary_json, detail_json
 
 
@@ -675,6 +680,10 @@ def _build_initial_from_asset(asset: Asset) -> tuple[dict, dict, str]:
         hostname=asset.hostname,
         services=services,
     )
+    assessment = resolve_asset_device_assessment(asset)
+    if assessment:
+        summary_json["device_assessment"] = assessment
+        detail_json["device_assessment"] = assessment
     observations = summary_json.get("key_observations")
     if isinstance(observations, list):
         observations.append("当前展示为降级结果，等待发现任务生成完整网络快照")
@@ -962,7 +971,7 @@ def get_latest_asset_collection(
     if latest is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="暂无 SSH 授权深度检查结果")
 
-    summary_json, detail_json = _build_latest_collection_payload(latest)
+    summary_json, detail_json = _build_latest_collection_payload(latest, asset=asset)
     return CollectLatestResponse(
         asset_id=asset.id,
         status=latest.collection_status,
@@ -1006,6 +1015,10 @@ def get_latest_asset_initial(
     if not summary_json and isinstance(latest.services_json, dict):
         summary_json = latest.services_json.get("summary_json") or summary_json
         detail_json = latest.services_json.get("detail_json") or detail_json
+    assessment = resolve_asset_device_assessment(asset)
+    if assessment:
+        summary_json.setdefault("device_assessment", assessment)
+        detail_json.setdefault("device_assessment", assessment)
 
     return CollectInitialLatestResponse(
         asset_id=asset.id,

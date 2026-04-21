@@ -1,5 +1,4 @@
 import asyncio
-import ipaddress
 from datetime import datetime, timezone
 from typing import Any
 import logging
@@ -32,6 +31,11 @@ from app.scanner.service_enrichment import (
     to_fingerprint_json,
 )
 from app.scanner.service_fingerprint import DEFAULT_SERVICE_BY_PORT, infer_service_aliases
+from app.services.device_assessment_service import (
+    apply_device_assessment_to_asset,
+    build_discovery_host_device_assessment,
+    resolve_asset_device_assessment,
+)
 from app.tasks.collection_tasks import run_collection_for_asset
 from app.tasks.risk_tasks import evaluate_risks_for_asset
 from app.tasks.task_runtime import log_task_warning
@@ -43,6 +47,7 @@ NETWORK_INITIAL_SNAPSHOT_TYPE = "network_initial"
 BACKDOOR_VERSION_SKIP_REASON = "后门候选端口，已跳过版本识别"
 DEFAULT_DISCOVERY_CONFIG = DiscoveryConfig()
 FORCED_NMAP_ENRICH_PORTS = {21, 80, 111, 512, 513, 514, 1099, 1524, 2121, 3306, 3632, 6667, 8009, 8180}
+NETWORK_DISCOVERY_INFERRED_IDENTITY_SOURCE = "network_discovery_inferred"
 
 
 @celery_app.task(name="app.tasks.discovery_tasks.run_discovery_pipeline")
@@ -82,15 +87,16 @@ def discover_hosts(job_id: str) -> str:
             logger.warning("host discovery failed for job=%s: 批量 nmap 探活未能完成", job_id, exc_info=True)
             raise
         filtered_hosts, excluded_local_hosts = _filter_excluded_local_hosts([host.to_dict() for host in hosts], cidr=job.cidr)
+        annotated_hosts = _annotate_discovery_hosts_with_device_assessment(filtered_hosts, cidr=job.cidr)
         job.summary_json = {
-            "host_count": len(filtered_hosts),
-            "hosts": filtered_hosts,
+            "host_count": len(annotated_hosts),
+            "hosts": annotated_hosts,
             "excluded_local_ip_count": len(excluded_local_hosts),
             "excluded_local_hosts": excluded_local_hosts,
-            "discovery_source_stats": _build_discovery_source_stats(filtered_hosts),
+            "discovery_source_stats": _build_discovery_source_stats(annotated_hosts),
             "baseline_diff_summary": _build_baseline_diff_summary(
                 baseline_hosts=[host.to_dict() for host in hosts],
-                accepted_hosts=filtered_hosts,
+                accepted_hosts=annotated_hosts,
                 excluded_hosts=excluded_local_hosts,
             ),
         }
@@ -154,6 +160,7 @@ def full_port_scan(job_id: str) -> str:
             prepared_hosts.append(base_host)
 
         summary = dict(job.summary_json or {})
+        prepared_hosts = _annotate_discovery_hosts_with_device_assessment(prepared_hosts, cidr=job.cidr)
         summary["host_count"] = len(prepared_hosts)
         summary["hosts"] = prepared_hosts
         summary["excluded_local_ip_count"] = len(excluded_local_hosts)
@@ -185,6 +192,7 @@ def full_port_scan(job_id: str) -> str:
                     asset.hostname = hostname
                 asset.last_seen_at = datetime.now(timezone.utc)
                 host_stats = _upsert_asset_ports(db, asset, host)
+                _apply_discovery_asset_labels(asset, host, cidr=job.cidr)
                 _merge_port_scan_stats(reconciliation_stats, host_stats)
                 db.add(asset)
             summary["port_scan_stats"].update(reconciliation_stats)
@@ -344,6 +352,8 @@ def probe_open_services(job_id: str) -> str:
             }
             merged_hosts.append(merged_host)
 
+        merged_hosts = _annotate_discovery_hosts_with_device_assessment(merged_hosts, cidr=job.cidr)
+
         nse_targets, nse_candidate_port_count, nse_executed_port_count, nse_script_run_count, nse_skipped_count = _build_nse_targets(
             merged_hosts,
             high_backdoor_ports,
@@ -436,10 +446,12 @@ def probe_open_services(job_id: str) -> str:
                     asset.hostname = hostname
                 asset.last_seen_at = datetime.now(timezone.utc)
                 host_stats = _upsert_asset_ports(db, asset, host)
+                _apply_discovery_asset_labels(asset, host, cidr=job.cidr)
                 _merge_port_scan_stats(reconciliation_stats, host_stats)
                 snapshot = _build_network_initial_snapshot(asset, host)
                 if snapshot is not None:
                     db.add(snapshot)
+                    _apply_network_initial_asset_status(asset, snapshot)
                     network_initial_snapshot_count += 1
                 db.add(asset)
             summary["port_scan_stats"].update(reconciliation_stats)
@@ -533,6 +545,7 @@ def upsert_assets(job_id: str) -> str:
                 asset.status = AssetStatus.COLLECTING
                 asset.last_seen_at = datetime.now(timezone.utc)
             _upsert_asset_ports(db, asset, host)
+            _apply_discovery_asset_labels(asset, host, cidr=job.cidr)
             db.add(asset)
         db.commit()
 
@@ -608,6 +621,23 @@ def _extract_ips(hosts: list[dict[str, Any]]) -> list[str]:
     return ips
 
 
+def _annotate_discovery_hosts_with_device_assessment(
+    hosts: list[dict[str, Any]],
+    *,
+    cidr: str | None = None,
+) -> list[dict[str, Any]]:
+    annotated: list[dict[str, Any]] = []
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        payload = dict(host)
+        assessment = build_discovery_host_device_assessment(payload, cidr=cidr)
+        if assessment:
+            payload["device_assessment"] = assessment
+        annotated.append(payload)
+    return annotated
+
+
 def _extract_excluded_local_hosts(summary_json: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(summary_json, dict):
         return []
@@ -660,10 +690,6 @@ def _resolve_discovery_host_exclusion_reason(
     return None
 
 
-def _resolve_gateway_candidate_reason(ip: str, cidr: str | None) -> str | None:
-    return None
-
-
 def _resolve_local_node_hint_reason(
     ip: str,
     hostname: str | None,
@@ -711,6 +737,37 @@ def _normalize_service_name(value: Any) -> str:
         return "unknown"
     cleaned = value.strip().lower()
     return cleaned or "unknown"
+
+
+def _infer_discovery_asset_labels(host: dict[str, Any], *, cidr: str | None = None) -> dict[str, Any]:
+    assessment = (
+        dict(host.get("device_assessment"))
+        if isinstance(host.get("device_assessment"), dict)
+        else build_discovery_host_device_assessment(host, cidr=cidr)
+    )
+    if not assessment:
+        return {}
+    flags = assessment.get("flags") if isinstance(assessment.get("flags"), dict) else {}
+    return {
+        "is_infrastructure_device": bool(flags.get("is_infrastructure_device") is True),
+        "is_iot": bool(flags.get("is_iot") is True),
+        "is_virtual_network_component": bool(flags.get("is_virtual_network_component") is True),
+        "asset_category": assessment.get("asset_category"),
+        "device_role": assessment.get("device_role"),
+        "device_assessment_json": assessment,
+        "identity_source": NETWORK_DISCOVERY_INFERRED_IDENTITY_SOURCE,
+    }
+
+
+def _apply_discovery_asset_labels(asset: Asset, host: dict[str, Any], *, cidr: str | None = None) -> None:
+    labels = _infer_discovery_asset_labels(host, cidr=cidr)
+    if not labels:
+        return
+    assessment = labels.get("device_assessment_json") if isinstance(labels.get("device_assessment_json"), dict) else None
+    apply_device_assessment_to_asset(asset, assessment)
+    current_identity_source = str(asset.identity_source or "").strip()
+    if not current_identity_source or current_identity_source == NETWORK_DISCOVERY_INFERRED_IDENTITY_SOURCE:
+        asset.identity_source = str(labels.get("identity_source") or "").strip() or asset.identity_source
 
 
 def _to_port(value: Any) -> int | None:
@@ -963,6 +1020,17 @@ def _parse_port_csv(value: Any, fallback: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(parsed) if parsed else fallback
 
 
+def _effective_discovery_portset_mode() -> str:
+    configured = str(settings.DISCOVERY_PORTSET_MODE or DEFAULT_DISCOVERY_CONFIG.portset_mode).strip().lower()
+    if configured and configured != "full":
+        return configured
+    campus_default = str(getattr(settings, "CAMPUS_DEFAULT_PORTSET_MODE", "top1000_plus_custom") or "top1000_plus_custom").strip().lower()
+    campus_allow_full = bool(getattr(settings, "CAMPUS_ALLOW_FULL_SCAN_DEFAULT", False))
+    if not campus_allow_full and campus_default in {"curated", "top1000_plus_custom"}:
+        return campus_default
+    return configured or DEFAULT_DISCOVERY_CONFIG.portset_mode
+
+
 def _build_discovery_config() -> DiscoveryConfig:
     return DiscoveryConfig(
         liveness_ports=_parse_port_csv(settings.DISCOVERY_LIVENESS_PORTS, DEFAULT_DISCOVERY_CONFIG.liveness_ports),
@@ -996,7 +1064,7 @@ def _build_discovery_config() -> DiscoveryConfig:
             settings.DISCOVERY_HIGH_BACKDOOR_PORTS,
             DEFAULT_DISCOVERY_CONFIG.high_backdoor_ports,
         ),
-        portset_mode=str(settings.DISCOVERY_PORTSET_MODE or DEFAULT_DISCOVERY_CONFIG.portset_mode),
+        portset_mode=_effective_discovery_portset_mode(),
         top_ports_limit=max(1, int(settings.DISCOVERY_TOP_PORTS_LIMIT)),
         enable_arp_discovery=bool(getattr(settings, "DISCOVERY_ENABLE_ARP_DISCOVERY", getattr(DEFAULT_DISCOVERY_CONFIG, "enable_arp_discovery", True))),
         enable_fping=bool(getattr(settings, "DISCOVERY_ENABLE_FPING", getattr(DEFAULT_DISCOVERY_CONFIG, "enable_fping", True))),
@@ -1239,6 +1307,10 @@ def _build_network_initial_snapshot(asset: Asset, host: dict[str, Any]) -> HostS
     hostname = _normalize_hostname(host.get("hostname")) or asset.hostname
     services = sanitize_json_value([item for item in host.get("services", []) if isinstance(item, dict)])
     summary_json, detail_json, collection_status = build_network_initial_snapshot(ip=ip, hostname=hostname, services=services)
+    assessment = resolve_asset_device_assessment(asset)
+    if assessment:
+        summary_json["device_assessment"] = assessment
+        detail_json["device_assessment"] = assessment
     return HostSnapshot(
         asset_id=asset.id,
         hostname=hostname,
@@ -1267,6 +1339,12 @@ def _build_network_initial_snapshot(asset: Asset, host: dict[str, Any]) -> HostS
     )
 
 
+def _apply_network_initial_asset_status(asset: Asset, snapshot: HostSnapshot) -> None:
+    status = str(snapshot.collection_status or "").strip().lower()
+    if status in {"success", "partial"}:
+        asset.status = AssetStatus.ONLINE
+
+
 def apply_runner_discovery_scan_result(job_id: str, scan_result: dict[str, Any]) -> dict[str, Any]:
     with SessionLocal() as db:
         job = db.get(DiscoveryJob, job_id)
@@ -1284,6 +1362,7 @@ def apply_runner_discovery_scan_result(job_id: str, scan_result: dict[str, Any])
             cidr=job.cidr,
             local_node_hints=local_node_hints,
         )
+        filtered_hosts = _annotate_discovery_hosts_with_device_assessment(filtered_hosts, cidr=job.cidr)
 
         summary = dict(job.summary_json or {}) if isinstance(job.summary_json, dict) else {}
         summary["host_count"] = len(filtered_hosts)
@@ -1351,6 +1430,7 @@ def apply_runner_discovery_scan_result(job_id: str, scan_result: dict[str, Any])
                 asset.status = AssetStatus.COLLECTING
                 asset.last_seen_at = datetime.now(timezone.utc)
             host_stats = _upsert_asset_ports(db, asset, host)
+            _apply_discovery_asset_labels(asset, host, cidr=job.cidr)
             _merge_port_scan_stats(reconciliation_stats, host_stats)
             product_identified_count += sum(
                 1
@@ -1360,6 +1440,7 @@ def apply_runner_discovery_scan_result(job_id: str, scan_result: dict[str, Any])
             snapshot = _build_network_initial_snapshot(asset, host)
             if snapshot is not None:
                 db.add(snapshot)
+                _apply_network_initial_asset_status(asset, snapshot)
                 network_initial_snapshot_count += 1
             db.add(asset)
 

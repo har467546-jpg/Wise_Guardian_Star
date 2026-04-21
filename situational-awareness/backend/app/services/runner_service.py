@@ -58,6 +58,8 @@ from app.services.remediation_business_service import (
     queue_remediation_reverify,
 )
 from app.services.remediation_evidence_service import build_remediation_evidence
+from app.services.campus_discovery_service import aggregate_campus_discovery_job, update_discovery_execution_from_task
+from app.services.campus_zone_service import get_scanner_zone, merge_zone_profile_with_defaults
 from app.tasks.task_runtime import append_current_task_event
 from app.db.session import SessionLocal
 
@@ -241,12 +243,20 @@ def serialize_host_runner(asset_id: str, host_runner: HostRunner | None) -> Host
     runtime_kind = None
     install_mode = None
     service_mode = None
+    node_role = None
+    scanner_zone_id = None
+    visible_cidrs_json: list[str] = []
+    max_concurrent_jobs = 1
     detected_os = None
     detected_arch = None
     compatibility_issues: list[str] = []
     if host_runner is not None:
         runner_id = host_runner.id
         version = host_runner.version
+        node_role = host_runner.node_role
+        scanner_zone_id = host_runner.scanner_zone_id
+        visible_cidrs_json = [str(item).strip() for item in (host_runner.visible_cidrs_json or []) if str(item).strip()]
+        max_concurrent_jobs = int(host_runner.max_concurrent_jobs or 1)
         platform_url = host_runner.platform_url
         last_seen_at = host_runner.last_seen_at.isoformat() if host_runner.last_seen_at else None
         last_error = host_runner.last_error
@@ -266,6 +276,10 @@ def serialize_host_runner(asset_id: str, host_runner: HostRunner | None) -> Host
         status=status,
         install_status=install_status,
         version=version,
+        node_role=node_role,
+        scanner_zone_id=scanner_zone_id,
+        visible_cidrs_json=visible_cidrs_json,
+        max_concurrent_jobs=max_concurrent_jobs,
         platform_url=platform_url,
         last_seen_at=last_seen_at,
         last_error=last_error,
@@ -283,11 +297,20 @@ def _runner_status_value(host_runner: HostRunner) -> str:
     raw_status = str(host_runner.status or "").strip().lower()
     if raw_status == "not_installed":
         return raw_status
-    if host_runner.last_seen_at is None:
+    last_seen_at = _coerce_utc_datetime(host_runner.last_seen_at)
+    if last_seen_at is None:
         return "offline" if raw_status in {"online", "busy"} else raw_status or "offline"
-    if datetime.now(timezone.utc) - host_runner.last_seen_at > timedelta(seconds=_runner_offline_grace_seconds()):
+    if datetime.now(timezone.utc) - last_seen_at > timedelta(seconds=_runner_offline_grace_seconds()):
         return "offline"
     return raw_status or "offline"
+
+
+def _coerce_utc_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def resolve_runner_by_asset(db: Session, asset_id: str) -> HostRunner | None:
@@ -351,7 +374,9 @@ def resolve_runner_by_asset_for_read(db: Session, asset_id: str) -> HostRunner |
             TaskExecutionStatus.RUNNING,
             TaskExecutionStatus.RETRY,
         }:
-            task_updated_at = latest_install_task.updated_at or latest_install_task.started_at or latest_install_task.created_at
+            task_updated_at = _coerce_utc_datetime(
+                latest_install_task.updated_at or latest_install_task.started_at or latest_install_task.created_at
+            )
             if (
                 task_updated_at is not None
                 and datetime.now(timezone.utc) - task_updated_at > timedelta(seconds=_runner_install_stale_seconds())
@@ -954,7 +979,10 @@ def _build_runner_asset_scan_config() -> dict[str, Any]:
         for item in str(getattr(settings, "DISCOVERY_HIGH_BACKDOOR_PORTS", "")).split(",")
         if str(item).strip().isdigit() and 1 <= int(str(item).strip()) <= 65535
     ]
-    portset_mode = str(getattr(settings, "DISCOVERY_PORTSET_MODE", "full") or "full").strip().lower() or "full"
+    portset_mode = str(getattr(settings, "DISCOVERY_PORTSET_MODE", "top1000_plus_custom") or "top1000_plus_custom").strip().lower() or "top1000_plus_custom"
+    campus_default_portset_mode = str(getattr(settings, "CAMPUS_DEFAULT_PORTSET_MODE", "top1000_plus_custom") or "top1000_plus_custom").strip().lower() or "top1000_plus_custom"
+    if portset_mode == "full" and not bool(getattr(settings, "CAMPUS_ALLOW_FULL_SCAN_DEFAULT", False)):
+        portset_mode = campus_default_portset_mode
     top_ports_limit = max(1, int(getattr(settings, "DISCOVERY_TOP_PORTS_LIMIT", 1000)))
     scan_ports = list(
         resolve_scan_ports(
@@ -977,7 +1005,7 @@ def _build_runner_asset_scan_config() -> dict[str, Any]:
         "nmap_min_rate": max(1, int(getattr(settings, "DISCOVERY_NMAP_MIN_RATE", 100000))),
         "nmap_liveness_timeout_seconds": max(1, int(getattr(settings, "DISCOVERY_NMAP_LIVENESS_TIMEOUT_SECONDS", 90))),
         "nmap_full_scan_timeout_seconds": max(1, int(getattr(settings, "DISCOVERY_NMAP_FULL_SCAN_TIMEOUT_SECONDS", 90))),
-        "nmap_version_intensity": max(0, int(getattr(settings, "DISCOVERY_NMAP_VERSION_INTENSITY", 7))),
+        "nmap_version_intensity": max(0, int(getattr(settings, "DISCOVERY_NMAP_VERSION_INTENSITY", 5))),
         "scan_ports": rendered_scan_ports,
         "portset_mode": portset_mode,
         "top_ports_limit": top_ports_limit,
@@ -992,7 +1020,7 @@ def _build_runner_asset_scan_assignment(
 ) -> tuple[RunnerTaskAssignmentRead, str] | None:
     result_json = task.result_json if isinstance(task.result_json, dict) else {}
     context = result_json.get("context") if isinstance(result_json.get("context"), dict) else {}
-    job_id = str(task.scope_id or context.get("job_id") or "").strip()
+    job_id = str(context.get("job_id") or task.scope_id or "").strip()
     if not job_id:
         return None
 
@@ -1002,8 +1030,15 @@ def _build_runner_asset_scan_assignment(
     if job is None:
         return None
 
-    scan_config = _build_runner_asset_scan_config()
-    summary = f"扫描网段 {job.cidr}"
+    zone = get_scanner_zone(
+        db,
+        str(context.get("scanner_zone_id") or "").strip()
+        or str(getattr(job, "scanner_zone_id", "") or "").strip()
+        or None,
+    )
+    scan_config = merge_zone_profile_with_defaults(zone, _build_runner_asset_scan_config())
+    target_cidr = str(context.get("target_cidr") or job.cidr).strip()
+    summary = f"扫描网段 {target_cidr}" if zone is None else f"分区 {zone.name} 扫描 {target_cidr}"
     assignment = RunnerTaskAssignmentRead(
         task_id=task.id,
         asset_id=runner.asset_id,
@@ -1012,13 +1047,14 @@ def _build_runner_asset_scan_assignment(
         summary=summary,
         execution_mode="apply",
         plan={
-            "cidr": str(job.cidr),
+            "cidr": target_cidr,
             "runner_asset_id": runner.asset_id,
+            "scanner_zone_id": str(context.get("scanner_zone_id") or "").strip() or getattr(job, "scanner_zone_id", None),
             "scan_config": scan_config,
         },
         steps=[],
     )
-    return assignment, _build_discovery_assignment_execution_script(task_id=task.id, cidr=str(job.cidr), scan_config=scan_config)
+    return assignment, _build_discovery_assignment_execution_script(task_id=task.id, cidr=target_cidr, scan_config=scan_config)
 
 
 def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1) -> RunnerPollResponse:
@@ -1062,6 +1098,14 @@ def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1)
                 progress=task.progress,
                 payload_json={"runner_id": runner.id},
             )
+            if task.scope_type in {"discovery_job", "discovery_execution"}:
+                update_discovery_execution_from_task(
+                    db,
+                    task_id=task.id,
+                    status="running",
+                    progress=max(5, task.progress),
+                    summary_json=result_json,
+                )
             if task.scope_type == "discovery_job" and task.scope_id:
                 from app.db.models.discovery_job import DiscoveryJob
 
@@ -1108,6 +1152,7 @@ def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1)
                     title=str(step.get("title") or step.get("step_id") or ""),
                     action_type=str(step.get("action_type") or ""),
                     generated_command=str(step.get("generated_command") or "").strip() or None,
+                    rollback_command=str(step.get("rollback_command") or "").strip() or None,
                     execution_state="blocked" if str(step.get("execution_state") or "").strip().lower() == "blocked" else "ready",
                     blocked_reason=str(step.get("blocked_reason") or "").strip() or None,
                     backup_plan=step.get("backup_plan"),
@@ -1211,6 +1256,14 @@ def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload:
         execution["step_results"] = [item.model_dump(mode="json") for item in payload.step_results]
     backups = dict(payload.backups or execution.get("backup_map") or {})
     step_results = execution.get("step_results") if isinstance(execution.get("step_results"), list) else []
+    rollback_artifacts = {
+        str(item.get("step_id") or "").strip(): dict(item.get("rollback_artifact") or {})
+        for item in step_results
+        if isinstance(item, dict)
+        and str(item.get("step_id") or "").strip()
+        and isinstance(item.get("rollback_artifact"), dict)
+        and item.get("rollback_artifact")
+    }
     success_count = int(execution.get("success_count") or 0)
     if step_results and success_count <= 0:
         success_count = sum(1 for item in step_results if isinstance(item, dict) and str(item.get("status") or "").strip() == "success")
@@ -1274,13 +1327,14 @@ def complete_runner_task(db: Session, runner: HostRunner, task_id: str, payload:
         business_status = BUSINESS_STATUS_PENDING_REVERIFY
     else:
         overall_status = "applied"
-        final_message = payload.message or "Host Runner 已完成整机修复计划"
+        final_message = payload.message or "Host Runner 已完成当前阶段执行"
         execution_status = EXECUTION_STATUS_SUCCEEDED
         business_status = None
     execution["execution_mode"] = execution_mode
     execution["overall_status"] = overall_status
     execution["final_message"] = final_message
     execution["execution_status"] = execution_status
+    execution["rollback_artifacts"] = rollback_artifacts
     if business_status:
         execution["business_status"] = business_status
     result_json["evidence"] = build_remediation_evidence(
@@ -1370,7 +1424,7 @@ def _complete_runner_asset_scan_task(
     execution["execution_boundary"] = "runner_dispatch"
     scan_result = execution.get("scan_result") if isinstance(execution.get("scan_result"), dict) else {}
     context = result_json.get("context") if isinstance(result_json.get("context"), dict) else {}
-    job_id = str(task.scope_id or context.get("job_id") or "").strip()
+    job_id = str(context.get("job_id") or task.scope_id or "").strip()
     scan_summary = {
         "host_count": int(scan_result.get("host_count") or len(scan_result.get("hosts") or []))
         if isinstance(scan_result.get("hosts"), list)
@@ -1387,14 +1441,47 @@ def _complete_runner_asset_scan_task(
     }
 
     if payload.status == "success" and job_id and scan_result:
-        from app.tasks.discovery_tasks import apply_runner_discovery_scan_result
+        if task.scope_type == "discovery_execution":
+            execution_summary = {
+                "scan_result": scan_result,
+                "scan_summary": scan_summary,
+                "context": context,
+            }
+            update_discovery_execution_from_task(
+                db,
+                task_id=task.id,
+                status="success",
+                progress=100,
+                summary_json=execution_summary,
+            )
+            aggregated = aggregate_campus_discovery_job(db, job_id=job_id)
+            if aggregated:
+                scan_summary = {
+                    "host_count": int(aggregated.get("host_count") or 0),
+                    "open_port_count": int((aggregated.get("port_scan_stats") or {}).get("open_port_count") or 0)
+                    if isinstance(aggregated.get("port_scan_stats"), dict)
+                    else 0,
+                    "source_stats": aggregated.get("discovery_source_stats") if isinstance(aggregated.get("discovery_source_stats"), dict) else {},
+                }
+        else:
+            from app.tasks.discovery_tasks import apply_runner_discovery_scan_result
 
-        scan_summary = apply_runner_discovery_scan_result(job_id, scan_result)
+            scan_summary = apply_runner_discovery_scan_result(job_id, scan_result)
         final_status = TaskExecutionStatus.SUCCESS
         final_message = payload.message or "扫描节点已完成多源资产发现"
     else:
         final_status = TaskExecutionStatus.FAILURE
         final_message = payload.message or "扫描节点执行发现任务失败"
+        if task.scope_type == "discovery_execution":
+            update_discovery_execution_from_task(
+                db,
+                task_id=task.id,
+                status="failure",
+                progress=100,
+                summary_json={"scan_result": scan_result, "context": context},
+                error_json={"message": final_message},
+            )
+            aggregate_campus_discovery_job(db, job_id=job_id)
         if job_id:
             from app.db.models.discovery_job import DiscoveryJob
 
@@ -1638,6 +1725,8 @@ def _build_assignment_execution_script(*, task_id: str, summary: str, steps: lis
         '      if [ -n "$stat_value" ]; then',
         '        item_value="${target}|${stat_value}"',
         "      fi",
+        '    elif [ "$backup_kind" = "package_context" ]; then',
+        '      item_value="$(capture_package_context_raw "$target" 2>/dev/null || true)"',
         "    fi",
         '    if [ -n "$item_value" ]; then',
         '      item_json="$(json_quote "$item_value")"',
@@ -1652,6 +1741,91 @@ def _build_assignment_execution_script(*, task_id: str, summary: str, steps: lis
         '  printf \'[%s]\' "$json_items"',
         "}",
         "",
+        'capture_package_context_raw() {',
+        '  target="${1:-}"',
+        '  manager="${target%%:*}"',
+        '  package_name="${target#*:}"',
+        '  if [ "$package_name" = "$target" ]; then',
+        '    package_name="$target"',
+        '    manager=""',
+        "  fi",
+        '  if [ -z "$package_name" ]; then',
+        "    return 1",
+        "  fi",
+        '  if [ "$manager" = "dpkg" ]; then',
+        '    if dpkg-query -W -f=\'dpkg|${binary:Package}|${Version}|${Architecture}|${Status}\\n\' "$package_name" 2>/dev/null; then',
+        "      return 0",
+        "    fi",
+        '    printf \'dpkg|%s|not-installed|||\\n\' "$package_name"',
+        "    return 0",
+        "  fi",
+        '  if [ "$manager" = "rpm" ]; then',
+        '    if rpm -q --queryformat \'rpm|%{NAME}|%{EPOCHNUM}:%{VERSION}-%{RELEASE}|%{ARCH}|installed\\n\' "$package_name" 2>/dev/null; then',
+        "      return 0",
+        "    fi",
+        '    printf \'rpm|%s|not-installed|||\\n\' "$package_name"',
+        "    return 0",
+        "  fi",
+        '  if [ "$manager" = "apk" ]; then',
+        '    if apk info -e "$package_name" >/dev/null 2>&1; then',
+        '      version="$(apk info -v "$package_name" 2>/dev/null | head -n 1)"',
+        '      printf \'apk|%s|%s|||\\n\' "$package_name" "$version"',
+        "      return 0",
+        "    fi",
+        '    printf \'apk|%s|not-installed|||\\n\' "$package_name"',
+        "    return 0",
+        "  fi",
+        '  printf \'unknown|%s|unresolved|||\\n\' "$package_name"',
+        "}",
+        "",
+        'package_context_json_from_raw() {',
+        '  raw="${1:-}"',
+        '  if [ -z "$raw" ]; then',
+        "    printf 'null'",
+        "    return 0",
+        "  fi",
+        '  manager="$(printf "%s" "$raw" | cut -d"|" -f1)"',
+        '  package_name="$(printf "%s" "$raw" | cut -d"|" -f2)"',
+        '  version="$(printf "%s" "$raw" | cut -d"|" -f3)"',
+        '  arch="$(printf "%s" "$raw" | cut -d"|" -f4)"',
+        '  state="$(printf "%s" "$raw" | cut -d"|" -f5-)"',
+        '  installed_json="false"',
+        '  if [ -n "$version" ] && [ "$version" != "not-installed" ] && [ "$version" != "unresolved" ]; then',
+        '    installed_json="true"',
+        "  fi",
+        '  printf \'{"manager":%s,"package_name":%s,"version":%s,"arch":%s,"state":%s,"installed":%s}\' "$(json_quote "$manager")" "$(json_quote "$package_name")" "$(json_string_or_null "$version")" "$(json_string_or_null "$arch")" "$(json_string_or_null "$state")" "$installed_json"',
+        "}",
+        "",
+        'extract_transaction_id_from_file() {',
+        '  file_path="${1:-}"',
+        '  if [ ! -f "$file_path" ]; then',
+        "    return 0",
+        "  fi",
+        '  grep -E "SA_TRANSACTION_ID=|Transaction ID[[:space:]]*:" "$file_path" 2>/dev/null | tail -n 1 | sed -e \'s/^.*SA_TRANSACTION_ID=//\' -e \'s/^.*Transaction ID[[:space:]]*:[[:space:]]*//\'',
+        "}",
+        "",
+        'build_package_rollback_artifact_json() {',
+        '  target="${1:-}"',
+        '  before_raw="${2:-}"',
+        '  rollback_command="${3:-}"',
+        '  output_file="${4:-}"',
+        '  if [ -z "$target" ] || [ -z "$before_raw" ] || [ -z "$rollback_command" ]; then',
+        "    printf 'null'",
+        "    return 0",
+        "  fi",
+        '  manager="${target%%:*}"',
+        '  package_name="${target#*:}"',
+        '  if [ "$package_name" = "$target" ]; then',
+        '    package_name="$target"',
+        "  fi",
+        '  rollback_version="$(printf "%s" "$before_raw" | cut -d"|" -f3)"',
+        '  transaction_id="$(extract_transaction_id_from_file "$output_file")"',
+        '  after_raw="$(capture_package_context_raw "$target" 2>/dev/null || true)"',
+        '  before_json="$(package_context_json_from_raw "$before_raw")"',
+        '  after_json="$(package_context_json_from_raw "$after_raw")"',
+        '  printf \'{"kind":"package_version_replay","package_name":%s,"manager":%s,"rollback_version":%s,"rollback_command":%s,"transaction_id":%s,"before":%s,"after":%s}\' "$(json_quote "$package_name")" "$(json_string_or_null "$manager")" "$(json_string_or_null "$rollback_version")" "$(json_string_or_null "$rollback_command")" "$(json_string_or_null "$transaction_id")" "$before_json" "$after_json"',
+        "}",
+        "",
         'run_step() {',
         '  index="$1"',
         '  total="$2"',
@@ -1662,18 +1836,37 @@ def _build_assignment_execution_script(*, task_id: str, summary: str, steps: lis
         '  blocked_reason_b64="$7"',
         '  backup_kind="${8:-}"',
         '  backup_targets_b64="${9:-}"',
+        '  rollback_command_b64="${10:-}"',
         '  step_id="$(decode_b64 "$step_id_b64" 2>/dev/null || true)"',
         '  title="$(decode_b64 "$title_b64" 2>/dev/null || true)"',
         '  command_text="$(decode_b64 "$command_b64" 2>/dev/null || true)"',
         '  blocked_reason="$(decode_b64 "$blocked_reason_b64" 2>/dev/null || true)"',
+        '  rollback_command="$(decode_b64 "$rollback_command_b64" 2>/dev/null || true)"',
         '  if [ "$execution_state" = "blocked" ]; then',
-        '    result_json=$(printf \'{"step_id":%s,"title":%s,"status":"blocked","generated_command":null,"exit_status":null,"backup_paths":[],"output_tail":[],"started_at":null,"finished_at":null,"error":%s}\' "$(json_quote "$step_id")" "$(json_quote "$title")" "$(json_string_or_null "$blocked_reason")")',
+        '    result_json=$(printf \'{"step_id":%s,"title":%s,"status":"blocked","generated_command":null,"rollback_command":%s,"rollback_artifact":{},"exit_status":null,"backup_paths":[],"output_tail":[],"started_at":null,"finished_at":null,"error":%s}\' "$(json_quote "$step_id")" "$(json_quote "$title")" "$(json_string_or_null "$rollback_command")" "$(json_string_or_null "$blocked_reason")")',
         '    append_step_result "$result_json"',
         "    return 0",
         "  fi",
         '  EXECUTED_COUNT=$((EXECUTED_COUNT + 1))',
         '  progress_value=$((10 + (index * 70 / total)))',
         '  emit_stage "stage" "execute_steps" "Runner 执行步骤" "$title" "$progress_value" "{}"',
+        '  package_context_target=""',
+        '  package_context_before=""',
+        '  if [ "$backup_kind" = "package_context" ]; then',
+        '    targets_content="$(decode_b64 "$backup_targets_b64" 2>/dev/null || true)"',
+        '    old_ifs="$IFS"',
+        "    IFS='",
+        "'",
+        '    for target in $targets_content; do',
+        '      [ -n "$target" ] || continue',
+        '      package_context_target="$target"',
+        "      break",
+        "    done",
+        '    IFS="$old_ifs"',
+        '    if [ -n "$package_context_target" ]; then',
+        '      package_context_before="$(capture_package_context_raw "$package_context_target" 2>/dev/null || true)"',
+        "    fi",
+        "  fi",
         '  backup_paths_json="$(build_backup_paths_json "$backup_kind" "$backup_targets_b64")"',
         '  output_file="$(mktemp)"',
         '  started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"',
@@ -1709,7 +1902,14 @@ def _build_assignment_execution_script(*, task_id: str, summary: str, steps: lis
         '    fi',
         "  fi",
         '  output_tail_json="$(json_array_from_file_tail "$output_file")"',
-        '  result_json=$(printf \'{"step_id":%s,"title":%s,"status":%s,"generated_command":%s,"exit_status":%s,"backup_paths":%s,"output_tail":%s,"started_at":%s,"finished_at":%s,"error":%s}\' "$(json_quote "$step_id")" "$(json_quote "$title")" "$(json_quote "$step_status")" "$(json_string_or_null "$command_text")" "$exit_code" "$backup_paths_json" "$output_tail_json" "$(json_quote "$started_at")" "$(json_quote "$finished_at")" "$(json_string_or_null "$error_text")")',
+        '  rollback_artifact_json="{}"',
+        '  if [ -n "$package_context_target" ] && [ -n "$package_context_before" ] && [ -n "$rollback_command" ]; then',
+        '    rollback_artifact_json="$(build_package_rollback_artifact_json "$package_context_target" "$package_context_before" "$rollback_command" "$output_file")"',
+        '    if [ -z "$rollback_artifact_json" ] || [ "$rollback_artifact_json" = "null" ]; then',
+        '      rollback_artifact_json="{}"',
+        "    fi",
+        "  fi",
+        '  result_json=$(printf \'{"step_id":%s,"title":%s,"status":%s,"generated_command":%s,"rollback_command":%s,"rollback_artifact":%s,"exit_status":%s,"backup_paths":%s,"output_tail":%s,"started_at":%s,"finished_at":%s,"error":%s}\' "$(json_quote "$step_id")" "$(json_quote "$title")" "$(json_quote "$step_status")" "$(json_string_or_null "$command_text")" "$(json_string_or_null "$rollback_command")" "$rollback_artifact_json" "$exit_code" "$backup_paths_json" "$output_tail_json" "$(json_quote "$started_at")" "$(json_quote "$finished_at")" "$(json_string_or_null "$error_text")")',
         '  append_step_result "$result_json"',
         '  if [ "$step_status" != "success" ]; then',
         '    LAST_FAILURE_TITLE="$title"',
@@ -1753,6 +1953,7 @@ def _build_assignment_execution_script(*, task_id: str, summary: str, steps: lis
                     shlex.quote(_b64_encode_text(step.blocked_reason or "")),
                     shlex.quote(backup_kind),
                     shlex.quote(_b64_encode_text("\n".join(backup_targets))),
+                    shlex.quote(_b64_encode_text(step.rollback_command or "")),
                 ]
             )
             + " || break"

@@ -8,6 +8,7 @@ from app.db.models.user import User
 from app.repositories.asset_repo import batch_delete_assets, delete_asset, get_asset, list_assets, replace_asset_tags
 from app.schemas.asset import AssetBatchDeleteRequest, AssetBatchDeleteResponse, AssetListResponse, AssetRead, AssetUpdate
 from app.schemas.common import PageMeta
+from app.services.device_assessment_service import resolve_asset_device_assessment
 from app.utils.local_asset import resolve_local_asset
 
 router = APIRouter()
@@ -15,6 +16,7 @@ router = APIRouter()
 
 def _build_asset_read(asset: Asset) -> AssetRead:
     payload = AssetRead.model_validate(asset).model_dump()
+    payload["device_assessment_json"] = resolve_asset_device_assessment(asset) or {}
     is_local, local_hint = resolve_local_asset(str(asset.ip), asset.hostname)
     payload["is_local"] = is_local
     payload["local_hint"] = local_hint
@@ -28,6 +30,8 @@ def get_assets(
     ip: str | None = None,
     keyword: str | None = Query(default=None, description="IP/hostname/OS fuzzy search"),
     asset_status: AssetStatus | None = Query(default=None, alias="status"),
+    network_zone: str | None = Query(default=None),
+    asset_category: str | None = Query(default=None),
     tag_id: str | None = None,
     db: Session = Depends(get_db_session),
     _: User = Depends(get_current_user),
@@ -40,6 +44,8 @@ def get_assets(
         keyword=keyword,
         asset_status=asset_status,
         tag_id=tag_id,
+        network_zone=network_zone,
+        asset_category=asset_category,
     )
     return AssetListResponse(
         items=[_build_asset_read(item) for item in items],

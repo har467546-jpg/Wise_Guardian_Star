@@ -12,6 +12,7 @@ from app.services.remediation_service import (
     _build_comment_out_regex_command,
     _build_docker_remove_tcp_listener_command,
     _build_ini_section_directive_command,
+    _build_package_rollback_command,
     _build_package_upgrade_command,
     _build_replace_or_append_command,
     _build_service_control_command,
@@ -90,7 +91,49 @@ def test_samba_remove_exposure_step_is_renderable_with_default_config_path() -> 
     assert step.risk_level == "medium"
     assert step.dry_run_supported is True
     assert step.rollback_supported is True
+    assert step.apply_supported is False
+    assert "默认配置路径" in (step.apply_blocked_reason or "")
     assert step.adapter_id == "linux.exposure.remove"
+
+
+def test_apache_remove_exposure_filters_runtime_backup_paths_from_snapshot_context() -> None:
+    planner = RemediationCommandPlanner(
+        finding=_build_finding(rule_id="apache.directory_listing.enabled", service_name="apache"),
+        rendered_template={
+            "actions": [
+                {
+                    "action_type": "remove_exposure",
+                    "title": "关闭 Apache 目录浏览",
+                    "params": {
+                        "service_name": "apache",
+                        "config_key": "directory_listing_enabled",
+                        "rule_id": "apache.directory_listing.enabled",
+                    },
+                }
+            ]
+        },
+        snapshot=None,
+        credential=None,
+        snapshot_context={
+            "config_by_service": {
+                "apache": {
+                    "source_files": [
+                        "/etc/apache2/sites-enabled/000-default.conf.bak.sa.20260421074824",
+                    ],
+                }
+            },
+            "host_checks": {},
+            "packages": [],
+        },
+    )
+
+    step = planner.build_steps()[0]
+
+    assert step.execution_state == "ready"
+    assert "/etc/apache2/sites-enabled/000-default.conf.bak.sa.20260421074824" not in (step.generated_command or "")
+    assert "/etc/apache2/apache2.conf" in (step.generated_command or "")
+    assert step.apply_supported is False
+    assert "默认配置路径" in (step.apply_blocked_reason or "")
 
 
 def test_samba_guest_access_remove_exposure_step_is_renderable() -> None:
@@ -666,7 +709,118 @@ def test_upgrade_package_step_keeps_target_service_metadata() -> None:
     assert step.execution_state == "ready"
     assert "apt-get install -y" in (step.generated_command or "")
     assert "openssh-server" in (step.generated_command or "")
+    assert step.backup_plan is not None
+    assert step.backup_plan.targets == ["dpkg:openssh-server"]
+    assert step.rollback_supported is True
+    assert step.rollback_command is not None
+    assert "openssh-server=1:8.9p1-3" in (step.rollback_command or "")
     assert step.target_services == ["ssh"]
+
+
+def test_upgrade_package_step_resolves_fixed_version_from_host_os_context() -> None:
+    planner = RemediationCommandPlanner(
+        finding=_build_finding(rule_id="sudo.package.outdated", service_name="sudo"),
+        rendered_template={
+            "actions": [
+                {
+                    "action_type": "upgrade_package",
+                    "title": "升级 sudo 软件包",
+                    "params": {
+                        "service_name": "sudo",
+                        "package_name": "sudo",
+                        "package_manager": "dpkg",
+                        "fixed_versions": {"ubuntu": {"20.04": "1.8.31-1ubuntu1.2"}},
+                    },
+                }
+            ]
+        },
+        snapshot=None,
+        credential=None,
+        snapshot_context={
+            "os_release": "Ubuntu 20.04.6 LTS",
+            "config_by_service": {},
+            "host_checks": {},
+            "packages": [{"name": "sudo", "manager": "dpkg", "version": "1:1.8.31-1ubuntu1.1"}],
+        },
+    )
+
+    step = planner.build_steps()[0]
+
+    assert step.execution_state == "ready"
+    assert step.apply_supported is True
+    assert "sudo=1.8.31-1ubuntu1.2" in (step.generated_command or "")
+    assert step.rollback_supported is True
+    assert "sudo=1:1.8.31-1ubuntu1.1" in (step.rollback_command or "")
+
+
+def test_upgrade_package_step_is_preview_only_without_resolved_fixed_version() -> None:
+    planner = RemediationCommandPlanner(
+        finding=_build_finding(rule_id="sudo.package.outdated", service_name="sudo"),
+        rendered_template={
+            "actions": [
+                {
+                    "action_type": "upgrade_package",
+                    "title": "升级 sudo 软件包",
+                    "params": {
+                        "service_name": "sudo",
+                        "package_name": "sudo",
+                        "package_manager": "dpkg",
+                        "fixed_versions": {"ubuntu": {"20.04": "1.8.31-1ubuntu1.2"}},
+                    },
+                }
+            ]
+        },
+        snapshot=None,
+        credential=None,
+        snapshot_context={
+            "config_by_service": {},
+            "host_checks": {},
+            "packages": [{"name": "sudo", "manager": "dpkg", "version": "1:1.8.31-1ubuntu1.1"}],
+        },
+    )
+
+    step = planner.build_steps()[0]
+
+    assert step.execution_state == "ready"
+    assert step.apply_supported is False
+    assert "发行版修复版本" in (step.apply_blocked_reason or "")
+
+
+def test_upgrade_package_step_allows_rpm_apply_with_resolved_fixed_version() -> None:
+    planner = RemediationCommandPlanner(
+        finding=_build_finding(rule_id="ssh.openssh.rpm.outdated", service_name="ssh"),
+        rendered_template={
+            "actions": [
+                {
+                    "action_type": "upgrade_package",
+                    "title": "升级 openssh-server 软件包",
+                    "params": {
+                        "service_name": "ssh",
+                        "package_name": "openssh-server",
+                        "package_manager": "rpm",
+                        "fixed_versions": {"rocky": {"9": "1:8.7p1-40.el9"}},
+                    },
+                }
+            ]
+        },
+        snapshot=None,
+        credential=None,
+        snapshot_context={
+            "os_release": "Rocky Linux 9.4",
+            "config_by_service": {},
+            "host_checks": {},
+            "packages": [{"name": "openssh-server", "manager": "rpm", "version": "1:8.7p1-38.el9"}],
+        },
+    )
+
+    step = planner.build_steps()[0]
+
+    assert step.execution_state == "ready"
+    assert step.apply_supported is True
+    assert step.rollback_supported is True
+    assert "SA_ROLLBACK_VERSION=1:8.7p1-38.el9" in (step.rollback_command or "")
+    assert "SA_FIXED_VERSION=1:8.7p1-40.el9" in (step.generated_command or "")
+    assert 'SA_PACKAGE_TOKEN="${SA_PACKAGE_NAME}-${SA_FIXED_VERSION}"' in (step.generated_command or "")
 
 
 def test_legacy_debian_upgrade_package_step_uses_family_candidates() -> None:
@@ -888,6 +1042,65 @@ def test_package_upgrade_command_for_dpkg_is_noninteractive_and_preserves_conffi
     assert "export NEEDRESTART_MODE=a" in command
     assert "Dpkg::Options::=--force-confdef" in command
     assert "Dpkg::Options::=--force-confold" in command
+
+
+def test_package_upgrade_command_for_rpm_can_pin_fixed_version() -> None:
+    command = _build_package_upgrade_command(
+        manager="rpm",
+        package_name="openssh-server",
+        fixed_version="1:8.7p1-40.el9",
+    )
+
+    assert 'SA_PACKAGE_NAME=openssh-server' in command
+    assert "SA_FIXED_VERSION=1:8.7p1-40.el9" in command
+    assert 'dnf install -y "$SA_PACKAGE_TOKEN"' in command
+    assert 'yum install -y "$SA_PACKAGE_TOKEN"' in command
+    assert 'rpm -q --queryformat "%{EPOCHNUM}:%{VERSION}-%{RELEASE}" "$SA_PACKAGE_NAME"' in command
+    assert "rpm 精确版本校验失败" in command
+
+
+def test_package_rollback_command_for_dpkg_uses_exact_version() -> None:
+    command = _build_package_rollback_command(
+        manager="dpkg",
+        package_name="openssh-server",
+        rollback_version="1:8.9p1-3",
+    )
+
+    assert command is not None
+    assert "apt-get update" in command
+    assert "openssh-server=1:8.9p1-3" in command
+
+
+def test_package_rollback_command_for_rpm_uses_exact_version_and_verifies_result() -> None:
+    command = _build_package_rollback_command(
+        manager="rpm",
+        package_name="openssh-server",
+        rollback_version="1:8.7p1-38.el9",
+    )
+
+    assert command is not None
+    assert "SA_ROLLBACK_VERSION=1:8.7p1-38.el9" in command
+    assert 'dnf downgrade -y "$SA_PACKAGE_TOKEN"' in command
+    assert 'yum downgrade -y "$SA_PACKAGE_TOKEN"' in command
+    assert "rpm 回滚版本校验失败" in command
+
+
+def test_select_executable_plan_steps_rejects_preview_only_step_for_apply() -> None:
+    preview_only_step = RemediationPlanStepRead(
+        step_id="step-1",
+        action_type="set_config",
+        title="关闭 SSH 密码登录",
+        supported=True,
+        execution_state="ready",
+        generated_command="echo preview",
+        requires_confirmation=True,
+        render_reason="preview only",
+        apply_supported=False,
+        apply_blocked_reason="当前仅支持预演",
+    )
+
+    with pytest.raises(RuntimeError, match="当前仅支持预演"):
+        select_executable_plan_steps([preview_only_step], require_apply_supported=True)
 
 
 def test_sudo_self_lock_step_is_blocked_for_sudo_chain() -> None:

@@ -8920,7 +8920,7 @@ rules:
   enabled: true
   service: sudo
   severity: critical
-  description: 已授权主机检查发现当前 Debian/Ubuntu 主机上的 sudo 软件包版本低于官方修复版本，存在 Baron Samedit 本地提权暴露面。
+  description: 已授权主机检查发现当前 Debian/Ubuntu 主机上的 sudo 软件包版本低于发行版修复版本；对已停止支持的旧版发行版，按 sudo 上游 1.8.32 修复基线判定 Baron Samedit 本地提权暴露面。
   match:
     package:
       manager: dpkg
@@ -8928,6 +8928,7 @@ rules:
       compare: lt_fixed
       fixed_versions:
         ubuntu:
+          '8.04': '1.8.32'
           '16.04': 1.8.16-0ubuntu1.10
           '18.04': 1.8.21p2-3ubuntu1.4
           '20.04': 1.8.31-1ubuntu1.2
@@ -8937,7 +8938,7 @@ rules:
           '11': 1.9.5p2-3+deb11u1
   cve_ids:
   - CVE-2021-3156
-  affected_versions_text: Debian/Ubuntu 官方公告中低于修复版本的 sudo 软件包
+  affected_versions_text: Debian/Ubuntu 发行版修复版本以下的 sudo 软件包；对已停止支持的旧版发行版，按上游 sudo 1.8.32 修复基线判定
   preconditions:
   - 确认目标主机已识别软件包管理器，并记录当前版本与回滚版本。
   - 确认当前处于可接受的业务维护窗口，并已准备配置或路径备份。
@@ -8946,6 +8947,7 @@ rules:
   - 对照官方公告确认该版本是否已纳入修复。
   mitigations:
   - 将 sudo 升级到发行版公告中的修复版本或更高版本。
+  - 对已停止支持的旧版 Debian/Ubuntu，优先升级到仍受支持的发行版或切换到受支持的软件包来源。
   - 对高风险主机优先收敛本地普通账号和 sudo 暴露面。
   remediation:
     summary: 升级 sudo 软件包到发行版修复版本

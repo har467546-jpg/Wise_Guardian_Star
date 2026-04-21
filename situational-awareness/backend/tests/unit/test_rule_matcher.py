@@ -155,7 +155,7 @@ def test_rule_matcher_matches_distro_aware_package_conditions() -> None:
                 name="sudo",
                 compare="lt_fixed",
                 fixed_versions={
-                    "ubuntu": {"20.04": "1.8.31-1ubuntu1.2"},
+                    "ubuntu": {"8.04": "1.8.32", "20.04": "1.8.31-1ubuntu1.2"},
                     "debian": {"11": "1.9.5p2-3+deb11u1"},
                 },
             ),
@@ -193,6 +193,40 @@ def test_rule_matcher_matches_distro_aware_package_conditions() -> None:
     assert missed == []
 
 
+def test_rule_matcher_matches_legacy_ubuntu_package_condition_against_upstream_floor() -> None:
+    rules = [
+        RuleDefinition(
+            rule_id="sudo.baron_samedit.cve_2021_3156.exposed",
+            enabled=True,
+            service="sudo",
+            severity="critical",
+            description="sudo vulnerable on ubuntu 8.04",
+            package_conditions=PackageMatchDefinition(
+                manager="dpkg",
+                name="sudo",
+                compare="lt_fixed",
+                fixed_versions={"ubuntu": {"8.04": "1.8.32"}},
+            ),
+        )
+    ]
+
+    matched = RuleMatcher.match(
+        RuleInput(
+            service="sudo",
+            package={
+                "manager": "dpkg",
+                "name": "sudo",
+                "version": "1:1.6.9p10-1ubuntu3",
+                "distro": "ubuntu",
+                "release": "8.04",
+            },
+        ),
+        rules,
+    )
+
+    assert [item.rule_id for item in matched] == ["sudo.baron_samedit.cve_2021_3156.exposed"]
+
+
 def test_rule_matcher_skips_package_match_without_release_context() -> None:
     rules = [
         RuleDefinition(
@@ -225,3 +259,51 @@ def test_rule_matcher_skips_package_match_without_release_context() -> None:
     )
 
     assert matches == []
+
+
+def test_rule_matcher_matches_rpm_package_conditions() -> None:
+    rules = [
+        RuleDefinition(
+            rule_id="ssh.openssh.rpm.outdated",
+            enabled=True,
+            service="ssh",
+            severity="high",
+            description="openssh vulnerable on rocky 9",
+            package_conditions=PackageMatchDefinition(
+                manager="rpm",
+                name="openssh-server",
+                compare="lt_fixed",
+                fixed_versions={"rocky": {"9": "1:8.7p1-40.el9"}},
+            ),
+        )
+    ]
+
+    matched = RuleMatcher.match(
+        RuleInput(
+            service="ssh",
+            package={
+                "manager": "dnf",
+                "name": "openssh-server",
+                "version": "1:8.7p1-38.el9",
+                "distro": "Rocky Linux",
+                "release": "9",
+            },
+        ),
+        rules,
+    )
+    missed = RuleMatcher.match(
+        RuleInput(
+            service="ssh",
+            package={
+                "manager": "rpm",
+                "name": "openssh-server",
+                "version": "1:8.7p1-40.el9",
+                "distro": "rocky",
+                "release": "9",
+            },
+        ),
+        rules,
+    )
+
+    assert [item.rule_id for item in matched] == ["ssh.openssh.rpm.outdated"]
+    assert missed == []

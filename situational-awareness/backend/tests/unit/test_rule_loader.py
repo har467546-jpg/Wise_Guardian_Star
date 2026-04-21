@@ -306,6 +306,37 @@ def test_rule_loader_accepts_package_match_conditions(tmp_path) -> None:
     assert ruleset.rules[0].package_conditions.fixed_versions["ubuntu"]["20.04"] == "1.8.31-1ubuntu1.2"
 
 
+def test_rule_loader_accepts_rpm_package_match_conditions(tmp_path) -> None:
+    path = tmp_path / "risk_rules.yaml"
+    path.write_text(
+        """rules:
+  - id: ssh.openssh.rpm.outdated
+    name: OpenSSH RPM outdated
+    enabled: true
+    service: ssh
+    severity: high
+    description: openssh rpm vulnerable
+    match:
+      package:
+        manager: dnf
+        name: openssh-server
+        compare: lt_fixed
+        fixed_versions:
+          Rocky Linux:
+            "9": "1:8.7p1-40.el9"
+""",
+        encoding="utf-8",
+    )
+
+    loader = RuleLoader(path)
+    ruleset = loader.load(force=True)
+
+    assert ruleset.last_error is None
+    assert ruleset.rules[0].package_conditions is not None
+    assert ruleset.rules[0].package_conditions.manager == "rpm"
+    assert ruleset.rules[0].package_conditions.fixed_versions["rocky"]["9"] == "1:8.7p1-40.el9"
+
+
 def test_rule_loader_accepts_remediation_definition(tmp_path) -> None:
     path = tmp_path / "risk_rules.yaml"
     path.write_text(VALID_REMEDIATION_RULES, encoding="utf-8")

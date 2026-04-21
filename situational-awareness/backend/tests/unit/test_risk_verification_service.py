@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from app.db.models.asset import Asset, AssetPort
+from app.db.models.enums import FindingStatus, RiskSeverity
+from app.db.models.risk_finding import RiskFinding
 from app.db.models.snapshot import HostSnapshot
 from app.rules.rule_engine import RuleEngine
 from app.services.risk_verification_service import RiskVerificationService
 from app.verifiers.base import VerificationResult
+
+
+@pytest.fixture(autouse=True)
+def _stub_device_alert_publish(monkeypatch):
+    monkeypatch.setattr("app.services.risk_verification_service.publish_device_abnormal_alert", lambda event: None)
 
 
 class _FakeDB:
@@ -71,7 +80,37 @@ def _build_asset(
         )
     ]
     asset.snapshots = [snapshot]
+    asset.findings = []
     return asset
+
+
+def _existing_finding(
+    *,
+    rule_id: str,
+    asset_id: str = "asset-1",
+    asset_port_id: str = "port-1",
+    title: str = "existing finding",
+    severity: RiskSeverity = RiskSeverity.CRITICAL,
+) -> RiskFinding:
+    return RiskFinding(
+        id="finding-existing-1",
+        asset_id=asset_id,
+        asset_port_id=asset_port_id,
+        yaml_rule_id=rule_id,
+        severity=severity,
+        status=FindingStatus.OPEN,
+        title=title,
+        description="existing description",
+        evidence_json={
+            "yaml_rule_id": rule_id,
+            "evidence_scope": "network",
+            "match_source": "active_only",
+            "verification_status": "confirmed",
+            "verification_summary": "历史确认",
+            "service_name": "vsftpd",
+            "port": 21,
+        },
+    )
 
 
 def test_risk_verification_service_confirms_on_passive_match(tmp_path, monkeypatch) -> None:
@@ -112,7 +151,7 @@ def test_risk_verification_service_confirms_on_passive_match(tmp_path, monkeypat
     assert db.added[0].evidence_json["match_source"] == "active"
 
 
-def test_risk_verification_service_skips_rejected_on_passive_match(tmp_path, monkeypatch) -> None:
+def test_risk_verification_service_keeps_passive_match_when_active_check_rejects(tmp_path, monkeypatch) -> None:
     path = tmp_path / "risk_rules.yaml"
     path.write_text(
         """rules:
@@ -143,9 +182,10 @@ def test_risk_verification_service_skips_rejected_on_passive_match(tmp_path, mon
 
     summary = service.evaluate_asset("asset-1")
 
-    assert summary.created_finding_count == 0
+    assert summary.created_finding_count == 1
     assert summary.active_rejected_count == 1
-    assert db.added == []
+    assert db.added[0].evidence_json["verification_status"] == "rejected"
+    assert db.added[0].evidence_json["match_source"] == "passive"
 
 
 def test_risk_verification_service_creates_on_service_present_confirmation(tmp_path, monkeypatch) -> None:
@@ -184,7 +224,133 @@ def test_risk_verification_service_creates_on_service_present_confirmation(tmp_p
     assert summary.passive_match_count == 0
     assert summary.created_finding_count == 1
     assert db.added[0].evidence_json["verification_status"] == "confirmed"
-    assert db.added[0].evidence_json["match_source"] == "active"
+    assert db.added[0].evidence_json["match_source"] == "active_only"
+
+
+def test_risk_verification_service_upserts_existing_finding_instead_of_creating_duplicate(tmp_path) -> None:
+    path = tmp_path / "risk_rules.yaml"
+    path.write_text(
+        """rules:
+  - id: redis.legacy.lt_3_2
+    name: redis legacy
+    enabled: true
+    service: redis
+    severity: high
+    description: legacy redis
+    match:
+      version: <3.2
+""",
+        encoding="utf-8",
+    )
+    asset = _build_asset("redis", "redis 2.8.24")
+    existing = RiskFinding(
+        id="finding-existing-1",
+        asset_id="asset-1",
+        asset_port_id="port-1",
+        yaml_rule_id="redis.legacy.lt_3_2",
+        severity=RiskSeverity.HIGH,
+        status=FindingStatus.OPEN,
+        title="legacy redis old title",
+        description="old description",
+        evidence_json={
+            "yaml_rule_id": "redis.legacy.lt_3_2",
+            "evidence_scope": "network",
+            "match_source": "passive",
+            "verification_status": "skipped",
+            "service_name": "redis",
+            "port": 8080,
+        },
+    )
+    asset.findings = [existing]
+    db = _FakeDB(asset)
+    service = RiskVerificationService(RuleEngine(path), _FakeSessionLocal(db))
+
+    summary = service.evaluate_asset("asset-1")
+
+    assert summary.created_finding_count == 1
+    assert db.added == []
+    assert existing.id == "finding-existing-1"
+    assert existing.title == "redis legacy"
+    assert existing.description == "legacy redis"
+    assert existing.status == FindingStatus.OPEN
+    assert existing.resolved_at is None
+
+
+def test_risk_verification_service_marks_missing_finding_fixed_instead_of_deleting(tmp_path) -> None:
+    path = tmp_path / "risk_rules.yaml"
+    path.write_text("rules: []\n", encoding="utf-8")
+    asset = _build_asset("redis", "redis 7.0.0")
+    existing = RiskFinding(
+        id="finding-existing-1",
+        asset_id="asset-1",
+        asset_port_id="port-1",
+        yaml_rule_id="redis.legacy.lt_3_2",
+        severity=RiskSeverity.HIGH,
+        status=FindingStatus.OPEN,
+        title="legacy redis",
+        description="legacy redis",
+        evidence_json={
+            "yaml_rule_id": "redis.legacy.lt_3_2",
+            "evidence_scope": "network",
+            "match_source": "passive",
+            "verification_status": "confirmed",
+            "service_name": "redis",
+            "port": 8080,
+        },
+    )
+    asset.findings = [existing]
+    db = _FakeDB(asset)
+    service = RiskVerificationService(RuleEngine(path), _FakeSessionLocal(db))
+
+    summary = service.evaluate_asset("asset-1")
+
+    assert summary.created_finding_count == 0
+    assert db.added == []
+    assert existing.status == FindingStatus.FIXED
+    assert existing.resolved_at is not None
+
+
+def test_risk_verification_service_preserves_active_only_finding_on_rejected_probe(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "risk_rules.yaml"
+    path.write_text(
+        """rules:
+  - id: ftp.anonymous.enabled
+    name: ftp anonymous
+    enabled: true
+    service: vsftpd
+    severity: high
+    description: anonymous ftp
+    match:
+      config:
+        anonymous_enabled:
+          eq: true
+    active_check:
+      detector: ftp_anonymous_login
+      trigger: on_service_present
+      timeout_seconds: 5
+      params: {}
+""",
+        encoding="utf-8",
+    )
+    asset = _build_asset("ftp", "vsftpd 2.3.4", config={"anonymous_enabled": False})
+    existing = _existing_finding(rule_id="ftp.anonymous.enabled", title="ftp anonymous")
+    asset.findings = [existing]
+    db = _FakeDB(asset)
+    service = RiskVerificationService(RuleEngine(path), _FakeSessionLocal(db))
+
+    async def _verifier(context):
+        return VerificationResult(status="rejected", summary="匿名登录失败", detector=context.rule.active_check.detector, evidence={})
+
+    monkeypatch.setattr("app.services.risk_verification_service.get_verifier", lambda detector: _verifier)
+
+    summary = service.evaluate_asset("asset-1")
+
+    assert summary.created_finding_count == 0
+    assert db.added == []
+    assert existing.status == FindingStatus.OPEN
+    assert existing.resolved_at is None
+    assert existing.evidence_json["verification_status"] == "rejected"
+    assert existing.evidence_json["match_source"] == "active_only"
 
 
 def test_risk_verification_service_falls_back_to_package_version(tmp_path) -> None:
@@ -1080,3 +1246,59 @@ def test_risk_verification_service_matches_distro_aware_sudo_and_polkit_rules(tm
     assert findings["sudo"]["version"] == "1:1.8.31-1ubuntu1.1"
     assert findings["polkit"]["name"] == "policykit-1"
     assert all(item.evidence_json["evidence_scope"] == "authorized_local" for item in db.added)
+
+
+def test_risk_verification_service_matches_rpm_package_rule_with_snapshot_distro_fallback(tmp_path) -> None:
+    path = tmp_path / "risk_rules.yaml"
+    path.write_text(
+        """rules:
+  - id: ssh.openssh.rpm.outdated
+    name: openssh rpm outdated
+    enabled: true
+    service: ssh
+    severity: high
+    description: openssh rpm vulnerable
+    match:
+      package:
+        manager: rpm
+        name: openssh-server
+        compare: lt_fixed
+        fixed_versions:
+          rocky:
+            "9": "1:8.7p1-40.el9"
+""",
+        encoding="utf-8",
+    )
+    snapshot = HostSnapshot(
+        asset_id="asset-rpm-1",
+        os_release="Rocky Linux 9.4",
+        services_json={"config_by_service": {"ssh": {}}},
+        software_json={"packages": [{"name": "openssh-server", "version": "1:8.7p1-38.el9", "manager": "rpm"}]},
+        error_json={},
+        collected_at=datetime.now(timezone.utc),
+    )
+    asset = Asset(id="asset-rpm-1", ip="10.0.0.70")
+    asset.ports = [
+        AssetPort(
+            id="port-ssh-rpm",
+            asset_id="asset-rpm-1",
+            port=22,
+            protocol="tcp",
+            service_name="ssh",
+            service_version=None,
+            fingerprint_json={"banner": "OpenSSH"},
+        )
+    ]
+    asset.snapshots = [snapshot]
+    asset.findings = []
+    db = _FakeDB(asset)
+    service = RiskVerificationService(RuleEngine(path), _FakeSessionLocal(db))
+
+    summary = service.evaluate_asset("asset-rpm-1")
+
+    assert summary.passive_match_count == 1
+    assert summary.created_finding_count == 1
+    assert db.added[0].yaml_rule_id == "ssh.openssh.rpm.outdated"
+    assert db.added[0].evidence_json["package"]["manager"] == "rpm"
+    assert db.added[0].evidence_json["package"]["distro"] == "rocky"
+    assert db.added[0].evidence_json["package"]["release"] == "9"

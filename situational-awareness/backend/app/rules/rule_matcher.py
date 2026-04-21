@@ -4,11 +4,17 @@ from typing import Any
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
-from app.utils.versioning import compare_debian_package_versions, normalize_version_token
+from app.utils.versioning import (
+    compare_debian_package_versions,
+    compare_rpm_package_versions,
+    normalize_linux_distro_key,
+    normalize_package_manager,
+    normalize_version_token,
+)
 
 VALID_SEVERITIES = {"low", "medium", "high", "critical"}
 SUPPORTED_CONFIG_OPERATORS = {"eq", "ne", "exists", "contains"}
-SUPPORTED_PACKAGE_MANAGERS = {"dpkg"}
+SUPPORTED_PACKAGE_MANAGERS = {"dpkg", "rpm"}
 SUPPORTED_PACKAGE_COMPARES = {"lt_fixed"}
 VALID_REMEDIATION_AUTOMATION_LEVELS = {"callable"}
 SUPPORTED_REMEDIATION_ACTION_TYPES = {
@@ -195,10 +201,10 @@ class RuleMatcher:
         if not isinstance(package, dict):
             return False
 
-        manager = str(package.get("manager") or "").strip().lower()
+        manager = normalize_package_manager(package.get("manager")) or ""
         name = str(package.get("name") or "").strip().lower()
         version = str(package.get("version") or "").strip()
-        distro = str(package.get("distro") or "").strip().lower()
+        distro = normalize_linux_distro_key(package.get("distro")) or ""
         release = str(package.get("release") or "").strip()
         if manager != condition.manager or name != condition.name:
             return False
@@ -209,8 +215,14 @@ class RuleMatcher:
         if not fixed_version:
             return False
 
-        if condition.compare == "lt_fixed" and manager == "dpkg":
-            return compare_debian_package_versions(version, fixed_version) < 0
+        if condition.compare == "lt_fixed":
+            try:
+                if manager == "dpkg":
+                    return compare_debian_package_versions(version, fixed_version) < 0
+                if manager == "rpm":
+                    return compare_rpm_package_versions(version, fixed_version) < 0
+            except Exception:
+                return False
         return False
 
     @staticmethod

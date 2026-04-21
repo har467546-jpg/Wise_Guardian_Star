@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Index, String
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +19,10 @@ class HostRunner(Base):
     status: Mapped[str] = mapped_column(String(32), default="offline", index=True)
     install_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    node_role: Mapped[str] = mapped_column(String(32), default="hybrid", index=True)
+    scanner_zone_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("scanner_zones.id", ondelete="SET NULL"), nullable=True, index=True)
+    visible_cidrs_json: Mapped[list] = mapped_column(JSONB, default=list)
+    max_concurrent_jobs: Mapped[int] = mapped_column(Integer, default=1)
     platform_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     registration_token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -34,3 +38,4 @@ class HostRunner(Base):
 
     asset = relationship("Asset", back_populates="host_runner")
     sessions = relationship("RemediationSession", back_populates="runner")
+    scanner_zone = relationship("ScannerZone", back_populates="runners")

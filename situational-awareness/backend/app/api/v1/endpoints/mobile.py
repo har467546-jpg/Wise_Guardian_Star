@@ -77,13 +77,17 @@ def _serialize_risk_item(finding: RiskFinding) -> RiskFindingMobileRead:
             "asset_ip": str(asset.ip) if asset is not None else "",
             "asset_hostname": asset.hostname if asset is not None else None,
             "asset_port_id": finding.asset_port_id,
+            "yaml_rule_id": finding.resolved_yaml_rule_id(),
+            "identity_hash": finding.identity_hash,
             "severity": finding.severity,
             "status": finding.status,
             "title": finding.title,
             "description": finding.description,
-            "evidence_json": finding.evidence_json or {},
+            "evidence_json": finding.evidence(),
             "detected_at": finding.detected_at,
             "resolved_at": finding.resolved_at,
+            "verification_status": finding.resolved_verification_status(),
+            "match_source": finding.resolved_match_source(),
         }
     )
 

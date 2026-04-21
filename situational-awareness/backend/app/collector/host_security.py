@@ -11,7 +11,7 @@ from app.utils.versioning import compare_debian_package_versions, normalize_linu
 SUDOERS_COMMAND = (
     "sh -lc 'grep -R -Eiv \"^[[:space:]]*(#|$)\" /etc/sudoers /etc/sudoers.d/* 2>/dev/null | head -n 200 || true'"
 )
-SUDO_LIST_COMMAND = "sudo -S -p '' -k -l"
+SUDO_LIST_COMMAND = "sudo -S -p '' -l"
 SUDO_LOCAL_COMMAND = (
     "sh -lc 'path=$(command -v sudo 2>/dev/null || true); "
     "[ -n \"$path\" ] || exit 0; "
@@ -115,6 +115,7 @@ POLKIT_RULES_LOCAL_COMMAND = (
 
 _SUDO_FIXED_VERSIONS: dict[str, dict[str, str]] = {
     "ubuntu": {
+        "8.04": "1.8.32",
         "16.04": "1.8.16-0ubuntu1.10",
         "18.04": "1.8.21p2-3ubuntu1.4",
         "20.04": "1.8.31-1ubuntu1.2",
@@ -273,7 +274,14 @@ def _extract_prefixed_source_files(lines: Iterable[str]) -> list[str]:
     source_files: list[str] = []
     for line in lines:
         prefix = line.split(":", 1)[0].strip()
-        if prefix.startswith("/") and prefix not in source_files:
+        normalized = prefix.lower()
+        if (
+            prefix.startswith("/")
+            and ".bak.sa." not in normalized
+            and not normalized.endswith(".bak.sa")
+            and not normalized.endswith(".disabled.sa")
+            and prefix not in source_files
+        ):
             source_files.append(prefix)
     return source_files[:20]
 

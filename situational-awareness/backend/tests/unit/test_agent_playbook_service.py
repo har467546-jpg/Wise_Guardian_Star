@@ -1,5 +1,6 @@
 from app.services.agent_playbook_service import (
     PLAYBOOK_ANALYZE_ASSET_RISKS,
+    PLAYBOOK_INSTALL_RUNNER,
     PLAYBOOK_SCAN_AND_ANALYZE_CIDR,
     PLAYBOOK_START_REMEDIATION_SESSION,
     PLAYBOOK_VERIFY_ASSET_RISKS,
@@ -78,6 +79,26 @@ def test_match_registered_playbook_carries_maintenance_window_id_into_remediatio
         "asset_id": "asset-9",
         "submit_if_ready": True,
         "maintenance_window_id": "mw-e2e-20260327",
+    }
+
+
+def test_match_registered_playbook_install_runner_prefers_explicit_asset_id_and_attaches_resume_action() -> None:
+    decision = match_registered_playbook(
+        content="继续为资产 98daed9d-3f10-4102-a113-b678f785912b 安装 Runner，然后继续自动修复",
+        page_context={"pathname": "/assets/asset-old", "asset_id": "asset-old"},
+        browser_context={},
+        working_context={"asset_id": "asset-old"},
+    )
+
+    assert decision is not None
+    assert decision.playbook_id == PLAYBOOK_INSTALL_RUNNER
+    action = decision.auto_execute_actions[0]
+    assert action["action_type"] == "install_runner"
+    assert action["params"]["asset_id"] == "98daed9d-3f10-4102-a113-b678f785912b"
+    assert action["params"]["resume_action"]["action_type"] == "create_or_resume_remediation_session"
+    assert action["params"]["resume_action"]["params"] == {
+        "asset_id": "98daed9d-3f10-4102-a113-b678f785912b",
+        "submit_if_ready": True,
     }
 
 

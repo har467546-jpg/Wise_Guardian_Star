@@ -25,6 +25,7 @@ from app.rules.rule_matcher import (
     VALID_SEVERITIES,
     VALID_REMEDIATION_AUTOMATION_LEVELS,
 )
+from app.utils.versioning import normalize_linux_distro_key, normalize_package_manager
 
 logger = logging.getLogger(__name__)
 _UNICODE_ESCAPE_PATTERN = re.compile(r"\\u([0-9a-fA-F]{4})")
@@ -228,7 +229,7 @@ class RuleLoader:
         if not isinstance(raw_conditions, dict):
             raise RuleLoadError(f"规则 {rule_id} 的 软件包匹配必须是对象结构")
 
-        manager = self._expect_string(raw_conditions, "manager").lower()
+        manager = normalize_package_manager(self._expect_string(raw_conditions, "manager"))
         if manager not in SUPPORTED_PACKAGE_MANAGERS:
             raise RuleLoadError(f"规则 {rule_id} 的 match.package.manager 不受支持：{manager}")
 
@@ -247,6 +248,9 @@ class RuleLoader:
                 raise RuleLoadError(f"规则 {rule_id} 的 match.package.fixed_versions 发行版键必须是非空字符串")
             if not isinstance(releases, dict) or not releases:
                 raise RuleLoadError(f"规则 {rule_id} 的 match.package.fixed_versions.{distro} 必须是非空对象结构")
+            normalized_distro = normalize_linux_distro_key(distro)
+            if not normalized_distro:
+                raise RuleLoadError(f"规则 {rule_id} 的 match.package.fixed_versions 发行版键必须是非空字符串")
             normalized_releases: dict[str, str] = {}
             for release, version in releases.items():
                 if not isinstance(release, str) or not release.strip():
@@ -254,7 +258,7 @@ class RuleLoader:
                 if not isinstance(version, str) or not version.strip():
                     raise RuleLoadError(f"规则 {rule_id} 的 match.package.fixed_versions.{distro}.{release} 必须是非空字符串")
                 normalized_releases[release.strip()] = version.strip()
-            normalized_fixed_versions[distro.strip().lower()] = normalized_releases
+            normalized_fixed_versions[normalized_distro] = normalized_releases
 
         return PackageMatchDefinition(
             manager=manager,

@@ -8,9 +8,15 @@ from app.db.models.enums import DiscoveryJobStatus
 from app.utils.net import normalize_cidr
 
 
-def create_job(db: Session, cidr: str, label: str | None, created_by: str | None) -> DiscoveryJob:
+def create_job(
+    db: Session,
+    cidr: str,
+    label: str | None,
+    created_by: str | None,
+    scanner_zone_id: str | None = None,
+) -> DiscoveryJob:
     normalized_cidr = normalize_cidr(cidr)
-    job = DiscoveryJob(cidr=normalized_cidr, label=label, created_by=created_by)
+    job = DiscoveryJob(cidr=normalized_cidr, label=label, created_by=created_by, scanner_zone_id=scanner_zone_id)
     db.add(job)
     db.commit()
     db.refresh(job)

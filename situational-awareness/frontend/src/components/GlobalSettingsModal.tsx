@@ -57,6 +57,12 @@ const FIELD_TO_TAB_KEY: Record<string, SettingsTabKey> = {
   discovery_nse_timeout_seconds: "scan-verify",
   discovery_nse_host_concurrency: "scan-verify",
   discovery_nse_enable_vuln_scripts: "scan-verify",
+  campus_default_portset_mode: "scan-verify",
+  campus_allow_full_scan_default: "scan-verify",
+  campus_zone_host_concurrency_limit: "scan-verify",
+  campus_zone_nmap_min_rate: "scan-verify",
+  campus_dhcp_default_interval_seconds: "scan-verify",
+  campus_snmp_default_interval_seconds: "scan-verify",
   risk_active_verify_connect_timeout_seconds: "scan-verify",
   risk_active_verify_read_timeout_seconds: "scan-verify",
   risk_active_verify_max_concurrency: "scan-verify",
@@ -104,14 +110,14 @@ const READ_ONLY_DEFAULTS: PlatformSettingsInput = {
   discovery_nmap_host_discovery_profile: "balanced",
   discovery_service_ports: "22,80,443,3306,5432,6379,8080,8443",
   discovery_high_backdoor_ports: "1337,4444,5555,6666,31337",
-  discovery_portset_mode: "full",
+  discovery_portset_mode: "top1000_plus_custom",
   discovery_top_ports_limit: 1000,
   discovery_nmap_mode: "enrich",
   discovery_nmap_min_rate: 100000,
   discovery_nmap_timeout_seconds: 8,
   discovery_nmap_liveness_timeout_seconds: 90,
   discovery_nmap_full_scan_timeout_seconds: 90,
-  discovery_nmap_version_intensity: 7,
+  discovery_nmap_version_intensity: 5,
   discovery_low_confidence_threshold: 70,
   discovery_full_scan_host_concurrency: 8,
   discovery_full_scan_port_concurrency: 256,
@@ -120,6 +126,12 @@ const READ_ONLY_DEFAULTS: PlatformSettingsInput = {
   discovery_nse_timeout_seconds: 8,
   discovery_nse_host_concurrency: 8,
   discovery_nse_enable_vuln_scripts: true,
+  campus_default_portset_mode: "top1000_plus_custom",
+  campus_allow_full_scan_default: false,
+  campus_zone_host_concurrency_limit: 8,
+  campus_zone_nmap_min_rate: 5000,
+  campus_dhcp_default_interval_seconds: 1800,
+  campus_snmp_default_interval_seconds: 1800,
   risk_active_verify_connect_timeout_seconds: 3,
   risk_active_verify_read_timeout_seconds: 3,
   risk_active_verify_max_concurrency: 4,
@@ -249,6 +261,12 @@ function toFormValues(payload: PlatformSettings): PlatformSettingsInput {
     discovery_nse_timeout_seconds: payload.discovery_nse_timeout_seconds,
     discovery_nse_host_concurrency: payload.discovery_nse_host_concurrency,
     discovery_nse_enable_vuln_scripts: payload.discovery_nse_enable_vuln_scripts,
+    campus_default_portset_mode: payload.campus_default_portset_mode,
+    campus_allow_full_scan_default: payload.campus_allow_full_scan_default,
+    campus_zone_host_concurrency_limit: payload.campus_zone_host_concurrency_limit,
+    campus_zone_nmap_min_rate: payload.campus_zone_nmap_min_rate,
+    campus_dhcp_default_interval_seconds: payload.campus_dhcp_default_interval_seconds,
+    campus_snmp_default_interval_seconds: payload.campus_snmp_default_interval_seconds,
     risk_active_verify_connect_timeout_seconds: payload.risk_active_verify_connect_timeout_seconds,
     risk_active_verify_read_timeout_seconds: payload.risk_active_verify_read_timeout_seconds,
     risk_active_verify_max_concurrency: payload.risk_active_verify_max_concurrency,
@@ -819,6 +837,23 @@ export default function GlobalSettingsModal({ open, onClose, userRole }: GlobalS
                       <NumberField name="risk_active_verify_connect_timeout_seconds" label="验证连接超时" min={1} max={300} disabled={disabled} extra="单位：秒" />
                       <NumberField name="risk_active_verify_read_timeout_seconds" label="验证读取超时" min={1} max={300} disabled={disabled} extra="单位：秒" />
                       <NumberField name="risk_active_verify_max_concurrency" label="验证最大并发" min={1} max={1024} disabled={disabled} />
+                    </SectionCard>
+                    <SectionCard title="校园默认策略">
+                      <SelectField
+                        name="campus_default_portset_mode"
+                        label="校园默认端口策略"
+                        disabled={disabled}
+                        options={[
+                          { label: "Top + 自定义", value: "top1000_plus_custom" },
+                          { label: "仅自定义", value: "curated" },
+                          { label: "全量端口", value: "full" },
+                        ]}
+                      />
+                      <SwitchField name="campus_allow_full_scan_default" label="默认允许服务器区深扫" disabled={disabled} />
+                      <NumberField name="campus_zone_host_concurrency_limit" label="分区主机并发上限" min={1} max={4096} disabled={disabled} />
+                      <NumberField name="campus_zone_nmap_min_rate" label="分区 Nmap 速率上限" min={1} max={1000000} disabled={disabled} />
+                      <NumberField name="campus_dhcp_default_interval_seconds" label="DHCP 默认采集周期" min={60} max={86400} disabled={disabled} extra="单位：秒" />
+                      <NumberField name="campus_snmp_default_interval_seconds" label="SNMP 默认采集周期" min={60} max={86400} disabled={disabled} extra="单位：秒" />
                     </SectionCard>
                   </div>
                 ),

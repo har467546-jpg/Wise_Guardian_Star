@@ -230,7 +230,8 @@ def execute_remediation_plan(
         plan = build_plan(db, finding_id)
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    if not plan.execution_ready:
+    execution_mode = str(payload.execution_mode or "dry_run").strip().lower() or "dry_run"
+    if execution_mode == "apply" and not plan.execution_ready:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="；".join(plan.blocked_reasons) or "当前资产不满足修复执行条件",
@@ -240,10 +241,10 @@ def execute_remediation_plan(
         selected_steps = select_executable_plan_steps(
             plan.steps,
             submitted_step_ids=[item.step_id for item in payload.steps] if payload.steps else None,
+            require_apply_supported=execution_mode == "apply",
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    execution_mode = str(payload.execution_mode or "dry_run").strip().lower() or "dry_run"
     change_ticket = str(payload.change_ticket or "").strip() or None
     maintenance_window_id = str(payload.maintenance_window_id or "").strip() or None
     if execution_mode == "apply" and selected_steps_require_maintenance_window(selected_steps) and not maintenance_window_id:

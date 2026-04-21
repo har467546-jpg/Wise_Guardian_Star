@@ -10,8 +10,11 @@ import { formatDateTime, getTaskEventTypeLabel, getTaskTypeLabel, localizeTaskMe
 import {
   approveHaorSession,
   buildHaorSessionStreamUrl,
+  approveRemediationSession,
+  createRemediationSession,
   getHaorGoal,
   getHaorSessionSummary,
+  installAssetRunner,
   getTask,
   getTaskEvents,
   interruptHaorSession,
@@ -188,6 +191,12 @@ const EMPTY_SECURE_INPUT: AgentPendingSecureInput = {
   blocker_summary: null,
 };
 
+const ASSET_TITLE_PATTERN = /(?:asset|资产|主机)\s*([A-Za-z0-9][A-Za-z0-9._-]{2,63})/i;
+
+type MessageSendOverrides = {
+  pageContext?: Partial<AgentPageContext>;
+};
+
 type ChatBubbleProps = {
   actions?: ReactNode;
   badge?: string | null;
@@ -230,6 +239,15 @@ function ChatBubble({ actions, badge, content, metaNote, role, sender, stateTone
       </div>
     </article>
   );
+}
+
+function extractAssetIdFromTitle(value: string | null | undefined): string | null {
+  const text = String(value || "").trim();
+  if (!text) {
+    return null;
+  }
+  const match = ASSET_TITLE_PATTERN.exec(text);
+  return match?.[1]?.trim() || null;
 }
 
 function normalizeStatus(status: string | null | undefined) {
@@ -571,6 +589,7 @@ function toMessageActionSuggestion(value: unknown): AgentMessageActionSuggestion
     label,
     message_text: typeof record.message_text === "string" ? record.message_text : null,
     pathname: typeof record.pathname === "string" ? record.pathname : null,
+    asset_id: typeof record.asset_id === "string" ? record.asset_id : null,
   };
 }
 
@@ -582,7 +601,7 @@ function messageActionSuggestions(message: AgentMessage): AgentMessageActionSugg
   ].filter((item): item is AgentMessageActionSuggestion => Boolean(item));
   const seen = new Set<string>();
   return actions.filter((item) => {
-    const signature = `${item.kind}:${item.label}:${item.message_text || ""}:${item.pathname || ""}`;
+    const signature = `${item.kind}:${item.label}:${item.asset_id || ""}:${item.message_text || ""}:${item.pathname || ""}`;
     if (seen.has(signature)) {
       return false;
     }
@@ -978,7 +997,21 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const resetDisabled = resetting || interrupting;
   const approvalActionLabel = remediationAutoSubmitPlan ? "确认并自动修复" : "确认执行";
   const approvalBlockedText = remediationAutoSubmitPlan ? "当前账号不是管理员，不能确认自动修复。" : "当前账号不是管理员，不能确认执行。";
-  const currentGoalTitle = currentGoal?.title || session?.current_goal_title || summary.current_goal_title || "当前未绑定目标";
+  const currentGoalTitle = useMemo(() => {
+    if (currentGoal?.title) {
+      return currentGoal.title;
+    }
+    const rawTitle = session?.current_goal_title || summary.current_goal_title || "";
+    const pageAssetId = typeof pageContext.asset_id === "string" ? pageContext.asset_id.trim() : "";
+    if (!pageAssetId) {
+      return rawTitle || "当前未绑定目标";
+    }
+    const titleAssetId = extractAssetIdFromTitle(rawTitle);
+    if (titleAssetId && titleAssetId !== pageAssetId) {
+      return `为资产 ${pageAssetId} 继续当前目标`;
+    }
+    return rawTitle || `为资产 ${pageAssetId} 继续当前目标`;
+  }, [currentGoal?.title, pageContext.asset_id, session?.current_goal_title, summary.current_goal_title]);
   const agentStatePanel = useMemo(() => buildAgentStatePanel(agentState, task), [agentState, task]);
   const currentGoalProgress = useMemo(() => toGoalProgress(currentGoal), [currentGoal]);
   const currentGoalBlockers = useMemo(
@@ -2250,14 +2283,21 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     };
   }, [open, pendingUiKey, stepping, sending, approving, interrupting, resetting, router]);
 
-  const handleSend = async (content: string): Promise<boolean> => {
+  const handleSend = async (content: string, overrides?: MessageSendOverrides): Promise<boolean> => {
     const normalized = content.trim();
     if (!normalized) {
       return false;
     }
     const clientMessageId = createClientId();
     const createdAt = new Date().toISOString();
-    const currentPageContext = { ...pageContext };
+    const currentPageContext = {
+      ...pageContext,
+      ...(overrides?.pageContext || {}),
+      query: {
+        ...pageContext.query,
+        ...(overrides?.pageContext?.query || {}),
+      },
+    };
     const context = syncBrowserContext(currentPageContext);
     let usedStream = false;
 
@@ -2404,9 +2444,96 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     setMaintenanceWindowSubmitting(false);
   };
 
+  const waitForTaskTerminal = async (taskId: string, timeoutMs = 10 * 60 * 1000, intervalMs = 3000) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt <= timeoutMs) {
+      const taskResult = await getTask(taskId);
+      setTask(taskResult);
+      try {
+        const eventResult = await getTaskEvents(taskId, { pageSize: 6 });
+        setTaskEvents(eventResult.items);
+      } catch {
+        // ignore task event refresh failures during polling
+      }
+      const status = String(taskResult.status || "").trim().toLowerCase();
+      if (["success", "failure", "canceled"].includes(status)) {
+        return taskResult;
+      }
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, intervalMs);
+      });
+    }
+    throw new Error("等待 Runner 安装任务完成超时");
+  };
+
+  const handleInstallRunnerAndResume = async (assetId: string) => {
+    const normalizedAssetId = assetId.trim();
+    if (!normalizedAssetId) {
+      return;
+    }
+    try {
+      setSending(true);
+      setOpen(true);
+      setErrorText(null);
+      setStreamError(null);
+      setSummary((current) => ({
+        ...current,
+        current_goal_title: `为资产 ${normalizedAssetId} 安装 Runner 并继续自动修复`,
+      }));
+      setCurrentGoal((current) => (current ? { ...current, title: `为资产 ${normalizedAssetId} 安装 Runner 并继续自动修复` } : current));
+
+      const install = await installAssetRunner(normalizedAssetId);
+      message.success(`已开始为资产 ${normalizedAssetId} 安装 Runner：${install.task_id}`);
+      await loadTask(install.task_id, true);
+
+      const terminalTask = await waitForTaskTerminal(install.task_id);
+      if (String(terminalTask.status || "").trim().toLowerCase() !== "success") {
+        const detail = terminalTask.message || "请查看安装任务详情";
+        message.error(`资产 ${normalizedAssetId} 的 Runner 安装未成功完成：${detail}`);
+        return;
+      }
+
+      const remediationSession = await createRemediationSession(normalizedAssetId, {});
+      await loadSession(true);
+
+      if (!remediationSession.plan.execution_ready) {
+        const blockedDetail = remediationSession.plan.blocked_reasons.join("；") || "当前仍有前置条件未满足";
+        message.warning(`资产 ${normalizedAssetId} 的 Runner 已安装，但自动修复仍被阻塞：${blockedDetail}`);
+        return;
+      }
+
+      if (userRole !== "admin") {
+        message.warning(`资产 ${normalizedAssetId} 的 Runner 已安装，但当前账号不是管理员，不能继续自动修复。`);
+        return;
+      }
+
+      const approval = await approveRemediationSession(remediationSession.session_id, { execution_mode: "apply" });
+      message.success(`资产 ${normalizedAssetId} 已继续自动修复：${approval.task_id}`);
+      await loadTask(approval.task_id, true);
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "继续安装 Runner 并自动修复失败";
+      setErrorText(text);
+      message.error(text);
+    } finally {
+      setSending(false);
+    }
+  };
+
   const handleMessageAction = async (action: AgentMessageActionSuggestion, _messageId?: string) => {
+    if (action.kind === "install_runner_and_resume" && action.asset_id) {
+      await handleInstallRunnerAndResume(action.asset_id);
+      return;
+    }
     if (action.kind === "send_message" && action.message_text) {
-      await handleSend(action.message_text);
+      await handleSend(action.message_text, {
+        pageContext: action.asset_id
+          ? {
+              asset_id: action.asset_id,
+              pathname: `/remediation/${action.asset_id}`,
+              query: { assetId: action.asset_id },
+            }
+          : undefined,
+      });
       return;
     }
     if (action.kind === "open_maintenance_window_input") {

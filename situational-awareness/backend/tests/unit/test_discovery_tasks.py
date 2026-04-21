@@ -403,11 +403,115 @@ def test_probe_open_services_uses_only_open_ports_for_followup(monkeypatch) -> N
     result = discovery_tasks.probe_open_services("job-probe-1")
 
     assert result == "job-probe-1"
+    assert asset.status.value == "online"
     assert captured["probe_hosts"] == [{"ip": "192.168.10.88", "hostname": "target-host", "ports": [22, 80], "services": []}]
     assert captured["nmap_targets"] == [{"ip": "192.168.10.88", "ports": [80]}]
     assert captured["nse_targets"] == [{"ip": "192.168.10.88", "ports": [22, 80], "scripts": ["http-title", "ssh2-enum-algos"], "port_scripts": {22: ["ssh2-enum-algos"], 80: ["http-title"]}}]
     assert job.summary_json["hosts"][0]["services"]
     assert job.summary_json["service_enrichment_stats"]["network_initial_snapshot_count"] == 1
+
+
+def test_probe_open_services_labels_gateway_dns_assets_as_network_infrastructure(monkeypatch) -> None:
+    job = SimpleNamespace(
+        id="job-probe-gateway-1",
+        cidr="192.168.10.0/24",
+        status=DiscoveryJobStatus.PENDING,
+        summary_json={
+            "hosts": [{"ip": "192.168.10.2", "hostname": None, "ports": [53], "services": []}],
+            "port_scan_stats": {
+                "host_count": 1,
+                "open_port_count": 1,
+                "scanned_port_count": 1024,
+                "service_probe_target_count": 1,
+            },
+        },
+    )
+    asset = Asset(id="asset-gateway-1", ip="192.168.10.2")
+    asset.ports = [AssetPort(asset_id=asset.id, port=53, protocol="tcp", state="open", fingerprint_json={})]
+    db = _FakeDB(job, assets=[asset])
+
+    class _FakeScanner:
+        def __init__(self, config):
+            self.config = config
+
+        async def probe_known_open_ports(self, hosts):
+            return [
+                SimpleNamespace(
+                    ip="192.168.10.2",
+                    hostname=None,
+                    ports=[53],
+                    services=[
+                        {
+                            "port": 53,
+                            "service": "dns",
+                            "application_service": "dns",
+                            "probe_method": "connect",
+                            "service_aliases": ["dns"],
+                        }
+                    ],
+                )
+            ]
+
+    class _FakeNmapEnricher:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def enrich_hosts(self, targets):
+            return {}
+
+    class _FakeNseEnricher:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def enrich_hosts(self, targets):
+            return SimpleNamespace(by_host={}, error_count=0)
+
+    monkeypatch.setattr(discovery_tasks, "SessionLocal", _FakeSessionLocal(db))
+    monkeypatch.setattr(discovery_tasks, "AsyncNetworkDiscovery", _FakeScanner)
+    monkeypatch.setattr(discovery_tasks, "AsyncNmapServiceEnricher", _FakeNmapEnricher)
+    monkeypatch.setattr(discovery_tasks, "AsyncNmapScriptEnricher", _FakeNseEnricher)
+    monkeypatch.setattr(discovery_tasks, "select_nse_scripts_for_record", lambda record, include_vuln=True: [])
+
+    result = discovery_tasks.probe_open_services("job-probe-gateway-1")
+
+    assert result == "job-probe-gateway-1"
+    assert asset.is_infrastructure_device is True
+    assert asset.status.value == "online"
+    assert asset.asset_category == "network_infrastructure"
+    assert asset.device_role == "gateway_dns"
+    assert asset.device_assessment_json["device_role"] == "gateway_dns"
+    assert asset.identity_source == discovery_tasks.NETWORK_DISCOVERY_INFERRED_IDENTITY_SOURCE
+    assert job.summary_json["hosts"][0]["device_assessment"]["device_role"] == "gateway_dns"
+
+
+def test_infer_discovery_asset_labels_does_not_mark_mixed_workload_host_as_infrastructure() -> None:
+    labels = discovery_tasks._infer_discovery_asset_labels(
+        {
+            "ip": "192.168.10.138",
+            "ports": [22, 53, 80, 3306],
+            "services": [
+                {"port": 22, "service": "ssh", "service_aliases": ["ssh"]},
+                {"port": 53, "service": "dns", "service_aliases": ["dns"]},
+                {"port": 80, "service": "apache", "service_aliases": ["apache", "http"]},
+                {"port": 3306, "service": "mysql", "service_aliases": ["mysql"]},
+            ],
+        },
+        cidr="192.168.10.0/24",
+    )
+
+    assert labels["asset_category"] == "general_endpoint"
+    assert labels["device_role"] is None
+    assert labels["is_infrastructure_device"] is False
+    assert labels["device_assessment_json"]["asset_category"] == "general_endpoint"
+
+
+def test_apply_network_initial_asset_status_marks_partial_snapshot_online() -> None:
+    asset = Asset(id="asset-status-1", ip="192.168.10.10", status="collecting")
+    snapshot = SimpleNamespace(collection_status="partial")
+
+    discovery_tasks._apply_network_initial_asset_status(asset, snapshot)
+
+    assert asset.status.value == "online"
 
 
 def test_build_nmap_targets_forces_key_ports_and_rpcbind_related_unknown_high_ports() -> None:

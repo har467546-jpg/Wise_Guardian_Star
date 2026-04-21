@@ -20,13 +20,15 @@ import {
 
 import CollapsibleJsonBlock from "@/components/CollapsibleJsonBlock";
 import DesktopPageHeader from "@/components/DesktopPageHeader";
+import RollbackArtifactPanel from "@/components/RollbackArtifactPanel";
 import StatusTag from "@/components/StatusTag";
 import { getStoredToken } from "@/lib/auth";
 import {
   buildRemediationAssetPath,
   pickRecommendedFindingId,
   remediationBusinessStatusLabel,
-  remediationExecutionStatusLabel,
+  remediationExecutionOutcomeLabel,
+  remediationResolvedTaskMessage,
 } from "@/lib/remediation";
 import { formatDateTime, getTaskEventTypeLabel, localizeTaskMessage } from "@/lib/ui-text";
 import { executeRemediationPlan, getRemediationPlan, getRemediationTask, getRemediationWorkspace } from "@/services/api";
@@ -444,6 +446,9 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                             </Space>
                             <Typography.Text type="secondary">{step.render_reason}</Typography.Text>
                             {step.blocked_reason ? <Alert type="warning" showIcon message={step.blocked_reason} /> : null}
+                            {!step.apply_supported && step.apply_blocked_reason ? (
+                              <Alert type="info" showIcon message={`正式执行前需补齐条件：${step.apply_blocked_reason}`} />
+                            ) : null}
                             {step.fallback_strategy === "legacy_debian_auto_guess" && step.fallback_candidates.length ? (
                               <Typography.Text type="secondary">
                                 候选包/服务: {step.fallback_candidates.join("、")}
@@ -462,6 +467,10 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                                 证据项: {step.evidence_items.join("、")}
                               </Typography.Text>
                             ) : null}
+                            <RollbackArtifactPanel
+                              rollbackHint={step.rollback_hint}
+                              rollbackCommand={step.rollback_command}
+                            />
                             <Input.TextArea
                               rows={step.execution_state === "ready" ? 6 : 3}
                               value={step.generated_command || ""}
@@ -487,7 +496,7 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                         <StatusTag value={task.status} />
                         <Typography.Text>{task.execution_boundary || "-"}</Typography.Text>
                         <Tag>{task.execution_mode || "-"}</Tag>
-                        <Tag>{remediationExecutionStatusLabel(task.execution_status)}</Tag>
+                        <Tag>{remediationExecutionOutcomeLabel(task.execution_status, task.business_status)}</Tag>
                         {task.business_status ? (
                           <Tag color={remediationBusinessStatusColor(task.business_status)}>
                             {remediationBusinessStatusLabel(task.business_status)}
@@ -510,8 +519,8 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                     <Alert
                       type={task.business_status === "verified_closed" ? "success" : task.business_status === "verified_failed" ? "error" : "info"}
                       showIcon
-                      message={remediationBusinessStatusLabel(task.business_status)}
-                      description={localizeTaskMessage(task.message)}
+                      message={remediationExecutionOutcomeLabel(task.execution_status, task.business_status)}
+                      description={localizeTaskMessage(remediationResolvedTaskMessage(task.message, task.execution_status, task.business_status))}
                     />
                   ) : null}
                   <div className="remediation-stream-shell">
@@ -538,16 +547,20 @@ export default function RemediationWorkspaceView({ assetId }: { assetId: string 
                             {String(item.title || item.step_id || "-")}
                           </Space>
                         )}
-                        description={(
-                          <Space direction="vertical" size={4}>
-                            <Typography.Text type="secondary">开始: {formatDateTime(String(item.started_at || ""))}</Typography.Text>
-                            <Typography.Text type="secondary">完成: {formatDateTime(String(item.finished_at || ""))}</Typography.Text>
-                            {item.error ? <Typography.Text type="danger">{String(item.error)}</Typography.Text> : null}
-                          </Space>
+                              description={(
+                                <Space direction="vertical" size={4}>
+                                  <Typography.Text type="secondary">开始: {formatDateTime(String(item.started_at || ""))}</Typography.Text>
+                                  <Typography.Text type="secondary">完成: {formatDateTime(String(item.finished_at || ""))}</Typography.Text>
+                                  {item.error ? <Typography.Text type="danger">{String(item.error)}</Typography.Text> : null}
+                                  <RollbackArtifactPanel
+                                    rollbackCommand={String(item.rollback_command || "") || null}
+                                    rollbackArtifact={item.rollback_artifact}
+                                  />
+                                </Space>
+                              )}
+                            />
+                          </List.Item>
                         )}
-                      />
-                    </List.Item>
-                  )}
                 />
               ) : (
                 <Empty description="暂无步骤执行结果" />

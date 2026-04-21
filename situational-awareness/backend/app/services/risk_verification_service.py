@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.models.asset import Asset, AssetPort
 from app.db.models.enums import FindingStatus, RiskSeverity
-from app.db.models.risk_finding import RiskFinding
+from app.db.models.risk_finding import RiskFinding, build_finding_identity_hash
+from app.db.models.risk_rule import RiskRule
 from app.db.models.snapshot import HostSnapshot
 from app.db.session import SessionLocal
 from app.rules import RuleDefinition, RuleEngine, RuleInput, RuleMatcher
@@ -44,6 +45,7 @@ class PassiveRuleMatchRecord:
     package: dict[str, Any]
     nse: dict[str, Any]
     rule: RuleDefinition
+    evidence_source_level: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +111,7 @@ class RiskVerificationService:
                 return summary
 
             current_snapshot = latest_snapshot(asset.snapshots)
+            fallback_snapshot = current_snapshot or latest_available_snapshot(asset.snapshots)
             ruleset = self.rule_engine.loader.maybe_reload()
             active_rules_by_service: dict[str, list[RuleDefinition]] = defaultdict(list)
             for rule in ruleset.rules:
@@ -121,7 +124,9 @@ class RiskVerificationService:
             existing_alert_signatures = _load_open_device_alert_signatures(db, asset_id=asset.id)
             pending_alert_signatures: set[str] = set()
             pending_alert_findings: list[RiskFinding] = []
-            db.execute(delete(RiskFinding).where(RiskFinding.asset_id == asset.id))
+            existing_findings = list(getattr(asset, "findings", []) or [])
+            existing_finding_map = _index_findings_by_identity(existing_findings)
+            rule_db_map = _load_db_rule_map(db)
 
             passive_records: list[PassiveRuleMatchRecord] = []
             active_candidates: list[ActiveRuleCandidate] = []
@@ -160,6 +165,14 @@ class RiskVerificationService:
                                 package=package,
                                 nse=nse,
                                 rule=rule,
+                                evidence_source_level=_resolve_passive_evidence_source_level(
+                                    rule=rule,
+                                    service_version=service_version,
+                                    config=config,
+                                    package=package,
+                                    nse=nse,
+                                    fingerprint=fingerprint,
+                                ),
                             )
                         )
                         if rule.active_check and rule.active_check.trigger == "on_passive_match":
@@ -176,7 +189,7 @@ class RiskVerificationService:
                                             banner=banner,
                                             fingerprint=fingerprint,
                                             config=config,
-                                            latest_snapshot=current_snapshot,
+                                            latest_snapshot=fallback_snapshot,
                                             rule=rule,
                                             connect_timeout_seconds=self.connect_timeout_seconds,
                                             read_timeout_seconds=self.read_timeout_seconds,
@@ -202,7 +215,7 @@ class RiskVerificationService:
                                     banner=banner,
                                     fingerprint=fingerprint,
                                     config=config,
-                                    latest_snapshot=current_snapshot,
+                                    latest_snapshot=fallback_snapshot,
                                     rule=rule,
                                     connect_timeout_seconds=self.connect_timeout_seconds,
                                     read_timeout_seconds=self.read_timeout_seconds,
@@ -224,17 +237,22 @@ class RiskVerificationService:
                 progress_callback(70, "主动探测执行完成", summary.to_dict())
 
             created_keys: set[tuple[str, str]] = set()
+            seen_identity_hashes: set[str] = set()
             for record in passive_records:
+                db_rule_id = rule_db_map.get(_rule_lookup_key(record.rule))
                 result = active_results.get((record.port.id, record.rule.rule_id))
                 if record.rule.active_check is None:
                     finding = self._build_finding(
                         record,
+                        rule_id=db_rule_id,
                         verification_status="not_applicable",
                         match_source="passive",
                     )
-                    db.add(finding)
+                    finding = self._upsert_finding(db, existing_finding_map, finding)
                     summary.created_finding_count += 1
                     created_keys.add((record.port.id, record.rule.rule_id))
+                    if finding.identity_hash:
+                        seen_identity_hashes.add(finding.identity_hash)
                     _collect_pending_device_alert(
                         finding,
                         existing_signatures=existing_alert_signatures,
@@ -245,19 +263,20 @@ class RiskVerificationService:
 
                 trigger = record.rule.active_check.trigger
                 if trigger == "on_passive_match":
-                    if result and result.status == "rejected":
-                        continue
                     verification_status = result.status if result else "skipped"
                     match_source = "active" if result and result.status == "confirmed" else "passive"
                     finding = self._build_finding(
                         record,
+                        rule_id=db_rule_id,
                         verification_status=verification_status,
                         match_source=match_source,
                         verification_result=result,
                     )
-                    db.add(finding)
+                    finding = self._upsert_finding(db, existing_finding_map, finding)
                     summary.created_finding_count += 1
                     created_keys.add((record.port.id, record.rule.rule_id))
+                    if finding.identity_hash:
+                        seen_identity_hashes.add(finding.identity_hash)
                     _collect_pending_device_alert(
                         finding,
                         existing_signatures=existing_alert_signatures,
@@ -269,13 +288,16 @@ class RiskVerificationService:
                 if trigger == "on_service_present" and result and result.status == "confirmed":
                     finding = self._build_finding(
                         record,
+                        rule_id=db_rule_id,
                         verification_status="confirmed",
                         match_source="active",
                         verification_result=result,
                     )
-                    db.add(finding)
+                    finding = self._upsert_finding(db, existing_finding_map, finding)
                     summary.created_finding_count += 1
                     created_keys.add((record.port.id, record.rule.rule_id))
+                    if finding.identity_hash:
+                        seen_identity_hashes.add(finding.identity_hash)
                     _collect_pending_device_alert(
                         finding,
                         existing_signatures=existing_alert_signatures,
@@ -286,20 +308,53 @@ class RiskVerificationService:
             for candidate in active_candidates:
                 key = (candidate.context.port.id, candidate.context.rule.rule_id)
                 result = active_results.get(key)
-                if key in created_keys or result is None or result.status != "confirmed":
+                if key in created_keys:
                     continue
                 if candidate.context.rule.active_check is None or candidate.context.rule.active_check.trigger != "on_service_present":
                     continue
-                finding = self._build_finding_from_active(candidate.context, result)
-                db.add(finding)
-                summary.created_finding_count += 1
-                created_keys.add(key)
-                _collect_pending_device_alert(
-                    finding,
-                    existing_signatures=existing_alert_signatures,
-                    pending_signatures=pending_alert_signatures,
-                    sink=pending_alert_findings,
+
+                db_rule_id = rule_db_map.get(_rule_lookup_key(candidate.context.rule))
+                verification_result = result or _default_verification_result(candidate.context.rule)
+                if verification_result.status == "confirmed":
+                    finding = self._build_finding_from_active(
+                        candidate.context,
+                        verification_result,
+                        rule_id=db_rule_id,
+                    )
+                    finding = self._upsert_finding(db, existing_finding_map, finding)
+                    summary.created_finding_count += 1
+                    created_keys.add(key)
+                    if finding.identity_hash:
+                        seen_identity_hashes.add(finding.identity_hash)
+                    _collect_pending_device_alert(
+                        finding,
+                        existing_signatures=existing_alert_signatures,
+                        pending_signatures=pending_alert_signatures,
+                        sink=pending_alert_findings,
+                    )
+                    continue
+
+                existing_finding = existing_finding_map.get(
+                    _finding_identity_hash(
+                        asset_id=candidate.context.asset.id,
+                        asset_port_id=candidate.context.port.id,
+                        yaml_rule_id=candidate.context.rule.rule_id,
+                        evidence_scope=_resolve_evidence_scope(candidate.context.service_name, candidate.context.fingerprint),
+                    )
+                    or ""
                 )
+                if existing_finding is None:
+                    continue
+                finding = self._build_finding_from_active(
+                    candidate.context,
+                    verification_result,
+                    rule_id=db_rule_id,
+                )
+                finding = self._upsert_finding(db, existing_finding_map, finding, create_if_missing=False)
+                if finding and finding.identity_hash:
+                    seen_identity_hashes.add(finding.identity_hash)
+
+            _converge_missing_findings(existing_findings, seen_identity_hashes)
 
             db.commit()
             if pending_alert_findings:
@@ -403,23 +458,33 @@ class RiskVerificationService:
     def _build_finding(
         record: PassiveRuleMatchRecord,
         *,
+        rule_id: str | None,
         verification_status: str,
         match_source: str,
         verification_result: VerificationResult | None = None,
     ) -> RiskFinding:
         active_detector = record.rule.active_check.detector if record.rule.active_check else None
         active_trigger = record.rule.active_check.trigger if record.rule.active_check else None
+        evidence_scope = _resolve_evidence_scope(record.service_name, record.fingerprint)
         return RiskFinding(
             asset_id=record.port.asset_id,
             asset_port_id=record.port.id,
-            rule_id=None,
+            yaml_rule_id=record.rule.rule_id,
+            identity_hash=_finding_identity_hash(
+                asset_id=record.port.asset_id,
+                asset_port_id=record.port.id,
+                yaml_rule_id=record.rule.rule_id,
+                evidence_scope=evidence_scope,
+            ),
+            rule_id=rule_id,
             severity=RiskSeverity(record.rule.severity),
             status=FindingStatus.OPEN,
             title=record.rule.name or record.rule.rule_id,
             description=record.rule.description,
             evidence_json={
                 "yaml_rule_id": record.rule.rule_id,
-                "evidence_scope": _resolve_evidence_scope(record.service_name, record.fingerprint),
+                "evidence_scope": evidence_scope,
+                "evidence_source_level": record.evidence_source_level,
                 "match_source": match_source,
                 "passive_match_types": build_passive_match_types(record.rule),
                 "verification_status": verification_status,
@@ -440,19 +505,33 @@ class RiskVerificationService:
         )
 
     @staticmethod
-    def _build_finding_from_active(context: VerificationContext, verification_result: VerificationResult) -> RiskFinding:
+    def _build_finding_from_active(
+        context: VerificationContext,
+        verification_result: VerificationResult,
+        *,
+        rule_id: str | None,
+    ) -> RiskFinding:
+        evidence_scope = _resolve_evidence_scope(context.service_name, context.fingerprint)
         return RiskFinding(
             asset_id=context.asset.id,
             asset_port_id=context.port.id,
-            rule_id=None,
+            yaml_rule_id=context.rule.rule_id,
+            identity_hash=_finding_identity_hash(
+                asset_id=context.asset.id,
+                asset_port_id=context.port.id,
+                yaml_rule_id=context.rule.rule_id,
+                evidence_scope=evidence_scope,
+            ),
+            rule_id=rule_id,
             severity=RiskSeverity(context.rule.severity),
             status=FindingStatus.OPEN,
             title=context.rule.name or context.rule.rule_id,
             description=context.rule.description,
             evidence_json={
                 "yaml_rule_id": context.rule.rule_id,
-                "evidence_scope": _resolve_evidence_scope(context.service_name, context.fingerprint),
-                "match_source": "active",
+                "evidence_scope": evidence_scope,
+                "evidence_source_level": _resolve_active_evidence_source_level(context),
+                "match_source": "active_only",
                 "passive_match_types": build_passive_match_types(context.rule),
                 "verification_status": verification_result.status,
                 "verification_summary": verification_result.summary,
@@ -470,6 +549,40 @@ class RiskVerificationService:
                 "package": context.package,
             },
         )
+
+    @staticmethod
+    def _upsert_finding(
+        db: Session,
+        existing_finding_map: dict[str, RiskFinding],
+        candidate: RiskFinding,
+        *,
+        create_if_missing: bool = True,
+    ) -> RiskFinding | None:
+        identity_hash = candidate.identity_hash
+        if not identity_hash:
+            if create_if_missing:
+                db.add(candidate)
+            return candidate if create_if_missing else None
+
+        existing = existing_finding_map.get(identity_hash)
+        if existing is None:
+            if not create_if_missing:
+                return None
+            existing_finding_map[identity_hash] = candidate
+            db.add(candidate)
+            return candidate
+
+        existing.yaml_rule_id = candidate.yaml_rule_id
+        existing.identity_hash = identity_hash
+        existing.rule_id = candidate.rule_id
+        existing.asset_port_id = candidate.asset_port_id
+        existing.severity = candidate.severity
+        existing.status = FindingStatus.OPEN
+        existing.title = candidate.title
+        existing.description = candidate.description
+        existing.evidence_json = candidate.evidence_json
+        existing.resolved_at = None
+        return existing
 
 
 def _load_open_device_alert_signatures(db: Session, *, asset_id: str) -> set[str]:
@@ -505,8 +618,8 @@ def _collect_pending_device_alert(
 
 
 def _build_device_alert_signature(finding: RiskFinding) -> str:
-    evidence = finding.evidence_json if isinstance(finding.evidence_json, dict) else {}
-    yaml_rule_id = str(evidence.get("yaml_rule_id") or "").strip()
+    evidence = finding.evidence()
+    yaml_rule_id = str(finding.resolved_yaml_rule_id() or "").strip()
     service_name = str(evidence.get("service_name") or "").strip()
     evidence_scope = str(evidence.get("evidence_scope") or "").strip()
     port = str(evidence.get("port") or "").strip()
@@ -581,6 +694,16 @@ def _ensure_finding_identity(finding: RiskFinding) -> None:
         finding.id = str(uuid4())
     if not getattr(finding, "detected_at", None):
         finding.detected_at = datetime.now(timezone.utc)
+    yaml_rule_id = finding.resolved_yaml_rule_id()
+    if yaml_rule_id and not finding.yaml_rule_id:
+        finding.yaml_rule_id = yaml_rule_id
+    if not finding.identity_hash:
+        finding.identity_hash = _finding_identity_hash(
+            asset_id=finding.asset_id,
+            asset_port_id=finding.asset_port_id,
+            yaml_rule_id=finding.resolved_yaml_rule_id(),
+            evidence_scope=finding.resolved_evidence_scope(),
+        )
 
 
 def latest_snapshot(snapshots: list[HostSnapshot]) -> HostSnapshot | None:
@@ -590,6 +713,12 @@ def latest_snapshot(snapshots: list[HostSnapshot]) -> HostSnapshot | None:
     if not filtered:
         return None
     return max(filtered, key=lambda item: item.collected_at)
+
+
+def latest_available_snapshot(snapshots: list[HostSnapshot]) -> HostSnapshot | None:
+    if not snapshots:
+        return None
+    return max(snapshots, key=lambda item: item.collected_at)
 
 
 def is_probe_snapshot(snapshot: HostSnapshot) -> bool:
@@ -712,6 +841,10 @@ def extract_service_package_context(
     version = _first_non_empty(config.get("package_version_raw"), metadata.get("version"))
     distro = _first_non_empty(config.get("distro_name")).lower()
     release = _first_non_empty(config.get("distro_release"))
+    if (not distro or not release) and snapshot is not None:
+        normalized_distro, normalized_release = _normalize_snapshot_distro(snapshot)
+        distro = distro or normalized_distro or ""
+        release = release or normalized_release or ""
     if not any([manager, name, version, distro, release]):
         return {}
     return {
@@ -849,6 +982,146 @@ def _resolve_evidence_scope(service_name: str, fingerprint: dict[str, Any]) -> s
     if isinstance(fingerprint, dict) and str(fingerprint.get("authorization_scope") or "").strip().lower() == "authorized_local":
         return "authorized_local"
     return "network"
+
+
+def _default_verification_result(rule: RuleDefinition) -> VerificationResult:
+    detector = rule.active_check.detector if rule.active_check else "none"
+    return VerificationResult(status="skipped", summary="主动探测未执行", detector=detector)
+
+
+def _load_db_rule_map(db: Session) -> dict[tuple[str, str, str], str]:
+    if not hasattr(db, "scalars"):
+        return {}
+    try:
+        rows = db.scalars(select(RiskRule)).all()
+    except Exception:
+        return {}
+    result: dict[tuple[str, str, str], str] = {}
+    for row in rows:
+        key = (
+            str(row.service_name or "").strip().lower(),
+            str(row.title or "").strip(),
+            str(row.description or "").strip(),
+        )
+        if all(key) and row.id:
+            result.setdefault(key, row.id)
+    return result
+
+
+def _rule_lookup_key(rule: RuleDefinition) -> tuple[str, str, str]:
+    return (
+        str(rule.service or "").strip().lower(),
+        str(rule.name or rule.rule_id or "").strip(),
+        str(rule.description or "").strip(),
+    )
+
+
+def _index_findings_by_identity(findings: list[RiskFinding]) -> dict[str, RiskFinding]:
+    result: dict[str, RiskFinding] = {}
+    for finding in findings:
+        _ensure_finding_identity(finding)
+        if not finding.identity_hash:
+            continue
+        current = result.get(finding.identity_hash)
+        if current is None:
+            result[finding.identity_hash] = finding
+            continue
+        current_is_open = current.status == FindingStatus.OPEN
+        finding_is_open = finding.status == FindingStatus.OPEN
+        if finding_is_open and not current_is_open:
+            result[finding.identity_hash] = finding
+            continue
+        if finding.detected_at and current.detected_at and finding.detected_at < current.detected_at:
+            result[finding.identity_hash] = finding
+    return result
+
+
+def _converge_missing_findings(existing_findings: list[RiskFinding], seen_identity_hashes: set[str]) -> None:
+    resolved_at = datetime.now(timezone.utc)
+    for finding in existing_findings:
+        _ensure_finding_identity(finding)
+        if not finding.identity_hash or finding.identity_hash in seen_identity_hashes:
+            continue
+        if finding.status == FindingStatus.OPEN:
+            finding.status = FindingStatus.FIXED
+            finding.resolved_at = resolved_at
+
+
+def _finding_identity_hash(
+    *,
+    asset_id: str | None,
+    asset_port_id: str | None,
+    yaml_rule_id: str | None,
+    evidence_scope: str | None,
+) -> str | None:
+    return build_finding_identity_hash(
+        asset_id=asset_id,
+        asset_port_id=asset_port_id,
+        yaml_rule_id=yaml_rule_id,
+        evidence_scope=evidence_scope,
+    )
+
+
+def _resolve_passive_evidence_source_level(
+    *,
+    rule: RuleDefinition,
+    service_version: str | None,
+    config: dict[str, Any],
+    package: dict[str, Any],
+    nse: dict[str, Any],
+    fingerprint: dict[str, Any],
+) -> str:
+    sources: set[str] = set()
+    if rule.config_conditions or rule.package_conditions or config or package:
+        if config or package:
+            sources.add("host_snapshot")
+    if rule.version_constraint and service_version:
+        if package and service_version == str(package.get("version") or "").strip():
+            sources.add("host_snapshot")
+        else:
+            sources.add("network_fingerprint")
+    if rule.nse_conditions or nse or fingerprint:
+        sources.add("network_fingerprint")
+    if sources == {"host_snapshot"}:
+        return "host_snapshot"
+    if sources == {"network_fingerprint"}:
+        return "network_fingerprint"
+    if len(sources) > 1:
+        return "mixed"
+    return "network_fingerprint"
+
+
+def _resolve_active_evidence_source_level(context: VerificationContext) -> str:
+    return _resolve_passive_evidence_source_level(
+        rule=context.rule,
+        service_version=context.service_version,
+        config=context.config,
+        package=context.package,
+        nse=extract_nse_results(context.fingerprint),
+        fingerprint=context.fingerprint,
+    )
+
+
+def _normalize_snapshot_distro(snapshot: HostSnapshot) -> tuple[str | None, str | None]:
+    raw_sources = [snapshot.os_release]
+    for payload in [snapshot.services_json, snapshot.software_json, snapshot.error_json]:
+        if not isinstance(payload, dict):
+            continue
+        for key in ("os_release", "pretty_name", "distribution", "distro"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                raw_sources.append(value)
+    for value in raw_sources:
+        normalized = _normalize_distro_string(value)
+        if normalized != (None, None):
+            return normalized
+    return None, None
+
+
+def _normalize_distro_string(raw: str | None) -> tuple[str | None, str | None]:
+    from app.utils.versioning import normalize_linux_distro_text
+
+    return normalize_linux_distro_text(raw)
 
 
 RULES_PATH = Path(__file__).resolve().parents[1] / "rules" / "risk_rules.yaml"

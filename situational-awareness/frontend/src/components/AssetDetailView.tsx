@@ -83,6 +83,112 @@ function toStringArray(input: unknown): string[] {
     .filter(Boolean);
 }
 
+function normalizeDisplayText(input: unknown): string {
+  return typeof input === "string" ? input.trim() : "";
+}
+
+function displayOrNone(input: unknown): string {
+  const value = normalizeDisplayText(input);
+  return value || "无";
+}
+
+function compactDisplayParts(...values: unknown[]): string {
+  const parts = values.map((item) => normalizeDisplayText(item)).filter(Boolean);
+  return parts.join(" / ");
+}
+
+const ASSET_CATEGORY_LABELS: Record<string, string> = {
+  network_infrastructure: "网络基础设施",
+  virtual_network_component: "虚拟网络组件",
+  iot_device: "物联网设备",
+  general_endpoint: "通用终端",
+};
+
+const DEVICE_ROLE_LABELS: Record<string, string> = {
+  gateway_dns: "网关设备 / DNS 服务",
+  gateway: "网关设备",
+  dns_resolver: "DNS 解析服务",
+  dhcp_dns: "DHCP / DNS 服务",
+  dhcp_service: "DHCP 服务",
+  network_infrastructure: "网络基础设施",
+};
+
+const IDENTITY_SOURCE_LABELS: Record<string, string> = {
+  network_discovery_inferred: "发现推断",
+};
+
+function formatAssetCategory(value: unknown): string {
+  const normalized = normalizeDisplayText(value);
+  return ASSET_CATEGORY_LABELS[normalized] || normalized;
+}
+
+function formatDeviceRole(value: unknown): string {
+  const normalized = normalizeDisplayText(value);
+  return DEVICE_ROLE_LABELS[normalized] || normalized;
+}
+
+function formatIdentitySource(value: unknown): string {
+  const normalized = normalizeDisplayText(value);
+  return IDENTITY_SOURCE_LABELS[normalized] || normalized;
+}
+
+function isRecognizedServiceName(input: unknown): boolean {
+  const value = normalizeDisplayText(input).toLowerCase();
+  return value !== "" && value !== "unknown" && value !== "未知服务";
+}
+
+function resolveServiceName(record: Asset["ports"][number]): string {
+  if (isRecognizedServiceName(record.service_name)) {
+    return String(record.service_name).trim();
+  }
+  const payload = toRecord(record.fingerprint_json);
+  const aliases = toStringArray(payload.service_aliases);
+  const candidates = [
+    payload.application_service,
+    payload.product_name,
+    payload.transport_service,
+    payload.nmap_service,
+    payload.nmap_product,
+    aliases[0],
+  ];
+  for (const item of candidates) {
+    if (isRecognizedServiceName(item)) {
+      return normalizeDisplayText(item);
+    }
+  }
+  return "无";
+}
+
+function resolveServiceVersion(record: Asset["ports"][number]): string {
+  const direct = normalizeDisplayText(record.service_version);
+  if (direct) {
+    return direct;
+  }
+  const payload = toRecord(record.fingerprint_json);
+  const candidates = [payload.product_version, payload.version, payload.nmap_version];
+  for (const item of candidates) {
+    const value = normalizeDisplayText(item);
+    if (value) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function buildLocalAssetLabel(asset: Asset): string {
+  if (!asset.is_local) {
+    return "否";
+  }
+  const hint = normalizeDisplayText(asset.local_hint) || "本机命中";
+  return `是（${hint}）`;
+}
+
+function buildAssetHeaderDescription(asset: Asset): string {
+  const facts = [asset.hostname, asset.os_name].map((item) => normalizeDisplayText(item)).filter(Boolean);
+  facts.push("用于桌面端纵深分析和再采集操作。");
+  return facts.join(" · ");
+}
+
 function formatNmapSkipReason(reason: unknown): string {
   const raw = typeof reason === "string" ? reason.trim() : "";
   if (!raw) {
@@ -295,16 +401,18 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
           const payload = toRecord(record.fingerprint_json);
           const strategySkipped = Boolean(payload.nmap_skipped) || Boolean(payload.version_skipped);
           const skipReason = formatNmapSkipReason(payload.nmap_skip_reason) || "后门候选端口，已跳过版本探测";
+          const serviceName = resolveServiceName(record);
+          const serviceVersion = resolveServiceVersion(record);
           return (
             <div className="ui-cell-stack">
-              <OverflowText value={record.service_name || "未知服务"} block strong />
+              <OverflowText value={serviceName} block strong />
               {!record.service_version && strategySkipped ? (
                 <Tooltip title={skipReason}>
                   <Tag color="orange">策略跳过</Tag>
                 </Tooltip>
-              ) : (
-                <OverflowText value={record.service_version || "-"} block secondary />
-              )}
+              ) : serviceVersion ? (
+                <OverflowText value={serviceVersion} block secondary />
+              ) : null}
             </div>
           );
         },
@@ -354,8 +462,8 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
   const collectionMetrics = useMemo(() => {
     const portCount = sortedPorts.length;
     const identifiedServiceCount = sortedPorts.filter((item) => {
-      const value = String(item.service_name || "").trim().toLowerCase();
-      return value !== "" && value !== "unknown";
+      const value = resolveServiceName(item).trim().toLowerCase();
+      return value !== "" && value !== "无";
     }).length;
     const externalPortCount = sortedPorts.filter((item) => {
       const fingerprint = item.fingerprint_json;
@@ -446,6 +554,61 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
   }, [latestCollectionSummary]);
 
   const credentialSubmitLoading = credentialSaving || credentialVerifyLoading;
+
+  const assetOverviewItems = useMemo(() => {
+    if (!asset) {
+      return [];
+    }
+    const items = [
+      { key: "1", label: "资产 ID", children: <span className="ui-detail-wrap mono-text">{asset.id}</span> },
+      { key: "2", label: "本机标识", children: <span className="ui-detail-wrap">{buildLocalAssetLabel(asset)}</span> },
+    ];
+
+    const macVendor = compactDisplayParts(asset.mac_address, asset.vendor);
+    if (macVendor) {
+      items.push({ key: "3", label: "MAC / 厂商", children: <span className="ui-detail-wrap">{macVendor}</span> });
+    }
+
+    const zoneVlan = compactDisplayParts(asset.network_zone, asset.network_vlan);
+    if (zoneVlan) {
+      items.push({ key: "4", label: "分区 / VLAN", children: <span className="ui-detail-wrap">{zoneVlan}</span> });
+    }
+
+    const buildingDepartment = compactDisplayParts(asset.building, asset.department);
+    if (buildingDepartment) {
+      items.push({ key: "5", label: "楼宇 / 部门", children: <span className="ui-detail-wrap">{buildingDepartment}</span> });
+    }
+
+    const categoryRole = compactDisplayParts(formatAssetCategory(asset.asset_category), formatDeviceRole(asset.device_role));
+    if (categoryRole) {
+      items.push({ key: "6", label: "类别 / 角色", children: <span className="ui-detail-wrap">{categoryRole}</span> });
+    }
+
+    const identitySource = formatIdentitySource(asset.identity_source);
+    if (identitySource) {
+      items.push({ key: "7", label: "身份来源", children: <span className="ui-detail-wrap">{identitySource}</span> });
+    }
+
+    if (asset.last_auth_time) {
+      items.push({
+        key: "8",
+        label: "最近认证时间",
+        children: <span className="ui-detail-wrap">{new Date(asset.last_auth_time).toLocaleString()}</span>,
+      });
+    }
+
+    items.push({
+      key: "9",
+      label: "首次发现",
+      children: <span className="ui-detail-wrap">{new Date(asset.first_seen_at).toLocaleString()}</span>,
+    });
+    items.push({
+      key: "10",
+      label: "最近发现",
+      children: <span className="ui-detail-wrap">{new Date(asset.last_seen_at).toLocaleString()}</span>,
+    });
+    return items;
+  }, [asset]);
 
   const resetCredentialFlow = () => {
     setAuthorizationModalOpen(false);
@@ -596,7 +759,7 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
       <DesktopPageHeader
         eyebrow="资产纵深"
         title={asset.ip}
-        description={`${asset.hostname || "未识别主机名"} · ${asset.os_name || "未识别系统"} · 用于桌面端纵深分析和再采集操作。`}
+        description={buildAssetHeaderDescription(asset)}
         meta={[
           { label: "资产状态", value: <StatusTag value={asset.status} />, tone: asset.status === "online" ? "success" : "warning" },
           { label: "最高风险", value: <StatusTag value={highestSeverity || null} />, tone: highestSeverity ? "danger" : "neutral" },
@@ -641,12 +804,7 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
               <Descriptions
                 column={1}
                 size="small"
-                items={[
-                  { key: "1", label: "资产 ID", children: <span className="ui-detail-wrap mono-text">{asset.id}</span> },
-                  { key: "2", label: "本机标识", children: <span className="ui-detail-wrap">{asset.is_local ? `是（${asset.local_hint || "本机命中"}）` : "否"}</span> },
-                  { key: "3", label: "首次发现", children: new Date(asset.first_seen_at).toLocaleString() },
-                  { key: "4", label: "最近发现", children: new Date(asset.last_seen_at).toLocaleString() },
-                ]}
+                items={assetOverviewItems}
               />
               <div style={{ marginTop: 16 }}>
                 <Typography.Text type="secondary">风险密度</Typography.Text>
@@ -712,9 +870,9 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
               column={1}
               size="small"
                 items={[
-                  { key: "1", label: "主机名", children: <span className="ui-detail-wrap">{String((latestInitial.summary_json || {}).hostname || "未识别")}</span> },
-                  { key: "2", label: "系统猜测", children: <span className="ui-detail-wrap">{String((latestInitial.summary_json || {}).os_guess || "未知")}</span> },
-                  { key: "3", label: "用途猜测", children: <span className="ui-detail-wrap">{String((latestInitial.summary_json || {}).role_guess || "通用节点")}</span> },
+                  { key: "1", label: "主机名", children: <span className="ui-detail-wrap">{displayOrNone((latestInitial.summary_json || {}).hostname)}</span> },
+                  { key: "2", label: "系统猜测", children: <span className="ui-detail-wrap">{displayOrNone((latestInitial.summary_json || {}).os_guess)}</span> },
+                  { key: "3", label: "用途猜测", children: <span className="ui-detail-wrap">{displayOrNone((latestInitial.summary_json || {}).role_guess)}</span> },
                   {
                     key: "4",
                     label: "关键观察",

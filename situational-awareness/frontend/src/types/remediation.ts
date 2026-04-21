@@ -67,6 +67,8 @@ export type RemediationPlanStep = {
   supported: boolean;
   execution_state: "ready" | "blocked";
   blocked_reason: string | null;
+  apply_supported: boolean;
+  apply_blocked_reason: string | null;
   generated_command: string | null;
   requires_confirmation: boolean;
   backup_plan: {
@@ -82,6 +84,7 @@ export type RemediationPlanStep = {
   fallback_candidates: string[];
   verify_items: string[];
   rollback_hint: string | null;
+  rollback_command: string | null;
   risk_level: "low" | "medium" | "high";
   idempotent: boolean;
   dry_run_supported: boolean;
@@ -215,6 +218,8 @@ export type HostRemediationPlanStep = {
   phase_name: string;
   execution_state: "ready" | "blocked";
   blocked_reason: string | null;
+  apply_supported: boolean;
+  apply_blocked_reason: string | null;
   generated_command: string | null;
   backup_plan: RemediationPlanStep["backup_plan"];
   render_reason: string | null;
@@ -226,6 +231,7 @@ export type HostRemediationPlanStep = {
   fallback_candidates: string[];
   verify_items: string[];
   rollback_hint: string | null;
+  rollback_command: string | null;
   risk_level: "low" | "medium" | "high";
   idempotent: boolean;
   dry_run_supported: boolean;
@@ -339,6 +345,7 @@ export type RemediationSession = {
   last_task_id: string | null;
   approved_at: string | null;
   approved_by: string | null;
+  auto_apply_remaining?: boolean;
 };
 
 export type RemediationSessionCreateRequest = {
@@ -356,6 +363,7 @@ export type RemediationSessionApproveResponse = {
   status: "pending" | "running" | "retry" | "success" | "failure" | "canceled";
   stream_url: string;
   execution_mode: "dry_run" | "apply";
+  apply_all_remaining?: boolean;
 };
 
 export type RemediationSessionApproveRequest = {
@@ -363,6 +371,7 @@ export type RemediationSessionApproveRequest = {
   execution_mode?: "dry_run" | "apply";
   change_ticket?: string | null;
   maintenance_window_id?: string | null;
+  apply_all_remaining?: boolean;
 };
 
 export type HostRunnerInstallResponse = {

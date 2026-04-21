@@ -16,6 +16,7 @@ from app.db.base import Base
 from app.db import models as db_models  # noqa: F401
 from app.db.session import SessionLocal, engine
 from app.services.device_alert_service import device_alert_hub
+from app.services.campus_bootstrap_service import ensure_campus_auto_bootstrap
 from app.services.local_asset_service import purge_local_assets
 from app.services.platform_log_service import disable_platform_log_capture, enable_platform_log_capture, install_platform_log_capture
 from app.utils.local_asset import remember_local_asset_hint
@@ -86,6 +87,14 @@ def create_app() -> FastAPI:
         try:
             Base.metadata.create_all(bind=engine)
             _purge_removed_vuln_library_tasks(logger)
+            with SessionLocal() as db:
+                try:
+                    bootstrap_summary = ensure_campus_auto_bootstrap(db)
+                    if any(int(value or 0) > 0 for value in bootstrap_summary.values()):
+                        logger.info("Auto-bootstrapped campus discovery defaults: %s", bootstrap_summary)
+                except Exception as exc:  # pragma: no cover - startup bootstrap should not break app
+                    db.rollback()
+                    logger.warning("Campus auto bootstrap skipped: %s", exc)
             enable_platform_log_capture()
             platform_log_capture_enabled = True
         except Exception as exc:  # pragma: no cover - environment dependent

@@ -118,6 +118,8 @@ def _build_step_items(
     preview_payload = {
         "action_type": step.get("action_type"),
         "generated_command": step.get("generated_command"),
+        "apply_supported": step.get("apply_supported"),
+        "apply_blocked_reason": step.get("apply_blocked_reason"),
         "risk_level": step.get("risk_level"),
         "idempotent": step.get("idempotent"),
         "dry_run_supported": step.get("dry_run_supported"),
@@ -131,6 +133,7 @@ def _build_step_items(
         "backup_plan": step.get("backup_plan") if isinstance(step.get("backup_plan"), dict) else {},
         "verify_items": step.get("verify_items") if isinstance(step.get("verify_items"), list) else [],
         "rollback_hint": step.get("rollback_hint"),
+        "rollback_command": step.get("rollback_command"),
         "execution_state": step.get("execution_state"),
     }
     items = [
@@ -156,6 +159,8 @@ def _build_step_items(
                 "summary": _execution_summary(step_result),
                 "payload_json": {
                     "generated_command": step_result.get("generated_command") or step.get("generated_command"),
+                    "rollback_command": step_result.get("rollback_command") or step.get("rollback_command"),
+                    "rollback_artifact": step_result.get("rollback_artifact") if isinstance(step_result.get("rollback_artifact"), dict) else {},
                     "exit_status": step_result.get("exit_status"),
                     "backup_paths": step_result.get("backup_paths") if isinstance(step_result.get("backup_paths"), list) else [],
                     "output_tail": step_result.get("output_tail") if isinstance(step_result.get("output_tail"), list) else [],

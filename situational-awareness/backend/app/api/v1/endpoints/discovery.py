@@ -9,6 +9,9 @@ from app.repositories.discovery_repo import create_job, get_active_job_by_cidr, 
 from app.repositories.task_repo import create_task_run, get_latest_task_run_for_scope, update_task_run
 from app.schemas.common import PageMeta
 from app.schemas.discovery import DiscoveryJobCreate, DiscoveryJobCreateResponse, DiscoveryJobListResponse, DiscoveryJobRead
+from app.services.campus_bootstrap_service import ensure_campus_auto_bootstrap
+from app.services.campus_discovery_service import schedule_campus_discovery_job
+from app.services.campus_zone_service import find_matching_scanner_zones, get_scanner_zone
 from app.services.runner_service import resolve_runner_by_asset_for_read
 from app.tasks.scan_tasks import run_asset_scan_task
 from app.utils.net import normalize_cidr
@@ -23,7 +26,16 @@ def create_discovery_job(
     db: Session = Depends(get_db_session),
     current_user: User = Depends(get_current_user),
 ) -> DiscoveryJobCreateResponse:
-    def ensure_scan_task(job_id: str, *, message: str = "扫描任务已入队", runner_asset_id: str | None = None):
+    ensure_campus_auto_bootstrap(db)
+
+    def ensure_scan_task(
+        job_id: str,
+        *,
+        message: str = "扫描任务已入队",
+        runner_asset_id: str | None = None,
+        scanner_zone_id: str | None = None,
+        use_runner_dispatch: bool = False,
+    ):
         existing = get_latest_task_run_for_scope(
             db,
             scope_type="discovery_job",
@@ -38,16 +50,19 @@ def create_discovery_job(
             "context": {
                 "job_id": job_id,
                 "runner_asset_id": str(runner_asset_id or "").strip() or None,
-                "execution_boundary": "runner_dispatch" if runner_asset_id else "local",
+                "scanner_zone_id": str(scanner_zone_id or "").strip() or None,
+                "execution_boundary": "runner_dispatch" if use_runner_dispatch else "local",
             }
         }
-        if runner_asset_id:
+        if use_runner_dispatch:
             return update_task_run(db, created, result_json=result_json, message="等待扫描节点接单")
         celery_task = run_asset_scan_task.delay(created.id, job_id)
         return update_task_run(db, created, celery_task_id=celery_task.id, result_json=result_json)
 
     cidr_text = normalize_cidr(str(payload.cidr))
     runner_asset_id = str(getattr(payload, "runner_asset_id", "") or "").strip() or None
+    scanner_zone_id = str(getattr(payload, "scanner_zone_id", "") or "").strip() or None
+    matched_zones = []
     if runner_asset_id:
         runner = resolve_runner_by_asset_for_read(db, runner_asset_id)
         if runner is None:
@@ -56,9 +71,22 @@ def create_discovery_job(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="指定的扫描节点尚未完成 Runner 安装")
         if runner.status not in {"online", "busy"}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="指定的扫描节点当前离线")
+    elif scanner_zone_id:
+        zone = get_scanner_zone(db, scanner_zone_id)
+        if zone is None or not zone.enabled:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="指定的扫描分区不可用")
+        matched_zones = [zone]
+    else:
+        matched_zones = find_matching_scanner_zones(db, cidr_text)
     active_job = get_active_job_by_cidr(db, cidr_text)
     if active_job:
-        existing_task = ensure_scan_task(active_job.id, message="已复用已有扫描任务", runner_asset_id=runner_asset_id)
+        existing_task = ensure_scan_task(
+            active_job.id,
+            message="已复用已有扫描任务",
+            runner_asset_id=runner_asset_id,
+            scanner_zone_id=scanner_zone_id,
+            use_runner_dispatch=bool(runner_asset_id or scanner_zone_id or matched_zones),
+        )
         response.status_code = status.HTTP_200_OK
         return DiscoveryJobCreateResponse(
             job=DiscoveryJobRead.model_validate(active_job),
@@ -68,13 +96,25 @@ def create_discovery_job(
         )
 
     try:
-        job = create_job(db=db, cidr=cidr_text, label=payload.label, created_by=current_user.id)
+        job = create_job(
+            db=db,
+            cidr=cidr_text,
+            label=payload.label,
+            created_by=current_user.id,
+            scanner_zone_id=scanner_zone_id,
+        )
     except IntegrityError:
         db.rollback()
         active_job = get_active_job_by_cidr(db, cidr_text)
         if not active_job:
             raise
-        existing_task = ensure_scan_task(active_job.id, message="检测到并发冲突，已复用已有扫描任务", runner_asset_id=runner_asset_id)
+        existing_task = ensure_scan_task(
+            active_job.id,
+            message="检测到并发冲突，已复用已有扫描任务",
+            runner_asset_id=runner_asset_id,
+            scanner_zone_id=scanner_zone_id,
+            use_runner_dispatch=bool(runner_asset_id or scanner_zone_id or matched_zones),
+        )
         response.status_code = status.HTTP_200_OK
         return DiscoveryJobCreateResponse(
             job=DiscoveryJobRead.model_validate(active_job),
@@ -87,13 +127,23 @@ def create_discovery_job(
         **(job.summary_json if isinstance(job.summary_json, dict) else {}),
         "request": {
             "runner_asset_id": runner_asset_id,
-            "execution_boundary": "runner_dispatch" if runner_asset_id else "local",
+            "scanner_zone_id": scanner_zone_id,
+            "matched_zone_ids": [zone.id for zone in matched_zones],
+            "execution_boundary": "runner_dispatch" if (runner_asset_id or matched_zones) else "local",
         },
     }
+    job.scanner_zone_id = scanner_zone_id
     db.add(job)
     db.commit()
     db.refresh(job)
-    task_run = ensure_scan_task(job.id, runner_asset_id=runner_asset_id)
+    task_run = ensure_scan_task(
+        job.id,
+        runner_asset_id=runner_asset_id,
+        scanner_zone_id=scanner_zone_id,
+        use_runner_dispatch=bool(runner_asset_id or scanner_zone_id or matched_zones),
+    )
+    if not runner_asset_id and matched_zones:
+        schedule_campus_discovery_job(db, job=job, parent_task_id=task_run.id, scanner_zone_id=scanner_zone_id)
     response.status_code = status.HTTP_201_CREATED
     return DiscoveryJobCreateResponse(job=DiscoveryJobRead.model_validate(job), task_id=task_run.id, status="pending", reused=False)
 

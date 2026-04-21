@@ -7,6 +7,10 @@ from typing import Any
 from app.utils.sanitize import sanitize_json_value, sanitize_text
 
 CIDR_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b")
+ASSET_ID_PATTERN = re.compile(
+    r"(?:asset|资产|主机)\s*(?:id)?\s*[:：#]?\s*([A-Za-z0-9][A-Za-z0-9._-]{2,63})",
+    re.IGNORECASE,
+)
 MAINTENANCE_WINDOW_PATTERN = re.compile(
     r"(?:maintenance_window_id|维护窗口(?:id|编号)?)\s*(?:是|为|=|:|：)\s*([A-Za-z0-9][A-Za-z0-9._-]{1,126})",
     re.IGNORECASE,
@@ -182,6 +186,15 @@ def _contains_ssh_credential_intent(content: str) -> bool:
 
 def _asset_id_from_context(page_context: dict[str, Any], working_context: dict[str, Any]) -> str | None:
     return _normalize_id(working_context.get("asset_id") or page_context.get("asset_id"))
+
+
+def _asset_id_from_request(content: str, page_context: dict[str, Any], working_context: dict[str, Any]) -> str | None:
+    match = ASSET_ID_PATTERN.search(content)
+    if match is not None:
+        explicit = _normalize_id(match.group(1))
+        if explicit:
+            return explicit
+    return _asset_id_from_context(page_context, working_context)
 
 
 def _selected_asset_targets(browser_context: dict[str, Any]) -> list[dict[str, str]]:
@@ -394,7 +407,7 @@ def _playbook_analyze_asset_risks(content: str, *, page_context: dict[str, Any],
 
 
 def _playbook_verify_asset_risks(content: str, *, page_context: dict[str, Any], working_context: dict[str, Any]) -> AgentPlaybookDecision | None:
-    asset_id = _asset_id_from_context(page_context, working_context)
+    asset_id = _asset_id_from_request(content, page_context, working_context)
     if not asset_id or not _contains_risk_verification_intent(content):
         return None
     return AgentPlaybookDecision(
@@ -414,19 +427,32 @@ def _playbook_verify_asset_risks(content: str, *, page_context: dict[str, Any], 
 
 
 def _playbook_install_runner(content: str, *, page_context: dict[str, Any], working_context: dict[str, Any]) -> AgentPlaybookDecision | None:
-    asset_id = _asset_id_from_context(page_context, working_context)
-    if not asset_id or not _contains_any(content, ("安装 runner", "安装runner", "重装 runner", "重装runner", "runner")):
+    asset_id = _asset_id_from_request(content, page_context, working_context)
+    lowered = content.lower()
+    if not asset_id or not (_contains_any(content, ("安装 runner", "安装runner", "重装 runner", "重装runner")) or "runner" in lowered):
         return None
+    params: dict[str, Any] = {"asset_id": asset_id}
+    if _contains_any(content, ("自动修复", "继续自动修复", "然后继续自动修复", "恢复修复", "整改", "修复")):
+        params["resume_action"] = {
+            "action_type": "create_or_resume_remediation_session",
+            "title": f"为资产 {asset_id} 准备修复会话",
+            "reason": "Runner 安装完成后继续原自动修复目标。",
+            "params": {"asset_id": asset_id, "submit_if_ready": True},
+        }
     return AgentPlaybookDecision(
         playbook_id=PLAYBOOK_INSTALL_RUNNER,
         objective=f"为资产 {asset_id} 安装 Runner",
-        reply_markdown=f"我会先为资产 {asset_id} 启动 Runner 安装任务，并在完成后继续同步状态。",
+        reply_markdown=(
+            f"我会先为资产 {asset_id} 启动 Runner 安装任务，并在完成后继续自动修复。"
+            if "resume_action" in params
+            else f"我会先为资产 {asset_id} 启动 Runner 安装任务，并在完成后继续同步状态。"
+        ),
         auto_execute_actions=[
             {
                 "action_type": "install_runner",
                 "title": f"为资产 {asset_id} 安装 Runner",
                 "reason": "用户已明确要求安装当前资产的 Runner。",
-                "params": {"asset_id": asset_id},
+                "params": params,
             }
         ],
         stop_reason="playbook_install_runner",
@@ -434,7 +460,7 @@ def _playbook_install_runner(content: str, *, page_context: dict[str, Any], work
 
 
 def _playbook_start_remediation_session(content: str, *, page_context: dict[str, Any], working_context: dict[str, Any]) -> AgentPlaybookDecision | None:
-    asset_id = _asset_id_from_context(page_context, working_context)
+    asset_id = _asset_id_from_request(content, page_context, working_context)
     maintenance_window_id = _extract_maintenance_window_id(content)
     if not asset_id or (not _contains_any(content, ("修复", "整改", "修补", "恢复修复")) and not maintenance_window_id):
         return None

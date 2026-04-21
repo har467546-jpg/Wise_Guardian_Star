@@ -481,13 +481,13 @@ def _collect_targeted_finding_context(
 
 
 def _serialize_finding_scope(finding: RiskFinding) -> dict[str, Any]:
-    evidence = finding.evidence_json if isinstance(finding.evidence_json, dict) else {}
+    evidence = finding.evidence()
     port = evidence.get("port")
     try:
         normalized_port = int(port) if port is not None else None
     except (TypeError, ValueError):
         normalized_port = None
-    rule_id = str(evidence.get("yaml_rule_id") or finding.rule_id or "").strip() or None
+    rule_id = str(finding.resolved_yaml_rule_id() or finding.rule_id or "").strip() or None
     return {
         "finding_id": finding.id,
         "rule_id": rule_id,

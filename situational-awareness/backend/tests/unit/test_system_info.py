@@ -9,6 +9,22 @@ def test_parse_os_release() -> None:
     assert parsed["pretty_name"] == "Ubuntu 22.04.4 LTS"
 
 
+def test_parse_os_release_accepts_legacy_lsb_release_output() -> None:
+    raw = "Description:\tUbuntu 8.04.4 LTS\n"
+    parsed = parse_os_release(raw)
+    assert parsed["name"] == "Ubuntu"
+    assert parsed["version"] == "8.04.4 LTS"
+    assert parsed["pretty_name"] == "Ubuntu 8.04.4 LTS"
+
+
+def test_parse_os_release_accepts_legacy_issue_output() -> None:
+    raw = "Ubuntu 8.04 \\n \\l\n"
+    parsed = parse_os_release(raw)
+    assert parsed["name"] == "Ubuntu"
+    assert parsed["version"] == "8.04"
+    assert parsed["pretty_name"] == "Ubuntu 8.04"
+
+
 def test_parse_cpu_from_lscpu() -> None:
     raw = (
         "Architecture:        x86_64\n"

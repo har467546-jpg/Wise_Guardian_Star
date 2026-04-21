@@ -27,10 +27,15 @@ const pipelineStages = [
   },
 ];
 
-// 定义表单字段类型
 type DiscoveryFormValues = {
   cidr: string;
   label?: string;
+};
+
+type DiscoverySubmissionSummary = {
+  normalizedCidr: string;
+  estimatedHostCount: number | null;
+  discoveredHostCount: number | null;
 };
 
 function isValidDiscoveryCidr(value: string): boolean {
@@ -72,12 +77,51 @@ function normalizeDiscoveryValues(values: DiscoveryFormValues): DiscoveryFormVal
   };
 }
 
+function estimateDiscoverableHosts(cidr: string): number | null {
+  const normalized = cidr.trim();
+  if (!isValidDiscoveryCidr(normalized)) {
+    return null;
+  }
+
+  const [, rawPrefix] = normalized.split("/");
+  if (rawPrefix === undefined) {
+    return 1;
+  }
+
+  const prefix = Number(rawPrefix);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
+    return null;
+  }
+  if (prefix === 32) {
+    return 1;
+  }
+  if (prefix === 31) {
+    return 2;
+  }
+  return 2 ** (32 - prefix) - 2;
+}
+
+function extractDiscoveredHostCount(summaryJson: Record<string, unknown> | undefined): number | null {
+  if (!summaryJson) {
+    return null;
+  }
+  const rawHostCount = summaryJson.host_count;
+  if (typeof rawHostCount === "number" && Number.isFinite(rawHostCount)) {
+    return rawHostCount;
+  }
+  if (typeof rawHostCount === "string" && rawHostCount.trim() && !Number.isNaN(Number(rawHostCount))) {
+    return Number(rawHostCount);
+  }
+  return null;
+}
+
 export default function DiscoveryForm() {
   const [form] = Form.useForm<DiscoveryFormValues>();
   const [taskId, setTaskId] = useState<string | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [reused, setReused] = useState(false);
+  const [submissionSummary, setSubmissionSummary] = useState<DiscoverySubmissionSummary | null>(null);
 
   const onSubmit = async (values: DiscoveryFormValues) => {
     const payload = normalizeDiscoveryValues(values);
@@ -87,24 +131,28 @@ export default function DiscoveryForm() {
       setTaskId(null);
       setJobId(null);
       setReused(false);
+      setSubmissionSummary(null);
 
       const response = await createDiscoveryJob(payload);
-      
-      // --- 增加安全性校验 ---
+
       if (!response || !response.task_id) {
         throw new Error("接口未返回有效的任务 ID");
       }
 
       setTaskId(response.task_id);
-      // 使用可选链防止 job 不存在时崩溃
-      setJobId(response.job?.id || "未知 ID"); 
+      setJobId(response.job?.id || "未知 ID");
       setReused(!!response.reused);
-      
+      setSubmissionSummary({
+        normalizedCidr: String(response.job?.cidr || payload.cidr),
+        estimatedHostCount: estimateDiscoverableHosts(String(response.job?.cidr || payload.cidr)),
+        discoveredHostCount: extractDiscoveredHostCount(response.job?.summary_json),
+      });
+
       if (response.reused) {
         message.info("检测到进行中任务，已自动复用队列");
       } else {
         message.success("扫描任务已成功下发至引擎");
-        form.resetFields(["cidr"]); 
+        form.resetFields(["cidr"]);
       }
     } catch (error) {
       console.error("提交失败:", error);
@@ -122,11 +170,10 @@ export default function DiscoveryForm() {
         description="提交 CIDR 网段以触发全自动资产发现与风险校验流水线。"
         meta={[
           { label: "流水线模式", value: "全自动", tone: "success" },
-          { 
-            label: "当前状态", 
-            // 增加 reused 状态判断，让 Meta 信息更丰富
-            value: submitting ? "提交中" : taskId ? (reused ? "任务已复用" : "指令已下发") : "就绪", 
-            tone: submitting ? "warning" : taskId ? (reused ? "warning" : "accent") : "neutral" 
+          {
+            label: "当前状态",
+            value: submitting ? "提交中" : taskId ? (reused ? "任务已复用" : "指令已下发") : "就绪",
+            tone: submitting ? "warning" : taskId ? (reused ? "warning" : "accent") : "neutral",
           },
         ]}
       />
@@ -162,10 +209,7 @@ export default function DiscoveryForm() {
                 />
               </Form.Item>
 
-              <Form.Item
-                name="label"
-                label={<Text strong>任务备注标签</Text>}
-              >
+              <Form.Item name="label" label={<Text strong>任务备注标签</Text>}>
                 <Input
                   prefix={<TagOutlined className="ui-input-icon" />}
                   placeholder="例如: 核心业务段季度扫描"
@@ -198,7 +242,23 @@ export default function DiscoveryForm() {
                       <Tag color={reused ? "orange" : "blue"}>{taskId}</Tag>
                     </Space>
                   }
-                  description={`后台任务 ID: ${jobId || "处理中..."}。您可以在“任务中心”查看实时扫描进度。`}
+                  description={
+                    <Space direction="vertical" size={6}>
+                      <Text>后台任务 ID: {jobId || "处理中..."}。您可以在“任务中心”查看实时扫描进度。</Text>
+                      {submissionSummary ? (
+                        <Text type="secondary">
+                          网段摘要：
+                          {submissionSummary.normalizedCidr}
+                          {submissionSummary.estimatedHostCount !== null
+                            ? `，预计最多可探测 ${submissionSummary.estimatedHostCount} 个主机地址`
+                            : ""}
+                          {submissionSummary.discoveredHostCount !== null
+                            ? `，当前已识别在线 ${submissionSummary.discoveredHostCount} 台主机`
+                            : ""}
+                        </Text>
+                      ) : null}
+                    </Space>
+                  }
                 />
               </div>
             )}

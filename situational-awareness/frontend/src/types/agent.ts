@@ -183,6 +183,7 @@ export type AgentMessageActionSuggestion = {
   label: string;
   message_text?: string | null;
   pathname?: string | null;
+  asset_id?: string | null;
 };
 
 export type AgentAttentionKind = "none" | "waiting_approval" | "running_task" | "pending_ui_action";

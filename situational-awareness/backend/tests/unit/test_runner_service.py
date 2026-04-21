@@ -19,7 +19,7 @@ from app.services.runner_service import (
     _validate_runner_install_probe,
     _validate_runner_install_probe_minimal,
 )
-from app.schemas.remediation import RunnerTaskCompleteRequest, RunnerTaskStepRead
+from app.schemas.remediation import RemediationBackupPlanRead, RunnerTaskCompleteRequest, RunnerTaskStepRead
 
 
 class _FakeConnection:
@@ -464,3 +464,85 @@ def test_assignment_execution_script_falls_back_when_python_json_module_is_unava
 
     assert validated.status == "success"
     assert validated.step_results[0].generated_command == "cat <<'EOF'\npattern = re.compile('\\\\bDemo\\\\s+Rule\\\\b')\nEOF"
+
+
+def test_assignment_execution_script_reports_package_rollback_artifact(tmp_path: Path) -> None:
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir()
+    curl_path = tmp_path / "curl"
+    curl_path.write_text(
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            set -eu
+            body=""
+            url=""
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --data)
+                  body="$2"
+                  shift 2
+                  ;;
+                http://*|https://*)
+                  url="$1"
+                  shift
+                  ;;
+                *)
+                  shift
+                  ;;
+              esac
+            done
+            if printf "%s" "$url" | grep -q '/complete$'; then
+              printf "%s" "$body" >"$SA_CAPTURE_DIR/complete.json"
+            fi
+            printf '{}'
+            """
+        ),
+        encoding="utf-8",
+    )
+    curl_path.chmod(0o755)
+
+    script = _build_assignment_execution_script(
+        task_id="task-rollback",
+        summary="执行软件包升级",
+        steps=[
+            RunnerTaskStepRead(
+                step_id="step-1",
+                title="升级 bash 软件包",
+                action_type="upgrade_package",
+                generated_command="printf 'SA_TRANSACTION_ID=147\\n'",
+                rollback_command="apt-get install -y bash=5.2.15-2+b2",
+                execution_state="ready",
+                blocked_reason=None,
+                backup_plan=RemediationBackupPlanRead(kind="package_context", targets=["dpkg:bash"]),
+            )
+        ],
+    )
+
+    script_path = tmp_path / "assignment.sh"
+    script_path.write_text(script, encoding="utf-8")
+    script_path.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp_path}:{env['PATH']}"
+    env["SA_CAPTURE_DIR"] = str(capture_dir)
+    env["SA_RUNNER_PLATFORM_URL"] = "http://example.invalid"
+    env["SA_RUNNER_TOKEN"] = "runner-token"
+    env["SA_RUNNER_HTTP_TOOL"] = "curl"
+    subprocess.run(
+        ["/bin/sh", str(script_path)],
+        check=True,
+        cwd=str(tmp_path),
+        env=env,
+    )
+
+    payload = json.loads((capture_dir / "complete.json").read_text(encoding="utf-8"))
+    validated = RunnerTaskCompleteRequest.model_validate(payload)
+
+    assert validated.status == "success"
+    step_result = validated.step_results[0]
+    assert step_result.rollback_command == "apt-get install -y bash=5.2.15-2+b2"
+    assert step_result.rollback_artifact["kind"] == "package_version_replay"
+    assert step_result.rollback_artifact["package_name"] == "bash"
+    assert step_result.rollback_artifact["transaction_id"] == "147"
+    assert step_result.rollback_artifact["rollback_command"] == "apt-get install -y bash=5.2.15-2+b2"

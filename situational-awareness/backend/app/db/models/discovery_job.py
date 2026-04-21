@@ -25,6 +25,7 @@ class DiscoveryJob(Base):
     cidr: Mapped[str] = mapped_column(CIDR)
     status: Mapped[DiscoveryJobStatus] = mapped_column(Enum(DiscoveryJobStatus), default=DiscoveryJobStatus.PENDING)
     label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scanner_zone_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("scanner_zones.id", ondelete="SET NULL"), nullable=True, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -32,3 +33,5 @@ class DiscoveryJob(Base):
     summary_json: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     creator = relationship("User", back_populates="created_discovery_jobs")
+    scanner_zone = relationship("ScannerZone", back_populates="discovery_jobs")
+    executions = relationship("DiscoveryJobExecution", back_populates="discovery_job", cascade="all, delete-orphan")

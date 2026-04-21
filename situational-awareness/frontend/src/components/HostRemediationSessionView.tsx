@@ -20,12 +20,14 @@ import {
 
 import CollapsibleJsonBlock from "@/components/CollapsibleJsonBlock";
 import DesktopPageHeader from "@/components/DesktopPageHeader";
+import RollbackArtifactPanel from "@/components/RollbackArtifactPanel";
 import StatusTag from "@/components/StatusTag";
 import { getStoredToken } from "@/lib/auth";
 import {
   buildRemediationAssetPath,
   remediationBusinessStatusLabel,
-  remediationExecutionStatusLabel,
+  remediationExecutionOutcomeLabel,
+  remediationResolvedTaskMessage,
 } from "@/lib/remediation";
 import { formatDateTime, getTaskEventTypeLabel, localizeTaskMessage } from "@/lib/ui-text";
 import {
@@ -293,6 +295,114 @@ function executionBoundaryLabel(value: string | null | undefined): string {
 
 function executionModeLabel(value: string | null | undefined): string {
   return String(value || "").trim().toLowerCase() === "dry_run" ? "预演" : "正式执行";
+}
+
+function toSafeCount(input: unknown): number {
+  const parsed = Number(input);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0;
+}
+
+type RecentStageOutcome = {
+  stage: HostRemediationStage | null;
+  stageName: string;
+  businessStatus: string;
+  openTargetCount: number;
+  closedTargetCount: number;
+};
+
+function resolveStageFromTask(task: RemediationTask | null, stages: HostRemediationStage[]): HostRemediationStage | null {
+  const taskContext = toRecord(task?.context);
+  const stageCode = String(taskContext.stage_code || "").trim();
+  const stageName = String(taskContext.stage_name || "").trim();
+  return stages.find((stage) => stage.stage_code === stageCode)
+    || stages.find((stage) => stage.stage_name === stageName)
+    || null;
+}
+
+function resolveRecentStageOutcome({
+  task,
+  stages,
+}: {
+  task: RemediationTask | null;
+  stages: HostRemediationStage[];
+}): RecentStageOutcome | null {
+  const taskWithOutcome = task?.business_status ? task : null;
+  const taskContext = toRecord(taskWithOutcome?.context);
+  const taskReverifySummary = toRecord(taskWithOutcome?.reverify_summary);
+  const fallbackStage = [...stages].reverse().find((stage) => stage.business_status) || null;
+  const taskStage = resolveStageFromTask(taskWithOutcome, stages);
+  const businessStatus = (taskWithOutcome?.business_status || fallbackStage?.business_status || "").trim().toLowerCase();
+  if (!businessStatus) {
+    return null;
+  }
+  return {
+    stage: taskStage || fallbackStage,
+    stageName: String(taskContext.stage_name || taskStage?.stage_name || fallbackStage?.stage_name || "").trim() || "当前阶段",
+    businessStatus,
+    openTargetCount: taskWithOutcome
+      ? toSafeCount(taskReverifySummary.open_target_count)
+      : toSafeCount(fallbackStage?.open_target_count),
+    closedTargetCount: taskWithOutcome
+      ? toSafeCount(taskReverifySummary.closed_target_count)
+      : toSafeCount(fallbackStage?.closed_target_count),
+  };
+}
+
+function buildRecentStageOutcomeSummary(outcome: RecentStageOutcome | null, findingCount: number): string {
+  if (!outcome) {
+    return findingCount > 0
+      ? `当前资产仍有 ${findingCount} 条开放风险待处理`
+      : "当前资产暂无开放风险";
+  }
+  switch (outcome.businessStatus) {
+    case "pending_reverify":
+      return `${outcome.stageName}正在复验目标风险`;
+    case "verified_closed":
+      return outcome.closedTargetCount > 0
+        ? `${outcome.stageName}已关闭 ${outcome.closedTargetCount} 项目标风险`
+        : `${outcome.stageName}的目标风险已复验关闭`;
+    case "verified_partial":
+      return outcome.openTargetCount > 0
+        ? `${outcome.stageName}仍开放 ${outcome.openTargetCount} 项目标风险`
+        : `${outcome.stageName}的目标风险仍未完全闭环`;
+    case "verified_failed":
+      return `${outcome.stageName}执行或复验失败`;
+    default:
+      return findingCount > 0
+        ? `当前资产仍有 ${findingCount} 条开放风险待处理`
+        : "当前资产暂无开放风险";
+  }
+}
+
+function buildRecentStageOutcomeDetail({
+  findingCount,
+  task,
+  stages,
+}: {
+  findingCount: number;
+  task: RemediationTask | null;
+  stages: HostRemediationStage[];
+}): string {
+  const outcome = resolveRecentStageOutcome({ task, stages });
+  if (!outcome) {
+    return buildRecentStageOutcomeSummary(null, findingCount);
+  }
+  switch (outcome.businessStatus) {
+    case "pending_reverify":
+      return `最近阶段：${outcome.stageName}，正在复验目标风险`;
+    case "verified_closed":
+      return outcome.closedTargetCount > 0
+        ? `最近阶段：${outcome.stageName}，目标风险已关闭 ${outcome.closedTargetCount} 项`
+        : `最近阶段：${outcome.stageName}，目标风险已复验关闭`;
+    case "verified_partial":
+      return outcome.openTargetCount > 0
+        ? `最近阶段：${outcome.stageName}，目标风险仍开放 ${outcome.openTargetCount} 项`
+        : `最近阶段：${outcome.stageName}，目标风险仍未完全闭环`;
+    case "verified_failed":
+      return `最近阶段：${outcome.stageName}，执行或复验失败`;
+    default:
+      return buildRecentStageOutcomeSummary(outcome, findingCount);
+  }
 }
 
 function stepRiskColor(value: string | null | undefined): string {
@@ -737,6 +847,11 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
 
   const plan = session?.plan || null;
   const planStages = plan?.stages || [];
+  const remainingOpenRiskDetail = buildRecentStageOutcomeDetail({
+    findingCount: findings.length,
+    task,
+    stages: planStages,
+  });
   const currentStage =
     planStages.find((item) => item.stage_code === plan?.current_stage_code)
     || planStages.find((item) => item.gate_status === "running")
@@ -893,7 +1008,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
       ? "步骤：仅可执行"
       : "步骤：仅阻塞";
   const taskOutputSummary = task
-    ? `${localizeTaskMessage(task.message) || `当前任务状态：${task.status}`}${task.business_status ? ` · ${remediationBusinessStatusLabel(task.business_status)}` : ""}`
+    ? `${localizeTaskMessage(remediationResolvedTaskMessage(task.message, task.execution_status, task.business_status)) || `当前任务状态：${task.status}`}${task.business_status || task.execution_status ? ` · ${remediationExecutionOutcomeLabel(task.execution_status, task.business_status)}` : ""}`
     : activeTaskId
       ? `已关联任务 ${activeTaskId}`
       : "当前暂无任务输出";
@@ -956,22 +1071,26 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
     }
   };
 
-  const onApprove = async (executionMode: "dry_run" | "apply") => {
-    if (!session || !approvableStage) {
+  const onApprove = async (
+    executionMode: "dry_run" | "apply",
+    targetStage?: Pick<HostRemediationStage, "stage_code" | "stage_name"> | null,
+  ) => {
+    const stageToApprove = targetStage || approvableStage;
+    if (!session || !stageToApprove) {
       return;
     }
     try {
       setApproveModeLoading(executionMode);
       const response = await approveRemediationSession(session.session_id, {
-        stage_code: approvableStage.stage_code,
+        stage_code: stageToApprove.stage_code,
         execution_mode: executionMode,
         change_ticket: changeTicket.trim() || null,
         maintenance_window_id: maintenanceWindowId.trim() || null,
       });
       message.success(
         executionMode === "dry_run"
-          ? `阶段“${approvableStage.stage_name}”预演已生成：${response.task_id}`
-          : `阶段“${approvableStage.stage_name}”修复任务已提交：${response.task_id}`,
+          ? `阶段“${stageToApprove.stage_name}”预演已生成：${response.task_id}`
+          : `阶段“${stageToApprove.stage_name}”修复任务已提交：${response.task_id}`,
       );
       setStreamLines([]);
       setActiveTaskId(response.task_id);
@@ -1052,6 +1171,40 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
     syncRoute(nextFindingId || undefined, activeTaskId || undefined);
   };
 
+  const canRepairStage = (stage: HostRemediationStage): boolean => (
+    Boolean(
+      session
+      && approvableStage
+      && approvableStage.stage_code === stage.stage_code
+      && session.status !== "running"
+      && !approveModeLoading,
+    )
+  );
+
+  const stageRepairButtonLabel = (stage: HostRemediationStage): string => {
+    if (approvableStage?.stage_code === stage.stage_code) {
+      if (session?.status === "running") {
+        return "执行中";
+      }
+      if (approveModeLoading === "apply") {
+        return "提交中";
+      }
+      return "修复该阶段";
+    }
+    switch (stage.gate_status) {
+      case "completed":
+        return "阶段已完成";
+      case "running":
+        return "执行中";
+      case "blocked":
+        return "存在阻塞";
+      case "locked":
+        return "等待解锁";
+      default:
+        return "仅当前阶段可执行";
+    }
+  };
+
   const renderStageCard = (stage: HostRemediationStage & { filtered_steps: HostRemediationPlanStep[] }) => {
     const stageExpanded = viewState.expandedStages[stage.stage_code] ?? (
       stage.stage_code === currentStage?.stage_code
@@ -1080,9 +1233,20 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
               {stage.summary}
             </Typography.Text>
           </Space>
-          <Button size="small" onClick={() => toggleStageVisibility(stage.stage_code)}>
-            {stageExpanded ? "收起阶段" : "展开阶段"}
-          </Button>
+          <Space wrap>
+            <Button
+              size="small"
+              type={canRepairStage(stage) ? "primary" : "default"}
+              loading={approveModeLoading === "apply" && approvableStage?.stage_code === stage.stage_code}
+              disabled={!canRepairStage(stage)}
+              onClick={() => void onApprove("apply", stage)}
+            >
+              {stageRepairButtonLabel(stage)}
+            </Button>
+            <Button size="small" onClick={() => toggleStageVisibility(stage.stage_code)}>
+              {stageExpanded ? "收起阶段" : "展开阶段"}
+            </Button>
+          </Space>
         </div>
 
         <div className="remediation-stage-meta">
@@ -1157,6 +1321,14 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                         />
                       ) : null}
 
+                      {!step.apply_supported && step.apply_blocked_reason ? (
+                        <Alert
+                          type="info"
+                          showIcon
+                          message={`正式执行前需补齐条件：${step.apply_blocked_reason}`}
+                        />
+                      ) : null}
+
                       {step.fallback_strategy === "legacy_debian_auto_guess" && step.fallback_candidates.length ? (
                         <Space direction="vertical" size={4} style={{ width: "100%" }}>
                           <Typography.Text type="secondary" className="ui-detail-wrap">
@@ -1215,15 +1387,20 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                         </Space>
                       ) : null}
 
-                      {step.rollback_hint ? <Typography.Text type="secondary">回滚: {step.rollback_hint}</Typography.Text> : null}
+                      <RollbackArtifactPanel
+                        rollbackHint={step.rollback_hint}
+                        rollbackCommand={step.rollback_command}
+                      />
 
                       {commandExpanded && step.generated_command ? (
-                        <Input.TextArea
-                          className="remediation-workbench-command"
-                          rows={step.execution_state === "ready" ? 5 : 3}
-                          value={step.generated_command}
-                          readOnly
-                        />
+                        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                          <Input.TextArea
+                            className="remediation-workbench-command"
+                            rows={step.execution_state === "ready" ? 5 : 3}
+                            value={step.generated_command}
+                            readOnly
+                          />
+                        </Space>
                       ) : null}
                     </div>
                   </List.Item>
@@ -1247,7 +1424,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
         meta={[
           { label: "当前资产", value: assetDetail?.asset.hostname || assetDetail?.asset.ip || assetId, tone: "success" },
           { label: "工作台状态", value: workbenchStatusLabel(session?.status), tone: workbenchStatusTone(session?.status) },
-          { label: "可修复风险", value: findings.length, tone: findings.length ? "danger" : "neutral" },
+          { label: "剩余开放风险", value: findings.length, detail: remainingOpenRiskDetail, tone: findings.length ? "danger" : "neutral" },
           { label: "当前任务", value: activeTaskId || "无", tone: activeTaskId ? "accent" : "neutral" },
         ]}
         actions={(
@@ -1891,7 +2068,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                           <StatusTag value={task.status} />
                           <Typography.Text>{executionBoundaryLabel(task.execution_boundary)}</Typography.Text>
                           <Tag>{executionModeLabel(task.execution_mode)}</Tag>
-                          <Tag>{remediationExecutionStatusLabel(task.execution_status)}</Tag>
+                          <Tag>{remediationExecutionOutcomeLabel(task.execution_status, task.business_status)}</Tag>
                           {task.business_status ? (
                             <Tag color={remediationBusinessStatusColor(task.business_status)}>
                               {remediationBusinessStatusLabel(task.business_status)}
@@ -1914,8 +2091,8 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                       <Alert
                         type={task.business_status === "verified_closed" ? "success" : task.business_status === "verified_failed" ? "error" : "info"}
                         showIcon
-                        message={remediationBusinessStatusLabel(task.business_status)}
-                        description={localizeTaskMessage(task.message)}
+                        message={remediationExecutionOutcomeLabel(task.execution_status, task.business_status)}
+                        description={localizeTaskMessage(remediationResolvedTaskMessage(task.message, task.execution_status, task.business_status))}
                       />
                     ) : null}
 
@@ -1942,6 +2119,10 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                                   <Typography.Text type="secondary">开始: {formatDateTime(String(item.started_at || ""))}</Typography.Text>
                                   <Typography.Text type="secondary">完成: {formatDateTime(String(item.finished_at || ""))}</Typography.Text>
                                   {item.error ? <Typography.Text type="danger">{String(item.error)}</Typography.Text> : null}
+                                  <RollbackArtifactPanel
+                                    rollbackCommand={String(item.rollback_command || "") || null}
+                                    rollbackArtifact={item.rollback_artifact}
+                                  />
                                 </Space>
                               )}
                             />

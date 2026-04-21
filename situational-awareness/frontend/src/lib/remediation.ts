@@ -1,5 +1,76 @@
 import type { RemediationWorkspace } from "@/types/remediation";
 
+export type RollbackArtifactDiff = {
+  label: string;
+  before: string;
+  after: string;
+};
+
+type RollbackArtifactSummary = {
+  packageName: string | null;
+  manager: string | null;
+  rollbackVersion: string | null;
+  transactionId: string | null;
+};
+
+function toRecord(input: unknown): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return {};
+  }
+  return input as Record<string, unknown>;
+}
+
+function renderArtifactValue(value: unknown): string {
+  if (typeof value === "boolean") {
+    return value ? "是" : "否";
+  }
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+  return String(value).trim() || "-";
+}
+
+export function getRollbackArtifact(input: unknown): Record<string, unknown> | null {
+  const artifact = toRecord(input);
+  return Object.keys(artifact).length ? artifact : null;
+}
+
+export function getRollbackArtifactSummary(input: unknown): RollbackArtifactSummary | null {
+  const artifact = getRollbackArtifact(input);
+  if (!artifact) {
+    return null;
+  }
+  return {
+    packageName: renderArtifactValue(artifact.package_name) === "-" ? null : renderArtifactValue(artifact.package_name),
+    manager: renderArtifactValue(artifact.manager) === "-" ? null : renderArtifactValue(artifact.manager),
+    rollbackVersion: renderArtifactValue(artifact.rollback_version) === "-" ? null : renderArtifactValue(artifact.rollback_version),
+    transactionId: renderArtifactValue(artifact.transaction_id) === "-" ? null : renderArtifactValue(artifact.transaction_id),
+  };
+}
+
+export function getRollbackArtifactDiffs(input: unknown): RollbackArtifactDiff[] {
+  const artifact = getRollbackArtifact(input);
+  if (!artifact) {
+    return [];
+  }
+  const before = toRecord(artifact.before);
+  const after = toRecord(artifact.after);
+  const fields: Array<[string, string]> = [
+    ["version", "版本"],
+    ["arch", "架构"],
+    ["state", "状态"],
+    ["installed", "安装状态"],
+  ];
+  return fields.reduce<RollbackArtifactDiff[]>((items, [key, label]) => {
+    const beforeValue = renderArtifactValue(before[key]);
+    const afterValue = renderArtifactValue(after[key]);
+    if (beforeValue !== afterValue) {
+      items.push({ label, before: beforeValue, after: afterValue });
+    }
+    return items;
+  }, []);
+}
+
 export function buildRemediationAssetPath(
   assetId: string,
   params?: {
@@ -98,4 +169,61 @@ export function remediationExecutionStatusLabel(value: string | null | undefined
     default:
       return "-";
   }
+}
+
+
+export function remediationExecutionOutcomeLabel(
+  executionStatus: string | null | undefined,
+  businessStatus: string | null | undefined,
+): string {
+  switch ((businessStatus || "").trim().toLowerCase()) {
+    case "pending_reverify":
+      return "执行完成，待复验";
+    case "verified_closed":
+      return "执行完成，已闭环";
+    case "verified_partial":
+      return "执行完成，但未闭环";
+    case "verified_failed":
+      return "执行完成，但复验失败";
+    default:
+      return remediationExecutionStatusLabel(executionStatus);
+  }
+}
+
+
+export function remediationResolvedTaskMessage(
+  message: string | null | undefined,
+  executionStatus: string | null | undefined,
+  businessStatus: string | null | undefined,
+): string {
+  const normalizedMessage = String(message || "").trim();
+  const normalizedBusinessStatus = String(businessStatus || "").trim().toLowerCase();
+  if (
+    normalizedMessage === "Host Runner 已完成整机修复计划"
+    && normalizedBusinessStatus === "verified_partial"
+  ) {
+    return "当前阶段执行完成，但目标风险仍未关闭";
+  }
+  if (
+    normalizedMessage === "Host Runner 已完成整机修复计划"
+    && normalizedBusinessStatus === "verified_closed"
+  ) {
+    return "当前阶段执行完成，目标风险已闭环";
+  }
+  if (
+    normalizedMessage === "Host Runner 已完成当前阶段执行"
+    && normalizedBusinessStatus === "verified_partial"
+  ) {
+    return "当前阶段执行完成，但目标风险仍未关闭";
+  }
+  if (
+    normalizedMessage === "Host Runner 已完成当前阶段执行"
+    && normalizedBusinessStatus === "verified_closed"
+  ) {
+    return "当前阶段执行完成，目标风险已闭环";
+  }
+  if (!normalizedMessage) {
+    return remediationExecutionOutcomeLabel(executionStatus, businessStatus);
+  }
+  return normalizedMessage;
 }

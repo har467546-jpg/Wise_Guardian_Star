@@ -109,6 +109,12 @@ class PlatformSettingsRead(BaseModel):
     discovery_nse_timeout_seconds: int
     discovery_nse_host_concurrency: int
     discovery_nse_enable_vuln_scripts: bool
+    campus_default_portset_mode: str
+    campus_allow_full_scan_default: bool
+    campus_zone_host_concurrency_limit: int
+    campus_zone_nmap_min_rate: int
+    campus_dhcp_default_interval_seconds: int
+    campus_snmp_default_interval_seconds: int
     risk_active_verify_connect_timeout_seconds: int
     risk_active_verify_read_timeout_seconds: int
     risk_active_verify_max_concurrency: int
@@ -157,6 +163,12 @@ class PlatformSettingsUpdate(BaseModel):
     discovery_nse_timeout_seconds: int = Field(ge=1, le=7200)
     discovery_nse_host_concurrency: int = Field(ge=1, le=4096)
     discovery_nse_enable_vuln_scripts: bool
+    campus_default_portset_mode: Literal["curated", "top1000_plus_custom", "full"]
+    campus_allow_full_scan_default: bool
+    campus_zone_host_concurrency_limit: int = Field(ge=1, le=4096)
+    campus_zone_nmap_min_rate: int = Field(ge=1, le=1_000_000)
+    campus_dhcp_default_interval_seconds: int = Field(ge=60, le=86400)
+    campus_snmp_default_interval_seconds: int = Field(ge=60, le=86400)
     risk_active_verify_connect_timeout_seconds: int = Field(ge=1, le=300)
     risk_active_verify_read_timeout_seconds: int = Field(ge=1, le=300)
     risk_active_verify_max_concurrency: int = Field(ge=1, le=1024)

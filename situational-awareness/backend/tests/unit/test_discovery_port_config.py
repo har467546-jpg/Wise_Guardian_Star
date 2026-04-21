@@ -42,6 +42,16 @@ def test_build_discovery_config_from_settings(monkeypatch) -> None:
     assert cfg.top_ports_limit == 1000
 
 
+def test_build_discovery_config_prefers_campus_default_when_full_scan_not_allowed(monkeypatch) -> None:
+    monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_PORTSET_MODE", "full")
+    monkeypatch.setattr(discovery_tasks.settings, "CAMPUS_DEFAULT_PORTSET_MODE", "top1000_plus_custom")
+    monkeypatch.setattr(discovery_tasks.settings, "CAMPUS_ALLOW_FULL_SCAN_DEFAULT", False)
+
+    cfg = discovery_tasks._build_discovery_config()
+
+    assert cfg.portset_mode == "top1000_plus_custom"
+
+
 def test_normalize_open_ports_enforces_backdoor_version_skip(monkeypatch) -> None:
     monkeypatch.setattr(discovery_tasks.settings, "DISCOVERY_HIGH_BACKDOOR_PORTS", "10001,20001")
     host = {

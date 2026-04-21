@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -10,6 +11,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.api.deps import get_current_user, get_db_session
 from app.api.v1.endpoints import risks
+import app.main as app_main
 from app.db.base import Base
 from app.db.models.asset import Asset, AssetPort
 from app.db.models.enums import AssetStatus, FindingStatus, RiskSeverity, UserRole
@@ -69,17 +71,36 @@ def _build_client(tmp_path, rule_content: str) -> TestClient:
     rule_path.write_text(rule_content, encoding="utf-8")
     risks.RULE_STORE = RuleStore(rule_path)
 
+    async def _noop_async() -> None:
+        return None
+
+    app_main.device_alert_hub.start = _noop_async  # type: ignore[method-assign]
+    app_main.device_alert_hub.stop = _noop_async  # type: ignore[method-assign]
+    app_main._LOCAL_ASSET_PURGE_COMPLETED = True
+
     def _get_test_db():
         with SessionLocal() as db:
             yield db
 
     app = create_app()
+    @asynccontextmanager
+    async def _noop_lifespan(_app):
+        yield
+
+    app.router.lifespan_context = _noop_lifespan
     app.dependency_overrides[get_db_session] = _get_test_db
     app.dependency_overrides[get_current_user] = _override_user(UserRole.ADMIN)
     return TestClient(app)
 
 
-def _create_finding(*, evidence_json: dict, service_name: str = "apache", service_version: str = "2.2.8", port: int = 80) -> RiskFinding:
+def _create_finding(
+    *,
+    evidence_json: dict,
+    service_name: str = "apache",
+    service_version: str = "2.2.8",
+    port: int = 80,
+    yaml_rule_id: str | None = None,
+) -> RiskFinding:
     asset = Asset(id=str(uuid4()), ip=_unique_ip(), status=AssetStatus.ONLINE)
     asset_port = AssetPort(
         id=str(uuid4()),
@@ -95,6 +116,7 @@ def _create_finding(*, evidence_json: dict, service_name: str = "apache", servic
         id=str(uuid4()),
         asset_id=asset.id,
         asset_port_id=asset_port.id,
+        yaml_rule_id=yaml_rule_id or str(evidence_json.get("yaml_rule_id") or "").strip() or None,
         severity=RiskSeverity.HIGH,
         status=FindingStatus.OPEN,
         title="测试风险",
@@ -224,6 +246,47 @@ def test_risk_remediation_template_endpoint_generates_fallback_for_legacy_rule(t
     assert body["rollback_notes"]
 
 
+def test_risk_remediation_template_endpoint_prefers_structured_yaml_rule_id(tmp_path) -> None:
+    client = _build_client(
+        tmp_path,
+        """rules:
+  - id: apache.httpd.lt_2_2_9
+    name: Apache legacy exposure
+    enabled: true
+    service: apache
+    severity: high
+    description: Apache version is older than 2.2.9
+    match:
+      version: <2.2.9
+    remediation:
+      summary: 升级 {{ service_name }}
+      automation_level: callable
+      actions:
+        - action_type: upgrade_package
+          title: 升级 {{ service_name }}
+          params:
+            package_name: "{{ service_name }}"
+          target_services:
+            - apache
+""",
+    )
+    finding = _create_finding(
+        evidence_json={
+            "service_name": "apache",
+            "service_version": "2.2.8",
+            "port": 80,
+        },
+        yaml_rule_id="apache.httpd.lt_2_2_9",
+    )
+
+    response = client.get(f"/api/v1/risks/{finding.id}/remediation-template")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["rule_id"] == "apache.httpd.lt_2_2_9"
+    assert body["source_refs"]["yaml_rule_id"] == "apache.httpd.lt_2_2_9"
+
+
 def test_risk_remediation_template_endpoint_rejects_finding_without_yaml_rule(tmp_path) -> None:
     client = _build_client(tmp_path, "rules: []\n")
     finding = _create_finding(evidence_json={"service_name": "apache"})
@@ -274,6 +337,8 @@ def test_risks_endpoint_exposes_governance_and_supports_assign_and_waiver(tmp_pa
 
     assert list_response.status_code == 200
     list_item = list_response.json()["items"][0]
+    assert list_item["yaml_rule_id"] == "apache.httpd.lt_2_2_9"
+    assert list_item["verification_status"] == "confirmed"
     assert list_item["priority_tier"] in {"P2", "P3", "P4"}
     assert list_item["waiver_status"] == "none"
     assert assign_response.status_code == 200
@@ -281,5 +346,7 @@ def test_risks_endpoint_exposes_governance_and_supports_assign_and_waiver(tmp_pa
     assert waiver_response.status_code == 200
     assert waiver_response.json()["waiver_type"] == "accepted_risk"
     assert detail_response.status_code == 200
+    assert detail_response.json()["yaml_rule_id"] == "apache.httpd.lt_2_2_9"
+    assert detail_response.json()["verification_status"] == "confirmed"
     assert detail_response.json()["owner_id"] == "user-1"
     assert detail_response.json()["waiver_status"] == "accepted_risk"

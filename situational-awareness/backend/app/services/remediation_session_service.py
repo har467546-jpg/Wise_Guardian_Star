@@ -260,7 +260,8 @@ def approve_remediation_session(
         raise LookupError("修复会话不存在")
     asset_detail = build_remediation_asset_detail(db, session.asset_id)
     plan = _resolve_session_plan(db, session, asset_detail)
-    if not plan.execution_ready:
+    normalized_execution_mode = str(execution_mode or "apply").strip().lower() or "apply"
+    if normalized_execution_mode == "apply" and not plan.execution_ready:
         raise RuntimeError("；".join(plan.blocked_reasons) or "当前整机修复计划不可执行")
     requested_stage_code = str(stage_code or "").strip() or None
     approvable_stage = next((stage for stage in plan.stages if stage.gate_status == "ready"), None)
@@ -269,8 +270,13 @@ def approve_remediation_session(
     if requested_stage_code and requested_stage_code != approvable_stage.stage_code:
         raise RuntimeError("仅允许审批当前最早可执行阶段")
     stage = approvable_stage
-    ready_steps = [step.model_dump(mode="json") for step in select_executable_plan_steps(stage.steps)]
-    normalized_execution_mode = str(execution_mode or "apply").strip().lower() or "apply"
+    ready_steps = [
+        step.model_dump(mode="json")
+        for step in select_executable_plan_steps(
+            stage.steps,
+            require_apply_supported=normalized_execution_mode == "apply",
+        )
+    ]
     normalized_change_ticket = str(change_ticket or "").strip() or None
     normalized_maintenance_window_id = str(maintenance_window_id or "").strip() or None
     if normalized_execution_mode == "apply" and selected_steps_require_maintenance_window(ready_steps) and not normalized_maintenance_window_id:
@@ -650,13 +656,14 @@ def process_remediation_session_ai_generation(
     try:
         if "ai_plan_summary" in needs:
             plan_digest = str(needs["ai_plan_summary"]["digest"] or "").strip()
-            if not _has_ai_message_digest(
+            has_plan_summary = _prune_ai_message_type(
                 db,
-                session_id=session.id,
+                session=session,
                 message_type="ai_plan_summary",
                 payload_key="plan_digest",
-                digest=plan_digest,
-            ):
+                keep_digest=plan_digest,
+            )
+            if not has_plan_summary:
                 plan_content = ai_service.build_plan_summary(asset_detail=asset_detail, plan=plan)
                 _append_session_message(
                     db,
@@ -673,13 +680,14 @@ def process_remediation_session_ai_generation(
             summary_state["last_plan_digest"] = needs["ai_plan_summary"]["digest"]
         if "ai_blocker_analysis" in needs:
             blocker_digest = str(needs["ai_blocker_analysis"]["digest"] or "").strip()
-            if not _has_ai_message_digest(
+            has_blocker_analysis = _prune_ai_message_type(
                 db,
-                session_id=session.id,
+                session=session,
                 message_type="ai_blocker_analysis",
                 payload_key="blocker_digest",
-                digest=blocker_digest,
-            ):
+                keep_digest=blocker_digest,
+            )
+            if not has_blocker_analysis:
                 blocker_content = ai_service.build_blocker_analysis(asset_detail=asset_detail, plan=plan)
                 _append_session_message(
                     db,
@@ -697,19 +705,28 @@ def process_remediation_session_ai_generation(
         if "ai_task_failure" in needs:
             failed_task = db.get(TaskRun, needs["ai_task_failure"]["task_id"])
             if failed_task is not None:
-                failure_content = ai_service.build_task_failure(asset_detail=asset_detail, plan=plan, task=failed_task)
-                _append_session_message(
+                failure_digest = str(needs["ai_task_failure"]["digest"] or "").strip()
+                has_task_failure = _prune_ai_message_type(
                     db,
                     session=session,
-                    role="assistant",
                     message_type="ai_task_failure",
-                    content=failure_content,
-                    payload_json={
-                        "provider_mode": provider_mode,
-                        "task_id": failed_task.id,
-                        "failed_task_digest": needs["ai_task_failure"]["digest"],
-                    },
+                    payload_key="failed_task_digest",
+                    keep_digest=failure_digest,
                 )
+                if not has_task_failure:
+                    failure_content = ai_service.build_task_failure(asset_detail=asset_detail, plan=plan, task=failed_task)
+                    _append_session_message(
+                        db,
+                        session=session,
+                        role="assistant",
+                        message_type="ai_task_failure",
+                        content=failure_content,
+                        payload_json={
+                            "provider_mode": provider_mode,
+                            "task_id": failed_task.id,
+                            "failed_task_digest": failure_digest,
+                        },
+                    )
                 summary_state["last_failed_task_digest"] = needs["ai_task_failure"]["digest"]
         summary_state.update(
             ai_generation_status="idle",
@@ -769,8 +786,9 @@ def _collect_ai_generation_needs(
                 "step_blockers": [item.model_dump(mode="json") for item in plan.step_blockers],
             }
         )
-        force_blocker_analysis = force and reason in {"explain_blockers", "refresh_ai"}
-        if (
+        blocker_requested = reason in {None, "", "auto", "initial", "explain_blockers"}
+        force_blocker_analysis = force and reason == "explain_blockers"
+        if blocker_requested and (
             force_blocker_analysis
             or provider_changed
             or str(summary_state.get("last_blocker_digest") or "") != blocker_digest
@@ -830,6 +848,35 @@ def _has_ai_message_digest(
         if str(payload.get(payload_key) or "").strip() == normalized_digest:
             return True
     return False
+
+
+def _prune_ai_message_type(
+    db: Session,
+    *,
+    session: RemediationSession,
+    message_type: str,
+    payload_key: str,
+    keep_digest: str,
+) -> bool:
+    normalized_digest = str(keep_digest or "").strip()
+    if not normalized_digest:
+        return False
+    kept_current = False
+    removed = False
+    for item in reversed(list(session.messages)):
+        if item.message_type != message_type:
+            continue
+        payload = item.payload_json if isinstance(item.payload_json, dict) else {}
+        digest = str(payload.get(payload_key) or "").strip()
+        if digest == normalized_digest and not kept_current:
+            kept_current = True
+            continue
+        session.messages.remove(item)
+        db.delete(item)
+        removed = True
+    if removed:
+        db.add(session)
+    return kept_current
 
 
 def _has_task_failure_message(session: RemediationSession, failure_digest: str) -> bool:
@@ -1056,7 +1103,7 @@ def _synchronize_session_runtime_state_with_plan(
                 content = f"阶段“{running_stage_name}”执行后复验失败，请查看任务输出。" if running_stage_name else "当前阶段执行后复验失败，请查看任务输出。"
             elif task_execution_boundary == "runner_dispatch" and task_execution_mode != "dry_run":
                 next_status = "completed"
-                content = "Host Runner 已完成整机修复计划。"
+                content = "Host Runner 已完成当前阶段执行。"
             else:
                 content = f"阶段“{running_stage_name}”执行完成，工作台已更新到下一阶段。" if running_stage_name else "当前阶段执行完成，工作台已更新。"
             _append_session_audit_message(
@@ -1188,7 +1235,10 @@ def _build_host_plan(db: Session, asset_detail: RemediationAssetDetailRead, sess
                 step.action_type,
                 step.title,
                 step.generated_command or "",
+                step.rollback_command or "",
                 blocked_reason or "",
+                bool(step.apply_supported),
+                str(step.apply_blocked_reason or ""),
                 json_dumps(step.backup_plan.model_dump(mode="json") if step.backup_plan else {}),
                 json_dumps(step.target_files),
                 json_dumps(step.target_services),
@@ -1212,6 +1262,8 @@ def _build_host_plan(db: Session, asset_detail: RemediationAssetDetailRead, sess
                     phase_name=phase_name,
                     execution_state=step.execution_state,
                     blocked_reason=blocked_reason,
+                    apply_supported=step.apply_supported,
+                    apply_blocked_reason=step.apply_blocked_reason,
                     generated_command=step.generated_command,
                     backup_plan=step.backup_plan,
                     render_reason=step.render_reason,
@@ -1223,6 +1275,7 @@ def _build_host_plan(db: Session, asset_detail: RemediationAssetDetailRead, sess
                     fallback_candidates=list(step.fallback_candidates),
                     verify_items=list(step.verify_items),
                     rollback_hint=step.rollback_hint,
+                    rollback_command=step.rollback_command,
                     risk_level=step.risk_level,
                     idempotent=step.idempotent,
                     dry_run_supported=step.dry_run_supported,
@@ -1349,7 +1402,15 @@ def _build_host_plan(db: Session, asset_detail: RemediationAssetDetailRead, sess
     blocked_step_count = len([item for item in steps if item.execution_state == "blocked"])
     ready_stage_count = len([item for item in stages if item.gate_status == "ready"])
     blocked_stage_count = len([item for item in stages if item.gate_status == "blocked"])
-    blocked_reasons = [item.message for item in [*global_blockers, *step_blockers]]
+    blocked_reasons = list(
+        dict.fromkeys(
+            [
+                str(item.message).strip()
+                for item in [*global_blockers, *step_blockers]
+                if str(item.message).strip()
+            ]
+        )
+    )
     execution_ready = ready_stage_count > 0
     plan_mode = _plan_mode_for_session(session=session, stages=stages, execution_ready=execution_ready)
     summary_text = (

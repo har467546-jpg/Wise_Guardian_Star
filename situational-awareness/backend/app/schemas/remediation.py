@@ -86,6 +86,8 @@ class RemediationPlanStepRead(BaseModel):
     supported: bool
     execution_state: Literal["ready", "blocked"]
     blocked_reason: str | None = None
+    apply_supported: bool = True
+    apply_blocked_reason: str | None = None
     generated_command: str | None = None
     requires_confirmation: bool = True
     backup_plan: RemediationBackupPlanRead | None = None
@@ -97,6 +99,7 @@ class RemediationPlanStepRead(BaseModel):
     fallback_candidates: list[str] = Field(default_factory=list)
     verify_items: list[str] = Field(default_factory=list)
     rollback_hint: str | None = None
+    rollback_command: str | None = None
     risk_level: Literal["low", "medium", "high"] = "medium"
     idempotent: bool = False
     dry_run_supported: bool = False
@@ -210,6 +213,10 @@ class HostRunnerRead(BaseModel):
     status: str
     install_status: str
     version: str | None = None
+    node_role: str | None = None
+    scanner_zone_id: str | None = None
+    visible_cidrs_json: list[str] = Field(default_factory=list)
+    max_concurrent_jobs: int = 1
     platform_url: str | None = None
     last_seen_at: str | None = None
     last_error: str | None = None
@@ -272,6 +279,8 @@ class HostRemediationPlanStepRead(BaseModel):
     phase_name: str
     execution_state: Literal["ready", "blocked"]
     blocked_reason: str | None = None
+    apply_supported: bool = True
+    apply_blocked_reason: str | None = None
     generated_command: str | None = None
     backup_plan: RemediationBackupPlanRead | None = None
     render_reason: str | None = None
@@ -283,6 +292,7 @@ class HostRemediationPlanStepRead(BaseModel):
     fallback_candidates: list[str] = Field(default_factory=list)
     verify_items: list[str] = Field(default_factory=list)
     rollback_hint: str | None = None
+    rollback_command: str | None = None
     risk_level: Literal["low", "medium", "high"] = "medium"
     idempotent: bool = False
     dry_run_supported: bool = False
@@ -452,6 +462,7 @@ class RunnerTaskStepRead(BaseModel):
     title: str
     action_type: str
     generated_command: str | None = None
+    rollback_command: str | None = None
     execution_state: Literal["ready", "blocked"]
     blocked_reason: str | None = None
     backup_plan: RemediationBackupPlanRead | None = None
@@ -503,6 +514,8 @@ class RunnerTaskStepResultRead(BaseModel):
     title: str
     status: str
     generated_command: str | None = None
+    rollback_command: str | None = None
+    rollback_artifact: dict[str, Any] = Field(default_factory=dict)
     exit_status: int | None = None
     backup_paths: list[str] = Field(default_factory=list)
     output_tail: list[str] = Field(default_factory=list)

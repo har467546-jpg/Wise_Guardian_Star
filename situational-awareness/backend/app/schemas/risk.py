@@ -11,6 +11,8 @@ class RiskFindingRead(ORMModel):
     id: str
     asset_id: str
     asset_port_id: str | None
+    yaml_rule_id: str | None = None
+    identity_hash: str | None = None
     severity: RiskSeverity
     status: FindingStatus
     title: str
@@ -18,6 +20,8 @@ class RiskFindingRead(ORMModel):
     evidence_json: dict
     detected_at: datetime
     resolved_at: datetime | None
+    verification_status: str | None = None
+    match_source: str | None = None
     priority_score: int | None = None
     priority_tier: str | None = None
     priority_reason: dict[str, Any] | None = None
@@ -59,6 +63,8 @@ class RiskFindingMobileRead(BaseModel):
     asset_ip: str
     asset_hostname: str | None
     asset_port_id: str | None
+    yaml_rule_id: str | None = None
+    identity_hash: str | None = None
     severity: RiskSeverity
     status: FindingStatus
     title: str
@@ -66,6 +72,8 @@ class RiskFindingMobileRead(BaseModel):
     evidence_json: dict
     detected_at: datetime
     resolved_at: datetime | None
+    verification_status: str | None = None
+    match_source: str | None = None
     priority_score: int | None = None
     priority_tier: str | None = None
     priority_reason: dict[str, Any] | None = None

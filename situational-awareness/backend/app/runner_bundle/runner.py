@@ -398,7 +398,7 @@ def execute_assignment(config: Dict[str, Any], state: Dict[str, Any], assignment
         task_id,
         {
             "status": final_status,
-            "message": "Host Runner 已完成整机修复计划" if final_status == "success" else "Host Runner 执行失败",
+            "message": "Host Runner 已完成当前阶段执行" if final_status == "success" else "Host Runner 执行失败",
             "execution": execution,
             "backups": backup_map,
             "step_results": step_results,

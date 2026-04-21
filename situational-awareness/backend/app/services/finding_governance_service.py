@@ -289,9 +289,7 @@ def _sla_due_at(finding: RiskFinding, priority_tier: str) -> datetime:
 
 
 def _yaml_rule_id(finding: RiskFinding) -> str | None:
-    evidence = finding.evidence_json if isinstance(finding.evidence_json, dict) else {}
-    value = str(evidence.get("yaml_rule_id") or "").strip()
-    return value or None
+    return finding.resolved_yaml_rule_id()
 
 
 def _active_waiver(waivers: list[FindingWaiver] | None) -> FindingWaiver | None:

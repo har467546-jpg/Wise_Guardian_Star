@@ -51,19 +51,24 @@ def _serialize_risk_finding_payload(finding: RiskFinding) -> dict[str, object]:
     asset = getattr(finding, "asset", None)
     governance = getattr(finding, "governance", None)
     waivers = getattr(finding, "waivers", []) or []
+    evidence = finding.evidence()
     return {
         "id": finding.id,
         "asset_id": finding.asset_id,
         "asset_ip": str(asset.ip) if asset is not None else "",
         "asset_hostname": asset.hostname if asset is not None else None,
         "asset_port_id": finding.asset_port_id,
+        "yaml_rule_id": finding.resolved_yaml_rule_id(),
+        "identity_hash": finding.identity_hash,
         "severity": finding.severity,
         "status": finding.status,
         "title": finding.title,
         "description": finding.description,
-        "evidence_json": finding.evidence_json or {},
+        "evidence_json": evidence,
         "detected_at": finding.detected_at,
         "resolved_at": finding.resolved_at,
+        "verification_status": finding.resolved_verification_status(),
+        "match_source": finding.resolved_match_source(),
         "priority_score": governance.priority_score if governance is not None else None,
         "priority_tier": governance.priority_tier if governance is not None else None,
         "priority_reason": governance.priority_reason_json if governance is not None else None,
@@ -316,8 +321,8 @@ def get_risk_remediation_template(
     if finding is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="风险发现不存在")
 
-    evidence = finding.evidence_json if isinstance(finding.evidence_json, dict) else {}
-    yaml_rule_id = str(evidence.get("yaml_rule_id") or "").strip()
+    evidence = finding.evidence()
+    yaml_rule_id = str(finding.resolved_yaml_rule_id() or "").strip()
     if not yaml_rule_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="风险发现未关联 YAML 规则")
 
@@ -394,7 +399,7 @@ def _build_remediation_context(
         "service": rule.service,
         "service_name": service_name,
         "service_version": service_version,
-        "yaml_rule_id": evidence.get("yaml_rule_id"),
+        "yaml_rule_id": finding.resolved_yaml_rule_id(),
         "fixed_versions": fixed_versions,
         "finding": {
             "id": finding.id,
@@ -407,7 +412,7 @@ def _build_remediation_context(
             "port": port,
         },
         "evidence": {
-            "yaml_rule_id": evidence.get("yaml_rule_id"),
+            "yaml_rule_id": finding.resolved_yaml_rule_id(),
             "service_name": service_name,
             "service_version": service_version,
             "port": port,

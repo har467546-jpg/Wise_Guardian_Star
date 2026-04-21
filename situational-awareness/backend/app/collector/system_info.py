@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 HOSTNAME_COMMAND = "hostnamectl --static 2>/dev/null || hostname"
-OS_COMMAND = "cat /etc/os-release"
+OS_COMMAND = "(cat /etc/os-release 2>/dev/null | head -n 20; lsb_release -d 2>/dev/null; cat /etc/issue 2>/dev/null | head -n 1)"
 KERNEL_COMMAND = "uname -r && uname -v"
 CPU_COMMAND = "lscpu 2>/dev/null || cat /proc/cpuinfo"
 MEMORY_COMMAND = "free -b 2>/dev/null || cat /proc/meminfo"
@@ -26,15 +26,38 @@ def parse_os_release(raw: str | None) -> dict[str, str | None]:
         return data
 
     parsed: dict[str, str] = {}
+    plain_lines: list[str] = []
     for line in raw.splitlines():
-        if "=" not in line:
+        normalized_line = line.strip()
+        if not normalized_line:
             continue
-        key, value = line.split("=", 1)
-        parsed[key.strip()] = value.strip().strip('"')
+        if "=" in normalized_line:
+            key, value = normalized_line.split("=", 1)
+            parsed[key.strip()] = value.strip().strip('"')
+            continue
+        if ":" in normalized_line:
+            key, value = normalized_line.split(":", 1)
+            parsed[key.strip()] = value.strip().strip('"')
+            continue
+        sanitized = (
+            normalized_line
+            .replace("\\l", "")
+            .replace("\\n", "")
+            .replace("\\r", "")
+            .strip()
+        )
+        if sanitized:
+            plain_lines.append(sanitized)
 
-    data["name"] = parsed.get("NAME")
-    data["version"] = parsed.get("VERSION_ID") or parsed.get("VERSION")
-    data["pretty_name"] = parsed.get("PRETTY_NAME") or parsed.get("NAME")
+    data["name"] = parsed.get("NAME") or parsed.get("Distributor ID")
+    data["version"] = parsed.get("VERSION_ID") or parsed.get("VERSION") or parsed.get("Release")
+    data["pretty_name"] = parsed.get("PRETTY_NAME") or parsed.get("Description") or parsed.get("NAME")
+    if (not data["pretty_name"]) and plain_lines:
+        data["pretty_name"] = plain_lines[0]
+    if data["pretty_name"]:
+        inferred_name, inferred_version = _infer_name_and_version_from_pretty_name(data["pretty_name"])
+        data["name"] = data["name"] or inferred_name
+        data["version"] = data["version"] or inferred_version
     return data
 
 
@@ -207,3 +230,23 @@ def _to_int(raw: str | None) -> int | None:
     if not digits:
         return None
     return int(digits)
+
+
+def _infer_name_and_version_from_pretty_name(raw: str) -> tuple[str | None, str | None]:
+    cleaned = " ".join(raw.split()).strip()
+    if not cleaned:
+        return None, None
+    tokens = cleaned.split()
+    name_parts: list[str] = []
+    version_parts: list[str] = []
+    version_started = False
+    for token in tokens:
+        if not version_started and any(ch.isdigit() for ch in token):
+            version_started = True
+        if version_started:
+            version_parts.append(token)
+        else:
+            name_parts.append(token)
+    name = " ".join(name_parts).strip() or None
+    version = " ".join(version_parts).strip() or None
+    return name, version
