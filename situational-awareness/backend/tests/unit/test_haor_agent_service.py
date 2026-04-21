@@ -2173,7 +2173,7 @@ def test_run_agent_loop_returns_remediation_report_after_resume_reads(monkeypatc
         allow_auto_execute_actions=True,
     )
 
-    assert decision.stop_reason == "resume_hint_remediation_report"
+    assert decision.stop_reason == "resume_hint_remediation_gap_report"
     assert "1. 本轮执行了哪些步骤" in decision.reply_markdown
     assert "6. 是否建议再复验 / 人工介入" in decision.reply_markdown
     assert read_calls == [

@@ -1247,7 +1247,12 @@ def _default_resume_read_tools(
             read_tool_calls.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
         return _dedupe_read_tool_payloads(read_tool_calls)
 
-    if kind == "post_remediation_review" and asset_id:
+    if kind in {
+        "post_remediation_review",
+        "post_remediation_status",
+        "post_remediation_gap_analysis",
+        "post_remediation_failure_analysis",
+    } and asset_id:
         read_tool_calls.append({"tool_name": "get_remediation_asset", "arguments": {"asset_id": asset_id}})
         if task_id:
             read_tool_calls.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
@@ -4438,12 +4443,29 @@ def _build_remediation_resume_hint_summary_decision(tool_traces: list[dict[str, 
         suggest_manual = True
         manual_reason = "已出现执行失败，建议人工定位失败点并决定是否回滚。"
 
-    report_intro = "我已把这次自动修复整理成固定结构的复盘报告。"
+    if business_status == "verified_closed":
+        report_intro = "我已把这次自动修复整理成最终复盘报告。"
+        conclusion = "最终结论：本轮目标风险已经修复完毕，可以直接输出最终修复报告。"
+        objective = "输出最终修复报告"
+        stop_reason = "resume_hint_remediation_report"
+    else:
+        report_intro = "我已整理这次自动修复的执行结果，但当前还不能输出最终修复报告。"
+        if business_status == "pending_reverify":
+            conclusion = "当前结论：系统仍在复验目标风险，尚未达到“修复完毕”的状态。"
+        elif business_status == "verified_partial":
+            conclusion = "当前结论：仍有目标风险未闭环，尚未达到“修复完毕”的状态。"
+        elif business_status == "verified_failed":
+            conclusion = "当前结论：本轮执行或复验失败，尚未达到“修复完毕”的状态。"
+        else:
+            conclusion = "当前结论：还没有拿到明确的闭环证据，暂时不能认定为“修复完毕”。"
+        objective = "分析修复结果"
+        stop_reason = "resume_hint_remediation_gap_report"
     if task_message:
         report_intro = f"{report_intro}{task_message}。"
     reply = "\n\n".join(
         [
             report_intro,
+            conclusion,
             "1. 本轮执行了哪些步骤\n" + "\n".join(section_one),
             "2. 哪些成功\n" + "\n".join(section_two),
             "3. 哪些风险已闭环\n" + "\n".join(section_three),
@@ -4457,8 +4479,8 @@ def _build_remediation_resume_hint_summary_decision(tool_traces: list[dict[str, 
     return _AgentModelDecision(
         reply_markdown=reply,
         conversation_state="answer",
-        objective="复盘修复结果",
-        stop_reason="resume_hint_remediation_report",
+        objective=objective,
+        stop_reason=stop_reason,
     )
 
 
@@ -4471,7 +4493,12 @@ def _build_resume_hint_summary_decision(
     resume_kind = _sanitize_line(str(recent_resume_hint.get("kind") or ""), max_length=64)
     if resume_kind == "post_scan_analysis":
         return _build_scan_resume_hint_summary_decision(tool_traces)
-    if resume_kind == "post_remediation_review":
+    if resume_kind in {
+        "post_remediation_review",
+        "post_remediation_status",
+        "post_remediation_gap_analysis",
+        "post_remediation_failure_analysis",
+    }:
         return _build_remediation_resume_hint_summary_decision(tool_traces)
     return None
 
@@ -6805,11 +6832,34 @@ def _build_auto_execute_reply_markdown(
     return _normalize_assistant_reply_content("\n\n".join(replies)) or fallback
 
 
+def _remediation_resume_hint_kind_and_label(
+    *,
+    status: str,
+    business_status: str,
+) -> tuple[str, str]:
+    if status != TaskExecutionStatus.SUCCESS.value:
+        return "task_detail", "查看修复任务详情"
+    if business_status == "verified_closed":
+        return "post_remediation_review", "输出最终修复报告"
+    if business_status == "verified_partial":
+        return "post_remediation_gap_analysis", "分析未闭环原因"
+    if business_status == "verified_failed":
+        return "post_remediation_failure_analysis", "分析修复失败原因"
+    if business_status == "pending_reverify":
+        return "post_remediation_status", "查看复验状态"
+    return "post_remediation_status", "查看修复状态"
+
+
 def _build_task_followup_resume_hint(action: dict[str, Any], child_summary: dict[str, Any]) -> dict[str, Any]:
     action_type = _sanitize_line(str(action.get("action_type") or ""), max_length=64)
     params = action.get("params") if isinstance(action.get("params"), dict) else {}
     payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
     status = _normalize_task_status(child_summary.get("status"))
+    result_json = child_summary.get("result_json") if isinstance(child_summary.get("result_json"), dict) else {}
+    remediation_business_status = _sanitize_line(
+        str(result_json.get("business_status") or ""),
+        max_length=64,
+    ).lower()
     task_id = _sanitize_line(str(child_summary.get("task_id") or payload.get("submitted_task_id") or ""), max_length=64)
     asset_id = (
         _sanitize_line(str(params.get("asset_id") or payload.get("asset_id") or ""), max_length=64)
@@ -6857,8 +6907,10 @@ def _build_task_followup_resume_hint(action: dict[str, Any], child_summary: dict
         if task_id:
             preferred_read_tools.append({"tool_name": "get_task_detail", "arguments": {"task_id": task_id}})
     elif action_type == "create_or_resume_remediation_session":
-        kind = "post_remediation_review" if status == TaskExecutionStatus.SUCCESS.value else "task_detail"
-        suggested_reply_label = "复盘修复结果"
+        kind, suggested_reply_label = _remediation_resume_hint_kind_and_label(
+            status=status,
+            business_status=remediation_business_status,
+        )
         if asset_id:
             preferred_read_tools.append({"tool_name": "get_remediation_asset", "arguments": {"asset_id": asset_id}})
         if session_id:
@@ -6956,7 +7008,17 @@ def build_auto_action_task_followup_content(action: dict[str, Any], child_summar
                 message = f"{message}本阶段目标 {target_total} 条，已关闭 {closed_total} 条，仍开放 {open_total} 条，未纳入本阶段的其余风险 {other_total} 条。"
             if task_message:
                 message = f"{message}{task_message}。"
-            return "task_update", f"{message} 如需继续，我可以帮你复盘修复结果，或带你进入 {session_label} 查看详情。", resume_hint
+            if remediation_business_status == "verified_closed":
+                followup = f"{message} 如需继续，我可以直接输出最终修复报告，或带你进入 {session_label} 查看详情。"
+            elif remediation_business_status == "verified_partial":
+                followup = f"{message} 如需继续，我可以帮你分析未闭环原因，或带你进入 {session_label} 查看详情。"
+            elif remediation_business_status == "verified_failed":
+                followup = f"{message} 如需继续，我可以帮你分析修复失败原因，或带你进入 {session_label} 查看详情。"
+            elif remediation_business_status == "pending_reverify":
+                followup = f"{message} 如需继续，我可以帮你查看复验状态，或带你进入 {session_label} 查看详情。"
+            else:
+                followup = f"{message} 如需继续，我可以帮你查看当前修复状态，或带你进入 {session_label} 查看详情。"
+            return "task_update", followup, resume_hint
         detail = task_message or "请查看修复任务详情"
         return "error", f"资产 {asset_id} 的自动修复任务未成功完成：{detail}", resume_hint
 
