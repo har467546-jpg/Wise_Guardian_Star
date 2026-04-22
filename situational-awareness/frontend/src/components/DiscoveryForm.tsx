@@ -17,11 +17,16 @@ const pipelineStages = [
   },
   {
     code: "02",
-    title: "端口与指纹",
-    description: "识别开放端口、服务类型和版本线索，形成资产基础画像。",
+    title: "基础信息扫描",
+    description: "先把主机、基础资产信息和初始台账整理出来，优先给出第一批结果。",
   },
   {
     code: "03",
+    title: "端口与指纹",
+    description: "随后识别开放端口、服务类型和版本线索，补齐资产画像。",
+  },
+  {
+    code: "04",
     title: "风险验证",
     description: "基于规则和主动校验补齐风险确认结果，进入任务中心持续跟踪。",
   },
@@ -183,7 +188,7 @@ export default function DiscoveryForm() {
           <Card className="panel-card discovery-command-card" data-haor-section="任务配置" bordered={false}>
             <Title level={4}>任务配置</Title>
             <Paragraph type="secondary">
-              系统将按照 <Text code>主机存活 -{">"} 端口指纹 -{">"} 风险验证</Text> 的顺序执行。
+              系统将按照 <Text code>主机发现 -{">"} 基础信息扫描 -{">"} 深度扫描 -{">"} 风险验证</Text> 的顺序执行。
             </Paragraph>
 
             <Form form={form} layout="vertical" onFinish={onSubmit} size="large" data-haor-section="扫描发起表单">

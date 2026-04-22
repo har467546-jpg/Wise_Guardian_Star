@@ -298,6 +298,7 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = ""
     LLM_WIRE_API: str = "responses"
     LLM_TIMEOUT_SECONDS: int = 60
+    HAOR_REPLY_REWRITE_ENABLED: bool = False
 
     model_config = SettingsConfigDict(
         env_file=(str(RUNTIME_ENV_PATH), str(EXAMPLE_ENV_PATH), str(LEGACY_ENV_PATH)),

@@ -2759,6 +2759,129 @@ def _normalize_assistant_reply_content(content: str) -> str:
     return "\n\n".join(deduped_blocks).strip() or normalized.strip()
 
 
+def _trim_incomplete_think_suffix(content: str) -> str:
+    normalized = str(content or "")
+    if not normalized:
+        return ""
+    last_lt = normalized.rfind("<")
+    if last_lt < 0:
+        return normalized
+    suffix = normalized[last_lt:]
+    lower_suffix = suffix.lower()
+    if "<think".startswith(lower_suffix) or "</think".startswith(lower_suffix):
+        return normalized[:last_lt]
+    if lower_suffix.startswith("<think") and ">" not in lower_suffix:
+        return normalized[:last_lt]
+    if lower_suffix.startswith("</think") and ">" not in lower_suffix:
+        return normalized[:last_lt]
+    return normalized
+
+
+def _normalize_streaming_assistant_reply_content(content: str) -> str:
+    normalized = sanitize_text(content, max_length=4000) or ""
+    if not normalized:
+        return ""
+    visible_source = _trim_incomplete_think_suffix(normalized)
+    if not visible_source:
+        return ""
+
+    result: list[str] = []
+    lowered = visible_source.lower()
+    index = 0
+    inside_think = False
+    while index < len(visible_source):
+        if not inside_think and lowered.startswith("<think", index):
+            tag_end = visible_source.find(">", index)
+            if tag_end < 0:
+                break
+            inside_think = True
+            index = tag_end + 1
+            continue
+        if inside_think:
+            closing_start = lowered.find("</think", index)
+            if closing_start < 0:
+                break
+            tag_end = visible_source.find(">", closing_start)
+            if tag_end < 0:
+                break
+            inside_think = False
+            index = tag_end + 1
+            continue
+        if lowered.startswith("</think", index):
+            tag_end = visible_source.find(">", index)
+            if tag_end < 0:
+                break
+            index = tag_end + 1
+            continue
+        result.append(visible_source[index])
+        index += 1
+    return "".join(result).strip()
+
+
+def _emit_assistant_delta(
+    stream_emitter: _AgentStreamEmitter | None,
+    *,
+    turn_id: str,
+    delta: str,
+) -> None:
+    if stream_emitter is None:
+        return
+    normalized_delta = str(delta or "")
+    if not normalized_delta:
+        return
+    _emit_stream_event(
+        stream_emitter,
+        AgentAssistantDeltaEvent(turn_id=turn_id, delta=normalized_delta).model_dump(mode="json"),
+    )
+
+
+def _emit_chunked_assistant_reply(
+    stream_emitter: _AgentStreamEmitter | None,
+    *,
+    turn_id: str,
+    content: str,
+) -> str:
+    emitted = ""
+    for chunk in _iter_stream_text_chunks(content):
+        _emit_assistant_delta(stream_emitter, turn_id=turn_id, delta=chunk)
+        emitted = f"{emitted}{chunk}"
+    return emitted
+
+
+def _stream_upstream_assistant_reply(
+    stream_emitter: _AgentStreamEmitter | None,
+    *,
+    turn_id: str,
+    raw_chunks: Any,
+) -> str:
+    accumulated_raw = ""
+    emitted_visible = ""
+    for raw_chunk in raw_chunks:
+        chunk_text = str(raw_chunk or "")
+        if not chunk_text:
+            continue
+        accumulated_raw = f"{accumulated_raw}{chunk_text}"
+        visible_text = _normalize_streaming_assistant_reply_content(accumulated_raw)
+        if not visible_text or not visible_text.startswith(emitted_visible):
+            continue
+        next_delta = visible_text[len(emitted_visible) :]
+        if not next_delta:
+            continue
+        _emit_assistant_delta(stream_emitter, turn_id=turn_id, delta=next_delta)
+        emitted_visible = visible_text
+
+    normalized_final = _normalize_assistant_reply_content(accumulated_raw)
+    if normalized_final.startswith(emitted_visible):
+        trailing_delta = normalized_final[len(emitted_visible) :]
+        if trailing_delta:
+            _emit_assistant_delta(stream_emitter, turn_id=turn_id, delta=trailing_delta)
+            emitted_visible = normalized_final
+        return normalized_final
+    if normalized_final and not emitted_visible:
+        return normalized_final
+    return emitted_visible
+
+
 def _build_reply_stream_request(
     *,
     user_content: str,
@@ -2844,6 +2967,7 @@ def _append_or_stream_assistant_message(
         AgentAssistantMessageStartEvent(turn_id=turn_id, message_type=message_type).model_dump(mode="json"),
     )
     final_content = fallback_content
+    emitted_content = ""
     if fallback_content and _runtime_provider_mode() != "mock" and _haor_reply_rewrite_enabled():
         reply_request = _build_reply_stream_request(
             user_content=user_content,
@@ -2854,18 +2978,31 @@ def _append_or_stream_assistant_message(
         )
         provider = _build_runtime_provider().provider
         try:
-            streamed_reply = "".join(str(chunk or "") for chunk in provider.stream_generate(reply_request))
-            resolved_reply = _normalize_assistant_reply_content(streamed_reply)
+            resolved_reply = _stream_upstream_assistant_reply(
+                stream_emitter,
+                turn_id=turn_id,
+                raw_chunks=provider.stream_generate(reply_request),
+            )
             if resolved_reply:
                 final_content = resolved_reply
+                emitted_content = resolved_reply
         except Exception as exc:
             logger.warning("haor reply stream failed, falling back to draft reply", exc_info=exc)
 
-    for chunk in _iter_stream_text_chunks(final_content):
-        _emit_stream_event(
+    if not emitted_content:
+        emitted_content = _emit_chunked_assistant_reply(
             stream_emitter,
-            AgentAssistantDeltaEvent(turn_id=turn_id, delta=chunk).model_dump(mode="json"),
+            turn_id=turn_id,
+            content=final_content,
         )
+    elif final_content.startswith(emitted_content):
+        trailing_delta = final_content[len(emitted_content) :]
+        if trailing_delta:
+            _emit_chunked_assistant_reply(
+                stream_emitter,
+                turn_id=turn_id,
+                content=trailing_delta,
+            )
     message = _append_message(
         db,
         session=session,
@@ -4484,6 +4621,124 @@ def _build_remediation_resume_hint_summary_decision(tool_traces: list[dict[str, 
     )
 
 
+def _build_asset_risk_summary_decision(
+    *,
+    decision: _AgentModelDecision,
+    tool_traces: list[dict[str, Any]],
+) -> _AgentModelDecision | None:
+    if _sanitize_line(str(decision.stop_reason or ""), max_length=64) != "playbook_analyze_asset_risks":
+        return None
+
+    asset_result = _latest_successful_tool_result(tool_traces, tool_name="get_asset_detail")
+    risks_result = _latest_successful_tool_result(tool_traces, tool_name="list_asset_risks")
+    risk_items = risks_result.get("items") if isinstance(risks_result.get("items"), list) else []
+    if not asset_result and not risks_result:
+        return None
+
+    asset_id = _sanitize_line(str(asset_result.get("asset_id") or risks_result.get("asset_id") or ""), max_length=64) or "当前资产"
+    ip = sanitize_text(str(asset_result.get("ip") or ""), max_length=64, single_line=True) or ""
+    hostname = sanitize_text(str(asset_result.get("hostname") or ""), max_length=120, single_line=True) or ""
+    os_name = sanitize_text(str(asset_result.get("os_name") or ""), max_length=80, single_line=True) or ""
+    status = sanitize_text(str(asset_result.get("status") or ""), max_length=32, single_line=True) or ""
+    ports = asset_result.get("ports") if isinstance(asset_result.get("ports"), list) else []
+    open_ports = [
+        item
+        for item in ports
+        if isinstance(item, dict) and str(item.get("state") or "").strip().lower() == "open"
+    ]
+
+    risk_total = int(risks_result.get("total") or len(risk_items))
+    severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for item in risk_items:
+        if not isinstance(item, dict):
+            continue
+        severity = _sanitize_line(str(item.get("severity") or ""), max_length=16).lower()
+        if severity in severity_counts:
+            severity_counts[severity] += 1
+
+    top_risks = []
+    for severity in ("critical", "high", "medium", "low"):
+        for item in risk_items:
+            if not isinstance(item, dict):
+                continue
+            if _sanitize_line(str(item.get("severity") or ""), max_length=16).lower() != severity:
+                continue
+            title = sanitize_text(str(item.get("title") or ""), max_length=120, single_line=True) or "未命名风险"
+            rule_id = sanitize_text(str(item.get("rule_id") or ""), max_length=64, single_line=True) or ""
+            service_name = sanitize_text(str(item.get("service_name") or ""), max_length=64, single_line=True) or ""
+            detail = title
+            if rule_id:
+                detail = f"{detail}（{rule_id}）"
+            if service_name:
+                detail = f"{detail} / {service_name}"
+            top_risks.append(detail)
+            if len(top_risks) >= 3:
+                break
+        if len(top_risks) >= 3:
+            break
+
+    section_one = [f"- 资产标识：{asset_id}"]
+    if ip:
+        section_one.append(f"- IP：{ip}")
+    if hostname:
+        section_one.append(f"- 主机名：{hostname}")
+    if os_name:
+        section_one.append(f"- 系统：{os_name}")
+    if status:
+        section_one.append(f"- 当前状态：{status}")
+    if open_ports:
+        port_preview = "、".join(str(item.get("port")) for item in open_ports[:5] if item.get("port") is not None)
+        remainder = len(open_ports) - len(open_ports[:5])
+        if remainder > 0 and port_preview:
+            port_preview = f"{port_preview} 等 {len(open_ports)} 个开放端口"
+        elif port_preview:
+            port_preview = f"{port_preview}（共 {len(open_ports)} 个开放端口）"
+        if port_preview:
+            section_one.append(f"- 开放端口：{port_preview}")
+
+    section_two = [f"- 当前开放风险共 {risk_total} 条。"]
+    severity_line = " / ".join(
+        [
+            f"严重 {severity_counts['critical']}",
+            f"高危 {severity_counts['high']}",
+            f"中危 {severity_counts['medium']}",
+            f"低危 {severity_counts['low']}",
+        ]
+    )
+    section_two.append(f"- 风险分布：{severity_line}")
+    if top_risks:
+        section_two.append(f"- 优先关注：{_format_resume_hint_brief_list(top_risks, limit=3)}")
+    elif risk_total <= 0:
+        section_two.append("- 当前没有查询到开放风险。")
+
+    section_three: list[str] = []
+    if severity_counts["critical"] > 0 or severity_counts["high"] > 0:
+        section_three.append("- 建议先处理严重和高危风险，再看中低危项。")
+    elif risk_total > 0:
+        section_three.append("- 当前以中低危风险为主，可以按服务暴露面和修复成本排序处理。")
+    else:
+        section_three.append("- 当前没有开放风险，可以转去查看最近验证结果或补充更细的审计范围。")
+    if risk_total > len(risk_items):
+        section_three.append(f"- 当前界面只展开了前 {len(risk_items)} 条风险，若需要我可以继续逐条展开。")
+    else:
+        section_three.append("- 如果你要继续，我可以直接挑出最值得优先处理的几条风险。")
+
+    reply = "\n\n".join(
+        [
+            f"我已读完资产 {asset_id} 的详情和风险列表，给你一个确定性结论。",
+            "1. 资产概况\n" + "\n".join(section_one),
+            "2. 风险概览\n" + "\n".join(section_two),
+            "3. 下一步建议\n" + "\n".join(section_three),
+        ]
+    )
+    return _AgentModelDecision(
+        reply_markdown=reply,
+        conversation_state="answer",
+        objective="分析资产风险",
+        stop_reason="playbook_asset_risk_summary",
+    )
+
+
 def _build_resume_hint_summary_decision(
     *,
     session: AgentSession | Any | None,
@@ -4939,7 +5194,10 @@ def _runtime_provider_mode() -> str:
 
 
 def _haor_reply_rewrite_enabled() -> bool:
-    raw = read_runtime_env_value("HAOR_REPLY_REWRITE_ENABLED", "false")
+    raw = read_runtime_env_value(
+        "HAOR_REPLY_REWRITE_ENABLED",
+        "true" if getattr(settings, "HAOR_REPLY_REWRITE_ENABLED", False) else "false",
+    )
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -6448,6 +6706,12 @@ def _run_agent_loop(
                 _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         if not executed_any:
             return decision, tool_traces
+        post_read_summary_decision = _build_asset_risk_summary_decision(
+            decision=decision,
+            tool_traces=tool_traces,
+        )
+        if post_read_summary_decision is not None:
+            return post_read_summary_decision, tool_traces
         if decision.stop_reason == "resume_hint_read":
             resume_summary_decision = _build_resume_hint_summary_decision(session=session, tool_traces=tool_traces)
             if resume_summary_decision is not None:

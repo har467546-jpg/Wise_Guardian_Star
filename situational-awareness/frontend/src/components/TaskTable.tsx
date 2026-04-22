@@ -20,6 +20,26 @@ import {
 } from "@/lib/ui-text";
 
 function renderTaskSummary(value: Record<string, unknown>, record: TaskRun): string {
+  if (record.task_type === "asset_scan") {
+    const context = (value?.context || {}) as Record<string, unknown>;
+    const scanPhase = String(value?.scan_phase || context?.scan_phase || "").trim().toLowerCase();
+    if (scanPhase === "baseline") {
+      const hostCount = Number(value?.host_count ?? 0);
+      const excludedLocal = Number(value?.excluded_local_ip_count ?? 0);
+      const followupTaskId = String(value?.followup_task_id || "-");
+      if (!hostCount && !excludedLocal && followupTaskId === "-") {
+        return "基础信息扫描已完成";
+      }
+      return `在线主机:${hostCount} / 排除本机:${excludedLocal} / 深度扫描任务:${followupTaskId}`;
+    }
+    const hostCount = Number(value?.host_count ?? 0);
+    const openPortCount = Number(value?.open_port_count ?? 0);
+    const scannedPortCount = Number(value?.scanned_port_count ?? 0);
+    const lowConfidenceCount = Number(value?.low_confidence_count ?? 0);
+    if (hostCount || openPortCount || scannedPortCount || lowConfidenceCount) {
+      return `主机:${hostCount} / 开放端口:${openPortCount} / 已扫端口:${scannedPortCount} / 低置信:${lowConfidenceCount}`;
+    }
+  }
   if (record.task_type === "risk_verify") {
     const passive = Number(value?.passive_match_count ?? 0);
     const total = Number(value?.active_check_total ?? 0);
@@ -95,16 +115,21 @@ export default function TaskTable() {
   const [clearing, setClearing] = useState(false);
   const [cancelingTaskId, setCancelingTaskId] = useState<string | null>(null);
 
-  const load = async () => {
+  const load = async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
     try {
-      setLoading(true);
+      if (!silent) {
+        setLoading(true);
+      }
       const result = await listTasks({ pageSize: 100, status, taskType });
       setItems(result.items);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
     } finally {
-      setLoading(false);
+      if (!silent) {
+        setLoading(false);
+      }
     }
   };
 
@@ -119,7 +144,7 @@ export default function TaskTable() {
       return undefined;
     }
     const timer = window.setInterval(() => {
-      void load();
+      void load({ silent: true });
     }, 3000);
     return () => window.clearInterval(timer);
   }, [hasActiveTasks, status, taskType]);

@@ -1024,7 +1024,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     continue
                 if event_type in {"response.output_text.done", "output_text.done"}:
                     text = payload.get("text")
-                    if isinstance(text, str) and text:
+                    if not emitted_any and isinstance(text, str) and text:
                         emitted_any = True
                         yield text
             if not emitted_any:

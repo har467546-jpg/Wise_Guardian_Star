@@ -412,6 +412,7 @@ def test_append_or_stream_assistant_message_uses_draft_reply_by_default(monkeypa
     session = SimpleNamespace(id="session-1", updated_at=None)
 
     monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "_haor_reply_rewrite_enabled", lambda: False)
 
     def _unexpected_provider():
         raise AssertionError("reply rewrite provider should stay disabled by default")
@@ -478,6 +479,45 @@ def test_append_or_stream_assistant_message_scrubs_reply_stream_output_when_rewr
     assert "confirmed_reply_draft" not in delta_text
     assert done_event["message"]["content"] == "你好！有什么我可以帮助你的吗？"
     assert message.content == "你好！有什么我可以帮助你的吗？"
+
+
+def test_append_or_stream_assistant_message_passthroughs_upstream_chunks_when_rewrite_enabled(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class _FakeProvider:
+        def stream_generate(self, _request):
+            yield "浏览器"
+            yield "流式"
+            yield "展示正常。"
+
+    events: list[dict] = []
+    session = SimpleNamespace(id="session-1", updated_at=None)
+
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "openai")
+    monkeypatch.setattr(haor_agent_service, "_haor_reply_rewrite_enabled", lambda: True)
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_build_runtime_provider",
+        lambda: SimpleNamespace(provider=_FakeProvider()),
+    )
+
+    message = haor_agent_service._append_or_stream_assistant_message(
+        _FakeUnitDB(),
+        session=session,
+        message_type="text",
+        content="原始草稿回复",
+        payload_json={},
+        user_content="你好",
+        tool_traces=[],
+        working_context={},
+        stream_emitter=events.append,
+        turn_id="turn-text",
+    )
+
+    deltas = [str(item.get("delta") or "") for item in events if item.get("type") == "assistant_message_delta"]
+    done_event = next(item for item in events if item.get("type") == "assistant_message_done")
+
+    assert deltas == ["浏览器", "流式", "展示正常。"]
+    assert done_event["message"]["content"] == "浏览器流式展示正常。"
+    assert message.content == "浏览器流式展示正常。"
 
 
 def test_apply_agent_decision_updates_pending_plan_reply_to_streamed_content(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1882,6 +1922,59 @@ def test_build_resume_hint_summary_decision_generates_remediation_report() -> No
     assert "建议人工介入：是" in decision.reply_markdown
 
 
+def test_build_asset_risk_summary_decision_generates_deterministic_report() -> None:
+    decision = haor_agent_service._build_asset_risk_summary_decision(
+        decision=haor_agent_service._AgentModelDecision(
+            reply_markdown="我先读取资产详情和风险。",
+            conversation_state="answer",
+            stop_reason="playbook_analyze_asset_risks",
+        ),
+        tool_traces=[
+            {
+                "tool_name": "get_asset_detail",
+                "arguments": {"asset_id": "asset-1"},
+                "ok": True,
+                "result": {
+                    "asset_id": "asset-1",
+                    "ip": "10.115.177.247",
+                    "hostname": "metasploitable",
+                    "os_name": "Ubuntu 8.04",
+                    "status": "online",
+                    "ports": [
+                        {"port": 23, "state": "open"},
+                        {"port": 80, "state": "open"},
+                    ],
+                },
+            },
+            {
+                "tool_name": "list_asset_risks",
+                "arguments": {"asset_id": "asset-1", "status": "open", "limit": 10},
+                "ok": True,
+                "result": {
+                    "asset_id": "asset-1",
+                    "total": 18,
+                    "items": [
+                        {"title": "PostgreSQL 8.3 旧版本暴露", "severity": "critical", "rule_id": "postgresql.legacy.lt_8_4", "service_name": "postgresql"},
+                        {"title": "Samba 用户名映射脚本命令执行风险", "severity": "high", "rule_id": "samba.usermap_script.lt_3_0_25rc3", "service_name": "samba"},
+                        {"title": "FTP 匿名访问未关闭", "severity": "medium", "rule_id": "ftp.anonymous_access", "service_name": "ftp"},
+                    ],
+                },
+            },
+        ],
+    )
+
+    assert decision is not None
+    assert decision.stop_reason == "playbook_asset_risk_summary"
+    assert "1. 资产概况" in decision.reply_markdown
+    assert "10.115.177.247" in decision.reply_markdown
+    assert "2. 风险概览" in decision.reply_markdown
+    assert "当前开放风险共 18 条" in decision.reply_markdown
+    assert "严重 1 / 高危 1 / 中危 1 / 低危 0" in decision.reply_markdown
+    assert "PostgreSQL 8.3 旧版本暴露" in decision.reply_markdown
+    assert "3. 下一步建议" in decision.reply_markdown
+    assert "建议先处理严重和高危风险" in decision.reply_markdown
+
+
 def test_build_resume_hint_summary_decision_outputs_final_report_only_when_verified_closed() -> None:
     session = SimpleNamespace(
         messages=[
@@ -2181,6 +2274,82 @@ def test_run_agent_loop_returns_remediation_report_after_resume_reads(monkeypatc
         ("get_task_detail", {"task_id": "task-1"}),
     ]
     assert [item["tool_name"] for item in tool_traces] == ["get_remediation_asset", "get_task_detail"]
+
+
+def test_run_agent_loop_returns_asset_risk_summary_after_playbook_reads(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(
+        messages=[SimpleNamespace(role="user", message_type="text", content="帮我分析当前资产")],
+        working_context_json={"asset_id": "asset-1"},
+    )
+    user = SimpleNamespace(role="admin")
+    read_calls: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        haor_agent_service,
+        "match_registered_playbook",
+        lambda **kwargs: agent_playbook_service.AgentPlaybookDecision(
+            playbook_id=agent_playbook_service.PLAYBOOK_ANALYZE_ASSET_RISKS,
+            objective="分析资产 asset-1 的风险",
+            reply_markdown="我先读取资产详情和风险。",
+            read_tool_calls=[
+                {"tool_name": "get_asset_detail", "arguments": {"asset_id": "asset-1"}},
+                {"tool_name": "list_asset_risks", "arguments": {"asset_id": "asset-1", "status": "open", "limit": 10}},
+            ],
+            stop_reason="playbook_analyze_asset_risks",
+        ),
+    )
+
+    def _fake_execute_read_tool(_db, *, tool_name, arguments):  # type: ignore[no-untyped-def]
+        read_calls.append((tool_name, arguments))
+        if tool_name == "get_asset_detail":
+            return {
+                "asset_id": "asset-1",
+                "ip": "10.115.177.247",
+                "hostname": "metasploitable",
+                "os_name": "Ubuntu 8.04",
+                "status": "online",
+                "ports": [{"port": 23, "state": "open"}],
+            }
+        if tool_name == "list_asset_risks":
+            return {
+                "asset_id": "asset-1",
+                "total": 18,
+                "items": [
+                    {"title": "PostgreSQL 8.3 旧版本暴露", "severity": "critical", "rule_id": "postgresql.legacy.lt_8_4", "service_name": "postgresql"},
+                    {"title": "Samba 用户名映射脚本命令执行风险", "severity": "high", "rule_id": "samba.usermap_script.lt_3_0_25rc3", "service_name": "samba"},
+                ],
+            }
+        raise AssertionError(f"unexpected tool {tool_name}")
+
+    monkeypatch.setattr(haor_agent_service, "_execute_read_tool", _fake_execute_read_tool)
+    monkeypatch.setattr(
+        haor_agent_service,
+        "_run_model_once",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("asset risk summary should short-circuit model")),
+    )
+
+    decision, tool_traces = haor_agent_service._run_agent_loop(
+        _FakeUnitDB(),
+        session=session,
+        user=user,
+        page_context={"pathname": "/assets/asset-1", "asset_id": "asset-1", "query": {}},
+        browser_context={"pathname": "/assets/asset-1", "asset_id": "asset-1", "query": {}, "semantic_page_context": {"page_kind": "generic"}},
+        browser_runtime={},
+        working_context={"asset_id": "asset-1"},
+        dialog_state={},
+        followup_hint={},
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    assert decision.stop_reason == "playbook_asset_risk_summary"
+    assert "当前开放风险共 18 条" in decision.reply_markdown
+    assert "PostgreSQL 8.3 旧版本暴露" in decision.reply_markdown
+    assert read_calls == [
+        ("get_asset_detail", {"asset_id": "asset-1"}),
+        ("list_asset_risks", {"asset_id": "asset-1", "status": "open", "limit": 10}),
+    ]
+    assert [item["tool_name"] for item in tool_traces] == ["get_asset_detail", "list_asset_risks"]
 
 
 def test_reconcile_running_session_state_restores_active_after_canceled_task(monkeypatch) -> None:

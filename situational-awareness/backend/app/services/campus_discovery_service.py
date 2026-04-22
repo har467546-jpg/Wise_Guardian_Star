@@ -94,6 +94,7 @@ def schedule_campus_discovery_job(
             db,
             child_task,
             result_json={
+                "scan_phase": "baseline",
                 "context": {
                     "job_id": job.id,
                     "execution_id": execution.id,
@@ -102,6 +103,7 @@ def schedule_campus_discovery_job(
                     "scanner_zone_id": zone.id,
                     "target_cidr": job.cidr,
                     "execution_boundary": "runner_dispatch",
+                    "scan_phase": "baseline",
                 }
             },
             message=f"等待分区 {zone.name} 的扫描节点接单",
@@ -202,7 +204,14 @@ def update_discovery_execution_from_task(
     return execution
 
 
-def aggregate_campus_discovery_job(db: Session, *, job_id: str) -> dict[str, Any]:
+def aggregate_campus_discovery_job(
+    db: Session,
+    *,
+    job_id: str,
+    result_key: str = "scan_result",
+    allow_partial: bool = False,
+    finalize: bool = True,
+) -> dict[str, Any]:
     job = db.get(DiscoveryJob, job_id)
     if job is None:
         return {}
@@ -210,10 +219,22 @@ def aggregate_campus_discovery_job(db: Session, *, job_id: str) -> dict[str, Any
     if not executions:
         return {}
     terminal_statuses = {"success", "failure", "failed", "canceled"}
-    if any(str(item.status or "").strip().lower() not in terminal_statuses for item in executions):
+    if not allow_partial and any(str(item.status or "").strip().lower() not in terminal_statuses for item in executions):
         return {}
 
-    successful = [item for item in executions if str(item.status or "").strip().lower() == "success"]
+    if result_key == "scan_result":
+        successful = [
+            item
+            for item in executions
+            if str(item.status or "").strip().lower() == "success"
+            and isinstance((item.summary_json if isinstance(item.summary_json, dict) else {}).get("scan_result"), dict)
+        ]
+    else:
+        successful = [
+            item
+            for item in executions
+            if isinstance((item.summary_json if isinstance(item.summary_json, dict) else {}).get(result_key), dict)
+        ]
     aggregated_hosts: list[dict[str, Any]] = []
     runner_scan_errors: list[dict[str, Any]] = []
     discovery_source_stats: dict[str, int] = {}
@@ -223,7 +244,7 @@ def aggregate_campus_discovery_job(db: Session, *, job_id: str) -> dict[str, Any
 
     for execution in successful:
         payload = execution.summary_json if isinstance(execution.summary_json, dict) else {}
-        scan_result = payload.get("scan_result") if isinstance(payload.get("scan_result"), dict) else {}
+        scan_result = payload.get(result_key) if isinstance(payload.get(result_key), dict) else {}
         hosts = [item for item in (scan_result.get("hosts") if isinstance(scan_result.get("hosts"), list) else []) if isinstance(item, dict)]
         aggregated_hosts.extend(hosts)
         for key, value in (scan_result.get("discovery_source_stats") or {}).items() if isinstance(scan_result.get("discovery_source_stats"), dict) else []:
@@ -231,6 +252,9 @@ def aggregate_campus_discovery_job(db: Session, *, job_id: str) -> dict[str, Any
         runner_scan_errors.extend(
             [item for item in (scan_result.get("runner_scan_errors") if isinstance(scan_result.get("runner_scan_errors"), list) else []) if isinstance(item, dict)]
         )
+
+    if not successful:
+        return {}
 
     filtered_hosts, excluded_local_hosts = _filter_excluded_local_hosts(aggregated_hosts, cidr=job.cidr)
     filtered_hosts = _annotate_discovery_hosts_with_device_assessment(filtered_hosts, cidr=job.cidr)
@@ -267,78 +291,85 @@ def aggregate_campus_discovery_job(db: Session, *, job_id: str) -> dict[str, Any
     }
     summary_json["service_enrichment_stats"] = _empty_service_enrichment_stats()
 
-    ips = _extract_ips(filtered_hosts)
     assets_by_ip: dict[str, Asset] = {}
-    if ips:
-        assets_by_ip = {str(asset.ip): asset for asset in db.scalars(select(Asset).where(Asset.ip.in_(ips))).all()}
-    for host in filtered_hosts:
-        ip = str(host.get("ip") or "").strip()
-        if not ip:
-            continue
-        zone_name = _resolve_zone_name_for_host(executions, ip)
-        observation = CampusObservation(
-            source_type="active_scan",
-            observed_at=datetime.now(timezone.utc),
-            ip=ip,
-            hostname=str(host.get("hostname") or "").strip() or None,
-            network_zone=zone_name,
-            raw_evidence=[str(item) for item in (host.get("discovery_evidence") or []) if str(item).strip()],
-        )
-        asset, _ = upsert_asset_from_observation(db, observation, identity_source="active_scan")
-        asset.status = AssetStatus.COLLECTING
-        assets_by_ip[ip] = asset
-        host_stats = _upsert_asset_ports(db, asset, host)
-        _apply_discovery_asset_labels(asset, host, cidr=job.cidr)
-        _merge_port_scan_stats(port_scan_stats, host_stats)
-        product_identified_count += sum(
-            1 for item in (host.get("services") or []) if isinstance(item, dict) and isinstance(item.get("product_name"), str) and item.get("product_name")
-        )
-        snapshot = _build_network_initial_snapshot(asset, host)
-        if snapshot is not None:
-            db.add(snapshot)
-            network_initial_snapshot_count += 1
-        db.add(asset)
-    summary_json["port_scan_stats"].update(port_scan_stats)
-    summary_json["service_enrichment_stats"]["product_identified_count"] = product_identified_count
-    summary_json["service_enrichment_stats"]["network_initial_snapshot_count"] = network_initial_snapshot_count
+    if finalize:
+        ips = _extract_ips(filtered_hosts)
+        if ips:
+            assets_by_ip = {str(asset.ip): asset for asset in db.scalars(select(Asset).where(Asset.ip.in_(ips))).all()}
+        for host in filtered_hosts:
+            ip = str(host.get("ip") or "").strip()
+            if not ip:
+                continue
+            zone_name = _resolve_zone_name_for_host(executions, ip, result_key=result_key)
+            observation = CampusObservation(
+                source_type="active_scan",
+                observed_at=datetime.now(timezone.utc),
+                ip=ip,
+                hostname=str(host.get("hostname") or "").strip() or None,
+                network_zone=zone_name,
+                raw_evidence=[str(item) for item in (host.get("discovery_evidence") or []) if str(item).strip()],
+            )
+            asset, _ = upsert_asset_from_observation(db, observation, identity_source="active_scan")
+            asset.status = AssetStatus.COLLECTING
+            assets_by_ip[ip] = asset
+            host_stats = _upsert_asset_ports(db, asset, host)
+            _apply_discovery_asset_labels(asset, host, cidr=job.cidr)
+            _merge_port_scan_stats(port_scan_stats, host_stats)
+            product_identified_count += sum(
+                1 for item in (host.get("services") or []) if isinstance(item, dict) and isinstance(item.get("product_name"), str) and item.get("product_name")
+            )
+            snapshot = _build_network_initial_snapshot(asset, host)
+            if snapshot is not None:
+                db.add(snapshot)
+                network_initial_snapshot_count += 1
+            db.add(asset)
+        summary_json["port_scan_stats"].update(port_scan_stats)
+        summary_json["service_enrichment_stats"]["product_identified_count"] = product_identified_count
+        summary_json["service_enrichment_stats"]["network_initial_snapshot_count"] = network_initial_snapshot_count
+    summary_json["scan_phase"] = "deep" if finalize else "baseline"
 
     job.summary_json = sanitize_json_value(summary_json)
-    job.status = DiscoveryJobStatus.COMPLETED if successful else DiscoveryJobStatus.FAILED
-    job.finished_at = datetime.now(timezone.utc)
+    job.status = (DiscoveryJobStatus.COMPLETED if successful else DiscoveryJobStatus.FAILED) if finalize else DiscoveryJobStatus.RUNNING
+    job.finished_at = datetime.now(timezone.utc) if finalize else None
     db.add(job)
-    parent_task_ids: set[str] = set()
-    for item in executions:
-        if not isinstance(item.summary_json, dict):
-            continue
-        direct_parent_task_id = str(item.summary_json.get("parent_task_id") or "").strip()
-        if direct_parent_task_id:
-            parent_task_ids.add(direct_parent_task_id)
-        context = item.summary_json.get("context") if isinstance(item.summary_json.get("context"), dict) else {}
-        nested_parent_task_id = str(context.get("parent_task_id") or "").strip()
-        if nested_parent_task_id:
-            parent_task_ids.add(nested_parent_task_id)
-    for parent_task_id in parent_task_ids:
-        parent_task = db.get(TaskRun, parent_task_id)
-        if parent_task is None:
-            continue
-        update_task_run(
-            db,
-            parent_task,
-            status=TaskExecutionStatus.SUCCESS if successful else TaskExecutionStatus.FAILURE,
-            progress=100,
-            message="校园分区发现任务已完成" if successful else "校园分区发现任务执行失败",
-            result_json={
-                **(parent_task.result_json if isinstance(parent_task.result_json, dict) else {}),
-                "campus_summary": summary_json,
-                "job_id": job_id,
-            },
-            commit=False,
-            refresh=False,
-        )
+    if not finalize:
+        db.commit()
+        return summary_json
+    if finalize:
+        parent_task_ids: set[str] = set()
+        for item in executions:
+            if not isinstance(item.summary_json, dict):
+                continue
+            direct_parent_task_id = str(item.summary_json.get("parent_task_id") or "").strip()
+            if direct_parent_task_id:
+                parent_task_ids.add(direct_parent_task_id)
+            context = item.summary_json.get("context") if isinstance(item.summary_json.get("context"), dict) else {}
+            nested_parent_task_id = str(context.get("parent_task_id") or "").strip()
+            if nested_parent_task_id:
+                parent_task_ids.add(nested_parent_task_id)
+        for parent_task_id in parent_task_ids:
+            parent_task = db.get(TaskRun, parent_task_id)
+            if parent_task is None:
+                continue
+            update_task_run(
+                db,
+                parent_task,
+                status=TaskExecutionStatus.SUCCESS if successful else TaskExecutionStatus.FAILURE,
+                progress=100,
+                message="校园分区发现任务已完成" if successful else "校园分区发现任务执行失败",
+                result_json={
+                    **(parent_task.result_json if isinstance(parent_task.result_json, dict) else {}),
+                    "campus_summary": summary_json,
+                    "job_id": job_id,
+                },
+                commit=False,
+                refresh=False,
+            )
     db.commit()
 
-    for asset_id in [asset.id for asset in assets_by_ip.values()]:
-        evaluate_risks_for_asset.delay(asset_id)
+    if finalize:
+        for asset_id in [asset.id for asset in assets_by_ip.values()]:
+            evaluate_risks_for_asset.delay(asset_id)
     return summary_json
 
 
@@ -349,10 +380,10 @@ def _resolve_target_zones(db: Session, *, cidr: str, scanner_zone_id: str | None
     return find_matching_scanner_zones(db, cidr)
 
 
-def _resolve_zone_name_for_host(executions: list[DiscoveryJobExecution], ip: str) -> str | None:
+def _resolve_zone_name_for_host(executions: list[DiscoveryJobExecution], ip: str, *, result_key: str = "scan_result") -> str | None:
     for execution in executions:
         summary = execution.summary_json if isinstance(execution.summary_json, dict) else {}
-        scan_result = summary.get("scan_result") if isinstance(summary.get("scan_result"), dict) else {}
+        scan_result = summary.get(result_key) if isinstance(summary.get(result_key), dict) else {}
         hosts = scan_result.get("hosts") if isinstance(scan_result.get("hosts"), list) else []
         if any(isinstance(item, dict) and str(item.get("ip") or "").strip() == ip for item in hosts):
             if execution.scanner_zone is not None:

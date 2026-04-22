@@ -1345,7 +1345,13 @@ def _apply_network_initial_asset_status(asset: Asset, snapshot: HostSnapshot) ->
         asset.status = AssetStatus.ONLINE
 
 
-def apply_runner_discovery_scan_result(job_id: str, scan_result: dict[str, Any]) -> dict[str, Any]:
+def apply_runner_discovery_scan_result(
+    job_id: str,
+    scan_result: dict[str, Any],
+    *,
+    finalize: bool = True,
+    enqueue_risk_verification: bool = True,
+) -> dict[str, Any]:
     with SessionLocal() as db:
         job = db.get(DiscoveryJob, job_id)
         if job is None:
@@ -1453,20 +1459,21 @@ def apply_runner_discovery_scan_result(job_id: str, scan_result: dict[str, Any])
             for item in host.get("services", [])
             if isinstance(item, dict) and "nmap" in {str(step).strip().lower() for step in (item.get("probe_chain") or []) if str(step).strip()}
         )
+        summary["scan_phase"] = "deep" if finalize else "baseline"
 
         job.summary_json = sanitize_json_value(summary)
-        job.status = DiscoveryJobStatus.COMPLETED
+        job.status = DiscoveryJobStatus.COMPLETED if finalize else DiscoveryJobStatus.RUNNING
         if job.started_at is None:
             job.started_at = datetime.now(timezone.utc)
-        job.finished_at = datetime.now(timezone.utc)
+        job.finished_at = datetime.now(timezone.utc) if finalize else None
         db.add(job)
         db.commit()
 
-        if ips:
+        if finalize and enqueue_risk_verification and ips:
             assets = db.scalars(select(Asset).where(Asset.ip.in_(ips))).all()
             for asset in assets:
                 evaluate_risks_for_asset.delay(asset.id)
-        return get_discovery_scan_stats(job_id)
+        return get_discovery_scan_stats(job_id) if finalize else get_discovery_basic_stats(job_id)
 
 
 def get_service_enrichment_stats(job_id: str) -> dict[str, int]:
@@ -1532,3 +1539,18 @@ def get_discovery_scan_stats(job_id: str) -> dict[str, int]:
 
         combined.update(get_service_enrichment_stats(job_id))
         return combined
+
+
+def get_discovery_basic_stats(job_id: str) -> dict[str, int]:
+    with SessionLocal() as db:
+        job = db.get(DiscoveryJob, job_id)
+        if not job:
+            return {}
+        summary_json = job.summary_json if isinstance(job.summary_json, dict) else {}
+        parsed: dict[str, int] = {}
+        for key in ("host_count", "excluded_local_ip_count"):
+            try:
+                parsed[key] = int(summary_json.get(key, 0))
+            except (TypeError, ValueError):
+                parsed[key] = 0
+        return parsed

@@ -30,6 +30,7 @@ from app.core.config import settings
 from app.core.crypto import decrypt_text
 from app.db.models.asset import Asset
 from app.db.models.credential import SSHCredential
+from app.db.models.discovery_job_execution import DiscoveryJobExecution
 from app.db.models.enums import CredentialAuthType, DiscoveryJobStatus, TaskExecutionStatus, TaskType
 from app.db.models.host_runner import HostRunner
 from app.db.models.remediation_message import RemediationMessage
@@ -1013,6 +1014,57 @@ def _build_runner_asset_scan_config() -> dict[str, Any]:
     }
 
 
+def _normalize_runner_scan_phase(value: Any, *, default: str = "deep") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"baseline", "deep"}:
+        return normalized
+    return default
+
+
+def _queue_runner_asset_scan_followup_task(
+    db: Session,
+    *,
+    task: TaskRun,
+    context: dict[str, Any],
+) -> str | None:
+    next_phase = "deep"
+    followup = create_task_run(
+        db,
+        task_type=TaskType.ASSET_SCAN,
+        scope_type=task.scope_type,
+        scope_id=task.scope_id,
+        message="深度扫描任务已入队",
+    )
+    followup_context = {
+        **context,
+        "scan_phase": next_phase,
+        "execution_boundary": "runner_dispatch",
+    }
+    update_task_run(
+        db,
+        followup,
+        result_json={"scan_phase": next_phase, "context": followup_context},
+        message="等待扫描节点接单，继续深度扫描",
+    )
+    if task.scope_type == "discovery_execution":
+        execution = db.scalar(select(DiscoveryJobExecution).where(DiscoveryJobExecution.task_run_id == task.id))
+        if execution is not None:
+            summary_json = dict(execution.summary_json or {}) if isinstance(execution.summary_json, dict) else {}
+            summary_json["followup_task_id"] = followup.id
+            summary_json["current_phase"] = next_phase
+            execution.task_run_id = followup.id
+            execution.status = "pending"
+            execution.progress = 0
+            execution.summary_json = summary_json
+            execution.error_json = {}
+            execution.finished_at = None
+            execution.updated_at = datetime.now(timezone.utc)
+            db.add(execution)
+            db.commit()
+            db.refresh(execution)
+    return followup.id
+
+
 def _build_runner_asset_scan_assignment(
     db: Session,
     runner: HostRunner,
@@ -1037,8 +1089,13 @@ def _build_runner_asset_scan_assignment(
         or None,
     )
     scan_config = merge_zone_profile_with_defaults(zone, _build_runner_asset_scan_config())
+    scan_phase = _normalize_runner_scan_phase(context.get("scan_phase"), default="baseline")
+    scan_config["scan_phase"] = scan_phase
     target_cidr = str(context.get("target_cidr") or job.cidr).strip()
-    summary = f"扫描网段 {target_cidr}" if zone is None else f"分区 {zone.name} 扫描 {target_cidr}"
+    if scan_phase == "baseline":
+        summary = f"基础信息扫描 {target_cidr}" if zone is None else f"分区 {zone.name} 基础信息扫描 {target_cidr}"
+    else:
+        summary = f"深度扫描 {target_cidr}" if zone is None else f"分区 {zone.name} 深度扫描 {target_cidr}"
     assignment = RunnerTaskAssignmentRead(
         task_id=task.id,
         asset_id=runner.asset_id,
@@ -1051,6 +1108,7 @@ def _build_runner_asset_scan_assignment(
             "runner_asset_id": runner.asset_id,
             "scanner_zone_id": str(context.get("scanner_zone_id") or "").strip() or getattr(job, "scanner_zone_id", None),
             "scan_config": scan_config,
+            "scan_phase": scan_phase,
         },
         steps=[],
     )
@@ -1076,6 +1134,8 @@ def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1)
             if built is None:
                 continue
             assignment, execution_script = built
+            scan_phase = _normalize_runner_scan_phase(((result_json.get("context") or {}) if isinstance(result_json.get("context"), dict) else {}).get("scan_phase"), default="baseline")
+            dispatch_message = "扫描节点已接单，开始执行基础信息扫描" if scan_phase == "baseline" else "扫描节点已接单，开始执行深度扫描"
             result_json.setdefault("context", {})
             result_json["context"]["runner_id"] = runner.id
             result_json["context"]["runner_status"] = _runner_status_value(runner)
@@ -1084,7 +1144,7 @@ def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1)
                 task,
                 status=TaskExecutionStatus.RUNNING,
                 progress=max(5, task.progress),
-                message="扫描节点已接单，开始执行多源资产发现",
+                message=dispatch_message,
                 result_json=result_json,
             )
             create_task_event(
@@ -1094,9 +1154,9 @@ def poll_runner_assignments(db: Session, runner: HostRunner, max_tasks: int = 1)
                 level="info",
                 stage_code="runner_dispatch",
                 stage_name="扫描节点接单",
-                message="扫描节点已获取待执行的真实网络发现任务",
+                message=dispatch_message,
                 progress=task.progress,
-                payload_json={"runner_id": runner.id},
+                payload_json={"runner_id": runner.id, "scan_phase": scan_phase},
             )
             if task.scope_type in {"discovery_job", "discovery_execution"}:
                 update_discovery_execution_from_task(
@@ -1424,6 +1484,10 @@ def _complete_runner_asset_scan_task(
     execution["execution_boundary"] = "runner_dispatch"
     scan_result = execution.get("scan_result") if isinstance(execution.get("scan_result"), dict) else {}
     context = result_json.get("context") if isinstance(result_json.get("context"), dict) else {}
+    scan_phase = _normalize_runner_scan_phase(
+        execution.get("scan_phase") or context.get("scan_phase") or result_json.get("scan_phase"),
+        default="deep",
+    )
     job_id = str(context.get("job_id") or task.scope_id or "").strip()
     scan_summary = {
         "host_count": int(scan_result.get("host_count") or len(scan_result.get("hosts") or []))
@@ -1441,34 +1505,80 @@ def _complete_runner_asset_scan_task(
     }
 
     if payload.status == "success" and job_id and scan_result:
-        if task.scope_type == "discovery_execution":
-            execution_summary = {
-                "scan_result": scan_result,
-                "scan_summary": scan_summary,
-                "context": context,
-            }
-            update_discovery_execution_from_task(
-                db,
-                task_id=task.id,
-                status="success",
-                progress=100,
-                summary_json=execution_summary,
-            )
-            aggregated = aggregate_campus_discovery_job(db, job_id=job_id)
-            if aggregated:
-                scan_summary = {
-                    "host_count": int(aggregated.get("host_count") or 0),
-                    "open_port_count": int((aggregated.get("port_scan_stats") or {}).get("open_port_count") or 0)
-                    if isinstance(aggregated.get("port_scan_stats"), dict)
-                    else 0,
-                    "source_stats": aggregated.get("discovery_source_stats") if isinstance(aggregated.get("discovery_source_stats"), dict) else {},
+        if scan_phase == "baseline":
+            if task.scope_type == "discovery_execution":
+                execution_summary = {
+                    "baseline_scan_result": scan_result,
+                    "baseline_scan_summary": scan_summary,
+                    "context": context,
+                    "last_completed_phase": "baseline",
                 }
-        else:
-            from app.tasks.discovery_tasks import apply_runner_discovery_scan_result
+                update_discovery_execution_from_task(
+                    db,
+                    task_id=task.id,
+                    status="running",
+                    progress=45,
+                    summary_json=execution_summary,
+                )
+                aggregate_campus_discovery_job(
+                    db,
+                    job_id=job_id,
+                    result_key="baseline_scan_result",
+                    allow_partial=True,
+                    finalize=False,
+                )
+            else:
+                from app.tasks.discovery_tasks import apply_runner_discovery_scan_result
 
-            scan_summary = apply_runner_discovery_scan_result(job_id, scan_result)
-        final_status = TaskExecutionStatus.SUCCESS
-        final_message = payload.message or "扫描节点已完成多源资产发现"
+                scan_summary = apply_runner_discovery_scan_result(
+                    job_id,
+                    scan_result,
+                    finalize=False,
+                    enqueue_risk_verification=False,
+                )
+            followup_task_id = _queue_runner_asset_scan_followup_task(db, task=task, context=context)
+            execution["scan_phase"] = "baseline"
+            result_json["scan_phase"] = "baseline"
+            result_json["followup_task_id"] = followup_task_id
+            final_status = TaskExecutionStatus.SUCCESS
+            final_message = payload.message or "扫描节点已完成基础信息扫描"
+            scan_summary = {
+                **scan_summary,
+                "followup_task_id": followup_task_id,
+            }
+        else:
+            if task.scope_type == "discovery_execution":
+                execution_summary = {
+                    "scan_result": scan_result,
+                    "deep_scan_result": scan_result,
+                    "scan_summary": scan_summary,
+                    "context": context,
+                    "last_completed_phase": "deep",
+                }
+                update_discovery_execution_from_task(
+                    db,
+                    task_id=task.id,
+                    status="success",
+                    progress=100,
+                    summary_json=execution_summary,
+                )
+                aggregated = aggregate_campus_discovery_job(db, job_id=job_id)
+                if aggregated:
+                    scan_summary = {
+                        "host_count": int(aggregated.get("host_count") or 0),
+                        "open_port_count": int((aggregated.get("port_scan_stats") or {}).get("open_port_count") or 0)
+                        if isinstance(aggregated.get("port_scan_stats"), dict)
+                        else 0,
+                        "source_stats": aggregated.get("discovery_source_stats") if isinstance(aggregated.get("discovery_source_stats"), dict) else {},
+                    }
+            else:
+                from app.tasks.discovery_tasks import apply_runner_discovery_scan_result
+
+                scan_summary = apply_runner_discovery_scan_result(job_id, scan_result)
+            execution["scan_phase"] = "deep"
+            result_json["scan_phase"] = "deep"
+            final_status = TaskExecutionStatus.SUCCESS
+            final_message = payload.message or "扫描节点已完成深度扫描与风险验证"
     else:
         final_status = TaskExecutionStatus.FAILURE
         final_message = payload.message or "扫描节点执行发现任务失败"
@@ -1497,6 +1607,7 @@ def _complete_runner_asset_scan_task(
     result_json.setdefault("context", {})
     result_json["context"]["runner_id"] = runner.id
     result_json["context"]["runner_status"] = "online"
+    result_json["context"]["scan_phase"] = scan_phase
     result_json["execution"] = execution
     result_json["scan_summary"] = scan_summary
     if job_id:
@@ -1521,7 +1632,7 @@ def _complete_runner_asset_scan_task(
         stage_name="扫描节点回传",
         message=final_message,
         progress=100,
-        payload_json={"scan_summary": scan_summary},
+        payload_json={"scan_summary": scan_summary, "scan_phase": scan_phase},
     )
     runner.last_seen_at = datetime.now(timezone.utc)
     runner.status = "online"
@@ -2282,42 +2393,57 @@ def _build_discovery_assignment_execution_script(*, task_id: str, cidr: str, sca
         "    return parse_nmap_service_xml(ip, stdout)",
         "",
         "def build_result(cidr, config):",
-        "    emit_event('stage', '扫描节点开始执行多源主机发现', stage_code='runner_discover_hosts', stage_name='Runner 主机发现', progress=10, payload_json={'cidr': cidr})",
+        "    scan_phase = str(config.get('scan_phase') or 'deep').strip().lower()",
+        "    emit_event('stage', '扫描节点开始执行多源主机发现', stage_code='runner_discover_hosts', stage_name='Runner 主机发现', progress=10, payload_json={'cidr': cidr, 'scan_phase': scan_phase})",
         "    records, source_stats, local_interface = scan_host_discovery(cidr, config)",
-        "    emit_event('stage', '主机探活完成，开始执行端口与服务扫描', stage_code='runner_scan_ports', stage_name='Runner 端口扫描', progress=40, payload_json={'host_count': len(records), 'source_stats': source_stats})",
         "    hosts = []",
         "    scan_errors = []",
-        "    for ip in sorted(records, key=ipaddress.ip_address):",
-        "        open_ports = []",
-        "        scan_scope = {'protocol': 'tcp', 'scope_kind': 'explicit', 'ports': [], 'scanned_port_count': 0}",
-        "        services = []",
-        "        host_error = None",
-        "        try:",
-        "            open_ports, scan_scope = scan_ports_for_host(ip, config)",
-        "        except Exception as exc:",
-        "            host_error = f'port_scan_failed: {exc}'",
-        "        if host_error is None and open_ports:",
+        "    if scan_phase == 'baseline':",
+        "        for ip in sorted(records, key=ipaddress.ip_address):",
+        "            hosts.append({",
+        "                'ip': ip,",
+        "                'hostname': None,",
+        "                'ports': [],",
+        "                'services': [],",
+        "                'discovery_sources': sorted(records[ip]['sources']),",
+        "                'discovery_evidence': list(records[ip]['evidence']),",
+        "                'scan_scope': {'protocol': 'tcp', 'scope_kind': 'baseline', 'ports': [], 'scanned_port_count': 0},",
+        "            })",
+        "        emit_event('stage', '主机探活完成，准备回传基础信息结果', stage_code='runner_complete_baseline', stage_name='Runner 基础信息回传', progress=70, payload_json={'host_count': len(records), 'source_stats': source_stats, 'scan_phase': scan_phase})",
+        "    else:",
+        "        emit_event('stage', '主机探活完成，开始执行端口与服务扫描', stage_code='runner_scan_ports', stage_name='Runner 端口扫描', progress=40, payload_json={'host_count': len(records), 'source_stats': source_stats, 'scan_phase': scan_phase})",
+        "        for ip in sorted(records, key=ipaddress.ip_address):",
+        "            open_ports = []",
+        "            scan_scope = {'protocol': 'tcp', 'scope_kind': 'explicit', 'ports': [], 'scanned_port_count': 0}",
+        "            services = []",
+        "            host_error = None",
         "            try:",
-        "                services = scan_services_for_host(ip, open_ports, config)",
+        "                open_ports, scan_scope = scan_ports_for_host(ip, config)",
         "            except Exception as exc:",
-        "                host_error = f'service_scan_failed: {exc}'",
-        "        host_entry = {",
-        "            'ip': ip,",
-        "            'hostname': None,",
-        "            'ports': open_ports,",
-        "            'services': services,",
-        "            'discovery_sources': sorted(records[ip]['sources']),",
-        "            'discovery_evidence': list(records[ip]['evidence']),",
-        "            'scan_scope': scan_scope,",
-        "        }",
-        "        if host_error:",
-        "            host_entry['scan_error'] = host_error",
-        "            scan_errors.append({'ip': ip, 'error': host_error})",
-        "        hosts.append(host_entry)",
+        "                host_error = f'port_scan_failed: {exc}'",
+        "            if host_error is None and open_ports:",
+        "                try:",
+        "                    services = scan_services_for_host(ip, open_ports, config)",
+        "                except Exception as exc:",
+        "                    host_error = f'service_scan_failed: {exc}'",
+        "            host_entry = {",
+        "                'ip': ip,",
+        "                'hostname': None,",
+        "                'ports': open_ports,",
+        "                'services': services,",
+        "                'discovery_sources': sorted(records[ip]['sources']),",
+        "                'discovery_evidence': list(records[ip]['evidence']),",
+        "                'scan_scope': scan_scope,",
+        "            }",
+        "            if host_error:",
+        "                host_entry['scan_error'] = host_error",
+        "                scan_errors.append({'ip': ip, 'error': host_error})",
+        "            hosts.append(host_entry)",
         "    local_hostnames = [name for name in {socket.gethostname(), socket.getfqdn()} if name]",
         "    baseline_host_count = len(hosts)",
         "    result = {",
         "        'cidr': cidr,",
+        "        'scan_phase': scan_phase,",
         "        'hosts': hosts,",
         "        'host_count': len(hosts),",
         "        'open_port_count': sum(len(item.get('ports') or []) for item in hosts),",
@@ -2345,15 +2471,19 @@ def _build_discovery_assignment_execution_script(*, task_id: str, cidr: str, sca
         "        'runner_interface': local_interface,",
         "        'runner_scan_errors': scan_errors,",
         "    }",
-        "    emit_event('stage', '扫描节点已完成端口与服务识别，准备回传结果', stage_code='runner_complete_scan', stage_name='Runner 回传结果', progress=85, payload_json={'host_count': result['host_count'], 'open_port_count': result['open_port_count']})",
+        "    if scan_phase == 'baseline':",
+        "        emit_event('stage', '扫描节点已完成基础信息扫描，准备回传结果', stage_code='runner_complete_baseline', stage_name='Runner 基础信息回传', progress=85, payload_json={'host_count': result['host_count'], 'open_port_count': result['open_port_count'], 'scan_phase': scan_phase})",
+        "    else:",
+        "        emit_event('stage', '扫描节点已完成端口与服务识别，准备回传结果', stage_code='runner_complete_scan', stage_name='Runner 回传结果', progress=85, payload_json={'host_count': result['host_count'], 'open_port_count': result['open_port_count'], 'scan_phase': scan_phase})",
         "    return result",
         "",
         "try:",
         "    result = build_result(TARGET_CIDR, SCAN_CONFIG)",
-        "    complete('success', '扫描节点已完成多源资产发现', {'execution_boundary': 'runner_dispatch', 'scan_result': result, 'host_count': result.get('host_count', 0), 'open_port_count': result.get('open_port_count', 0)})",
+        "    success_message = '扫描节点已完成基础信息扫描' if str(result.get('scan_phase') or '').strip().lower() == 'baseline' else '扫描节点已完成多源资产发现'",
+        "    complete('success', success_message, {'execution_boundary': 'runner_dispatch', 'scan_phase': result.get('scan_phase'), 'scan_result': result, 'host_count': result.get('host_count', 0), 'open_port_count': result.get('open_port_count', 0)})",
         "except Exception as exc:",
         "    emit_event('failure', f'扫描节点执行失败: {exc}', stage_code='runner_scan_failed', stage_name='Runner 扫描失败', progress=100, level='error', payload_json={'error': str(exc)})",
-        "    complete('failure', f'扫描节点执行失败: {exc}', {'execution_boundary': 'runner_dispatch'})",
+        "    complete('failure', f'扫描节点执行失败: {exc}', {'execution_boundary': 'runner_dispatch', 'scan_phase': str(SCAN_CONFIG.get('scan_phase') or 'deep').strip().lower()})",
         "PY",
     ]
     return "\n".join(lines) + "\n"

@@ -52,8 +52,11 @@ def create_discovery_job(
                 "runner_asset_id": str(runner_asset_id or "").strip() or None,
                 "scanner_zone_id": str(scanner_zone_id or "").strip() or None,
                 "execution_boundary": "runner_dispatch" if use_runner_dispatch else "local",
+                "scan_phase": "baseline",
             }
         }
+        if use_runner_dispatch:
+            result_json["scan_phase"] = "baseline"
         if use_runner_dispatch:
             return update_task_run(db, created, result_json=result_json, message="等待扫描节点接单")
         celery_task = run_asset_scan_task.delay(created.id, job_id)

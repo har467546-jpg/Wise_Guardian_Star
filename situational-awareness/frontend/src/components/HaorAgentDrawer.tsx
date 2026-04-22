@@ -144,11 +144,19 @@ type MaintenanceWindowPrompt = {
   action: AgentMessageActionSuggestion;
 };
 
+type StableSidebarCopy = {
+  contextKey: string;
+  stageText: string;
+  blockerText: string;
+};
+
 const MESSAGE_TURN_ACK_TIMEOUT_MS = 8_000;
 const UI_STEP_ACK_TIMEOUT_MS = 8_000;
 const STREAM_FRAME_CONNECT_TIMEOUT_MS = 1_200;
 const UI_STEP_FAIL_OPEN_TEXT = "上次页面动作未收到继续结果，已结束等待。你可以继续提问、重试，或新开会话。";
 const HAOR_SUMMARY_POLL_INTERVAL_MS = 15_000;
+const SIDEBAR_IDLE_STAGE_TEXT = "空闲";
+const SIDEBAR_NO_BLOCKER_TEXT = "当前无阻塞";
 const EMPTY_HAOR_SUMMARY: AgentSessionSummary = {
   has_attention: false,
   attention_kind: "none",
@@ -537,6 +545,41 @@ function goalBlockerText(blocker: GoalProgressBlocker | undefined): string {
     return blocker;
   }
   return typeof blocker.blocker_message === "string" ? blocker.blocker_message : "";
+}
+
+function stabilizeSidebarCopy(
+  previous: StableSidebarCopy,
+  next: StableSidebarCopy,
+  options: {
+    preserveStage: boolean;
+    preserveBlocker: boolean;
+  },
+): StableSidebarCopy {
+  if (!previous.contextKey || previous.contextKey !== next.contextKey) {
+    return next;
+  }
+
+  const stageText =
+    options.preserveStage
+    && next.stageText === SIDEBAR_IDLE_STAGE_TEXT
+    && previous.stageText !== SIDEBAR_IDLE_STAGE_TEXT
+      ? previous.stageText
+      : next.stageText;
+  const blockerText =
+    options.preserveBlocker
+    && next.blockerText === SIDEBAR_NO_BLOCKER_TEXT
+    && previous.blockerText !== SIDEBAR_NO_BLOCKER_TEXT
+      ? previous.blockerText
+      : next.blockerText;
+
+  if (stageText === previous.stageText && blockerText === previous.blockerText) {
+    return previous;
+  }
+  return {
+    ...next,
+    stageText,
+    blockerText,
+  };
 }
 
 function messageBadgeText(message: AgentMessage): string | null {
@@ -959,6 +1002,11 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const [maintenanceWindowSubmitting, setMaintenanceWindowSubmitting] = useState(false);
   const [maintenanceWindowErrorText, setMaintenanceWindowErrorText] = useState<string | null>(null);
   const [dismissedMaintenancePromptId, setDismissedMaintenancePromptId] = useState<string | null>(null);
+  const [stableSidebarCopy, setStableSidebarCopy] = useState<StableSidebarCopy>({
+    contextKey: "",
+    stageText: SIDEBAR_IDLE_STAGE_TEXT,
+    blockerText: SIDEBAR_NO_BLOCKER_TEXT,
+  });
 
   const pageContext = useMemo(() => buildPageContext(pathname, searchParams), [pathname, searchParams]);
   const runtimeSnapshot = useMemo(() => toRuntimeSnapshot(session), [session]);
@@ -990,6 +1038,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const linkedTaskLoaded = Boolean(task && currentWatchTaskId && task.id === currentWatchTaskId);
   const confirmedRunningTask = rawRunningSession && linkedTaskLoaded && isActiveTaskStatus(task?.status);
   const runningStateResolving = rawRunningSession && !confirmedRunningTask;
+  const waitingApproval = sessionPhase === "waiting_approval" || normalizeStatus(session?.status) === "waiting_approval";
   const showInterrupt = runtimeSnapshot.can_interrupt;
   const hasAttention = open ? (session ? sessionSummary.has_attention : summary.has_attention) : summary.has_attention;
   const composerLocked = runtimeInputLocked || sending || approving || interrupting || resetting;
@@ -1027,18 +1076,170 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     }
     return latestMaintenanceWindowPrompt ? hasMaintenanceWindowText(latestMaintenanceWindowPrompt.content) : false;
   }, [runtimeSnapshot.blocker_summary, currentGoalBlockers, latestMaintenanceWindowPrompt]);
-  const sidebarStageText = firstNonEmptyString([
-    typeof currentGoalProgress.stage === "string" ? currentGoalProgress.stage : "",
+  const sidebarContextKey = useMemo(() => {
+    const goalKey = firstNonEmptyString([
+      currentGoal?.id,
+      session?.current_goal_id,
+      extractAssetIdFromTitle(currentGoalTitle),
+      pageContext.asset_id,
+      "default",
+    ]);
+    return `${session?.session_id || "no-session"}:${goalKey}`;
+  }, [currentGoal?.id, session?.current_goal_id, currentGoalTitle, pageContext.asset_id, session?.session_id]);
+  const sidebarStageCandidateText = useMemo(() => {
+    if (sessionPhase === "awaiting_secure_input" || pendingSecureInput.kind === "ssh_credential") {
+      return "等待 SSH 敏感信息";
+    }
+    if (waitingApproval) {
+      return remediationAutoSubmitPlan ? "等待确认自动修复" : "等待确认执行";
+    }
+    if (snapshotUiInProgress || stepping) {
+      return "执行页面动作";
+    }
+    if (snapshotAwaitingMessage || sending) {
+      return "生成回复";
+    }
+    if (confirmedRunningTask) {
+      return firstNonEmptyString([
+        task?.timing?.current_stage_name,
+        typeof currentGoalProgress.stage === "string" ? currentGoalProgress.stage : "",
+        task ? `执行${getTaskTypeLabel(task.task_type)}` : "",
+        agentStatePanel.stage,
+        runtimeSnapshot.active_skill_title || "",
+        "执行中",
+      ]);
+    }
+    if (runningStateResolving) {
+      return "校验最近任务状态";
+    }
+    return firstNonEmptyString([
+      typeof currentGoalProgress.stage === "string" ? currentGoalProgress.stage : "",
+      task?.timing?.current_stage_name,
+      agentStatePanel.stage,
+      runtimeSnapshot.active_skill_title || "",
+      SIDEBAR_IDLE_STAGE_TEXT,
+    ]);
+  }, [
+    sessionPhase,
+    pendingSecureInput.kind,
+    waitingApproval,
+    remediationAutoSubmitPlan,
+    snapshotUiInProgress,
+    stepping,
+    snapshotAwaitingMessage,
+    sending,
+    confirmedRunningTask,
+    task,
+    currentGoalProgress.stage,
     agentStatePanel.stage,
-    runtimeSnapshot.active_skill_title || "",
-    "空闲",
+    runtimeSnapshot.active_skill_title,
+    runningStateResolving,
   ]);
-  const sidebarBlockerText = firstNonEmptyString([
+  const sidebarBlockerCandidateText = useMemo(() => {
+    const goalBlocked = normalizeStatus(currentGoal?.status) === "blocked";
+    if (pendingSecureInput.kind === "ssh_credential") {
+      return firstNonEmptyString([
+        pendingSecureInput.blocker_summary,
+        runtimeSnapshot.blocker_summary,
+        goalBlockerText(currentGoalBlockers[0]),
+        "需要先补齐 SSH 管理员凭据",
+      ]);
+    }
+    if (maintenanceWindowBlocked) {
+      return firstNonEmptyString([
+        runtimeSnapshot.blocker_summary,
+        goalBlockerText(currentGoalBlockers[0]),
+        "当前阶段需要维护窗口后才能正式执行",
+      ]);
+    }
+    if (runtimeSnapshot.recoverable_error?.message) {
+      return runtimeSnapshot.recoverable_error.message;
+    }
+    if (waitingApproval) {
+      return remediationAutoSubmitPlan ? "等待管理员确认自动修复计划" : "等待管理员确认执行计划";
+    }
+    return firstNonEmptyString([
+      goalBlocked ? currentGoal?.blocked_reason : "",
+      runtimeSnapshot.blocker_summary,
+      goalBlockerText(currentGoalBlockers[0]),
+      SIDEBAR_NO_BLOCKER_TEXT,
+    ]);
+  }, [
+    pendingSecureInput.kind,
+    pendingSecureInput.blocker_summary,
     runtimeSnapshot.blocker_summary,
-    goalBlockerText(currentGoalBlockers[0]),
-    runtimeSnapshot.recoverable_error?.message || "",
-    "当前无阻塞",
+    runtimeSnapshot.recoverable_error,
+    currentGoalBlockers,
+    maintenanceWindowBlocked,
+    waitingApproval,
+    remediationAutoSubmitPlan,
+    currentGoal?.blocked_reason,
   ]);
+  const sidebarShouldPreserveStage = useMemo(() => {
+    if (sidebarStageCandidateText !== SIDEBAR_IDLE_STAGE_TEXT) {
+      return false;
+    }
+    return Boolean(
+      snapshotAwaitingMessage
+      || snapshotUiInProgress
+      || sending
+      || stepping
+      || approving
+      || runtimeInputLocked
+      || waitingApproval
+      || pendingSecureInput.kind === "ssh_credential"
+      || confirmedRunningTask
+      || runningStateResolving
+      || task?.timing?.current_stage_name
+      || agentStatePanel.stage
+      || runtimeSnapshot.active_skill_title,
+    );
+  }, [
+    sidebarStageCandidateText,
+    snapshotAwaitingMessage,
+    snapshotUiInProgress,
+    sending,
+    stepping,
+    approving,
+    runtimeInputLocked,
+    waitingApproval,
+    pendingSecureInput.kind,
+    confirmedRunningTask,
+    runningStateResolving,
+    task?.timing?.current_stage_name,
+    agentStatePanel.stage,
+    runtimeSnapshot.active_skill_title,
+  ]);
+  const sidebarShouldPreserveBlocker = useMemo(() => {
+    if (sidebarBlockerCandidateText !== SIDEBAR_NO_BLOCKER_TEXT) {
+      return false;
+    }
+    return Boolean(
+      pendingSecureInput.kind === "ssh_credential"
+      || pendingSecureInput.blocker_summary
+      || maintenanceWindowBlocked
+      || waitingApproval
+      || normalizeStatus(currentGoal?.status) === "blocked"
+      || currentGoalBlockers.length > 0
+      || runtimeSnapshot.recoverable_error?.message,
+    );
+  }, [
+    sidebarBlockerCandidateText,
+    pendingSecureInput.kind,
+    pendingSecureInput.blocker_summary,
+    maintenanceWindowBlocked,
+    waitingApproval,
+    currentGoal?.blocked_reason,
+    currentGoal?.status,
+    currentGoalBlockers.length,
+    runtimeSnapshot.recoverable_error,
+  ]);
+  const sidebarStageText = stableSidebarCopy.contextKey === sidebarContextKey
+    ? stableSidebarCopy.stageText
+    : sidebarStageCandidateText;
+  const sidebarBlockerText = stableSidebarCopy.contextKey === sidebarContextKey
+    ? stableSidebarCopy.blockerText
+    : sidebarBlockerCandidateText;
   const sidebarNextStepText = firstNonEmptyString([
     typeof currentGoalProgress.next_step === "string" ? currentGoalProgress.next_step : "",
     agentStatePanel.next,
@@ -1073,6 +1274,29 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     }
     setSummary(sessionSummary);
   }, [session, sessionSummary]);
+
+  useEffect(() => {
+    setStableSidebarCopy((current) =>
+      stabilizeSidebarCopy(
+        current,
+        {
+          contextKey: sidebarContextKey,
+          stageText: sidebarStageCandidateText,
+          blockerText: sidebarBlockerCandidateText,
+        },
+        {
+          preserveStage: sidebarShouldPreserveStage,
+          preserveBlocker: sidebarShouldPreserveBlocker,
+        },
+      ),
+    );
+  }, [
+    sidebarContextKey,
+    sidebarStageCandidateText,
+    sidebarBlockerCandidateText,
+    sidebarShouldPreserveStage,
+    sidebarShouldPreserveBlocker,
+  ]);
 
   useEffect(() => {
     taskRef.current = task;
@@ -1186,7 +1410,6 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const liveTaskDigest = useMemo(() => (task ? buildTaskDigest(task, taskEvents) : ""), [task, taskEvents]);
 
   const headerStatus = useMemo(() => {
-    const waitingApproval = sessionPhase === "waiting_approval" || normalizeStatus(session?.status) === "waiting_approval";
     if (errorText || streamError) {
       return {
         text: errorText || streamError,

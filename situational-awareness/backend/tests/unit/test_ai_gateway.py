@@ -1056,6 +1056,34 @@ def test_custom_proxy_provider_stream_generate_reads_responses_stream(monkeypatc
     assert chunks == ["实时", "输出"]
 
 
+def test_custom_proxy_provider_stream_generate_ignores_done_text_after_deltas(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def _fake_stream(method: str, url: str, *, headers: dict[str, str], json: dict[str, object], timeout: int):  # type: ignore[no-untyped-def]
+        assert method == "POST"
+        assert url == "https://relay.example.com/v1/responses"
+        assert json["stream"] is True
+        return _FakeStreamResponse(
+            lines=[
+                'data: {"type":"response.output_text.delta","delta":"实时"}',
+                'data: {"type":"response.output_text.delta","delta":"输出"}',
+                'data: {"type":"response.output_text.done","text":"实时输出"}',
+                "data: [DONE]",
+            ]
+        )
+
+    monkeypatch.setattr(providers_module.httpx, "stream", _fake_stream)
+    provider = providers_module.OpenAICompatibleProvider(
+        model="gpt-5.4",
+        base_url="https://relay.example.com/v1",
+        timeout_seconds=20,
+        api_key="relay-token",
+        wire_api="responses",
+    )
+
+    chunks = list(provider.stream_generate(providers_module.LLMRequest.from_text("请生成摘要")))
+
+    assert chunks == ["实时", "输出"]
+
+
 def test_custom_proxy_stream_generate_falls_back_to_root_base_url(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     captured_urls: list[str] = []
 
