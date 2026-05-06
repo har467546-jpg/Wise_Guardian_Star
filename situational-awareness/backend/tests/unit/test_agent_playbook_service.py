@@ -1,6 +1,7 @@
 from app.services.agent_playbook_service import (
     PLAYBOOK_ANALYZE_ASSET_RISKS,
     PLAYBOOK_INSTALL_RUNNER,
+    PLAYBOOK_QUICK_SMALLTALK,
     PLAYBOOK_SCAN_AND_ANALYZE_CIDR,
     PLAYBOOK_START_REMEDIATION_SESSION,
     PLAYBOOK_VERIFY_ASSET_RISKS,
@@ -102,7 +103,23 @@ def test_match_registered_playbook_install_runner_prefers_explicit_asset_id_and_
     }
 
 
-def test_match_registered_playbook_returns_none_for_generic_smalltalk() -> None:
+def test_match_registered_playbook_replies_quickly_for_short_smalltalk() -> None:
+    decision = match_registered_playbook(
+        content="你好",
+        page_context={"pathname": "/"},
+        browser_context={},
+        working_context={},
+    )
+
+    assert decision is not None
+    assert decision.playbook_id == PLAYBOOK_QUICK_SMALLTALK
+    assert decision.read_tool_calls == []
+    assert decision.proposed_write_actions == []
+    assert decision.auto_execute_actions == []
+    assert decision.stop_reason == "playbook_quick_smalltalk"
+
+
+def test_match_registered_playbook_replies_quickly_for_identity_smalltalk() -> None:
     decision = match_registered_playbook(
         content="你好，介绍一下你自己",
         page_context={"pathname": "/"},
@@ -110,4 +127,18 @@ def test_match_registered_playbook_returns_none_for_generic_smalltalk() -> None:
         working_context={},
     )
 
-    assert decision is None
+    assert decision is not None
+    assert decision.playbook_id == PLAYBOOK_QUICK_SMALLTALK
+    assert "haor" in decision.reply_markdown
+
+
+def test_match_registered_playbook_does_not_let_smalltalk_mask_business_intent() -> None:
+    decision = match_registered_playbook(
+        content="你好，帮我扫描并分析 10.10.0.0/24 的风险",
+        page_context={"pathname": "/discovery"},
+        browser_context={},
+        working_context={},
+    )
+
+    assert decision is not None
+    assert decision.playbook_id == PLAYBOOK_SCAN_AND_ANALYZE_CIDR

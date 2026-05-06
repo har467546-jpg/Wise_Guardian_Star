@@ -22,6 +22,7 @@ PLAYBOOK_VERIFY_ASSET_RISKS = "verify_asset_risks"
 PLAYBOOK_INSTALL_RUNNER = "install_runner"
 PLAYBOOK_START_REMEDIATION_SESSION = "start_remediation_session"
 PLAYBOOK_CONFIGURE_SSH_CREDENTIAL = "configure_ssh_credential"
+PLAYBOOK_QUICK_SMALLTALK = "quick_smalltalk"
 GOAL_KIND_GENERAL = "general"
 
 
@@ -182,6 +183,60 @@ def _contains_ssh_credential_intent(content: str) -> bool:
         content,
         ("ssh 凭据", "SSH 凭据", "管理员凭据", "凭据配置", "配置凭据", "配置 ssh", "配置SSH", "私钥", "sudo 密码", "管理员授权"),
     ) or ("ssh" in lowered and any(marker in content for marker in ("配置", "设置", "密码", "私钥", "授权", "凭据")))
+
+
+_QUICK_SMALLTALK_EXACT = {
+    "hi",
+    "hello",
+    "hey",
+    "你好",
+    "您好",
+    "嗨",
+    "哈喽",
+    "在吗",
+    "在不在",
+    "早上好",
+    "上午好",
+    "中午好",
+    "下午好",
+    "晚上好",
+}
+_QUICK_THANKS_EXACT = {"谢谢", "多谢", "谢了", "感谢", "辛苦了", "thanks", "thankyou"}
+_QUICK_IDENTITY_MARKERS = ("你是谁", "你是干什么的", "你是什么", "介绍一下你自己", "介绍下你自己")
+_QUICK_CAPABILITY_MARKERS = ("你能做什么", "你可以做什么", "怎么用你", "如何使用你", "你会什么", "你能帮我做什么")
+_BUSINESS_INTENT_MARKERS = (
+    "扫描",
+    "分析",
+    "网段",
+    "漏洞",
+    "风险",
+    "资产",
+    "主机",
+    "验证",
+    "复核",
+    "安装",
+    "runner",
+    "修复",
+    "整改",
+    "修补",
+    "ssh",
+    "凭据",
+    "密码",
+    "私钥",
+    "任务",
+    "日志",
+    "报告",
+    "查看",
+    "看看",
+    "处理",
+    "配置",
+    "执行",
+    "下发",
+    "审批",
+    "确认",
+    "maintenance_window",
+    "cidr",
+)
 
 
 def _asset_id_from_context(page_context: dict[str, Any], working_context: dict[str, Any]) -> str | None:
@@ -496,6 +551,50 @@ def _playbook_start_remediation_session(content: str, *, page_context: dict[str,
     )
 
 
+def _normalized_quick_chat_content(content: str) -> str:
+    return re.sub(r"[\s,，。.!！?？~～、；;:：]+", "", content).lower()
+
+
+def _contains_business_intent(content: str) -> bool:
+    lowered = content.lower()
+    return any(marker in lowered for marker in _BUSINESS_INTENT_MARKERS) or bool(CIDR_PATTERN.search(content))
+
+
+def _playbook_quick_smalltalk(content: str) -> AgentPlaybookDecision | None:
+    compact = _normalized_quick_chat_content(content)
+    if not compact or len(compact) > 28:
+        return None
+    if _contains_business_intent(content):
+        return None
+
+    if compact in _QUICK_SMALLTALK_EXACT:
+        objective = "快速寒暄"
+        reply = "你好，我是 haor。你可以直接告诉我要查看、分析或处理的资产、风险、任务或网段。"
+    elif compact in _QUICK_THANKS_EXACT:
+        objective = "回应致谢"
+        reply = "不客气。你可以继续告诉我要分析或处理的目标。"
+    elif any(marker in compact for marker in _QUICK_IDENTITY_MARKERS):
+        objective = "介绍 haor"
+        reply = "我是 haor，负责在当前平台里帮助你查看态势、分析资产风险，并在确认后推进扫描、验证、Runner 安装和修复流程。"
+    elif any(marker in compact for marker in _QUICK_CAPABILITY_MARKERS):
+        objective = "说明 haor 能力"
+        reply = "我可以帮你查看态势、分析资产风险、扫描网段、验证风险、安装 Runner，并在满足条件时准备修复流程。"
+    elif compact.startswith(("你好", "您好", "hi", "hello")) and any(
+        marker in compact for marker in (*_QUICK_IDENTITY_MARKERS, *_QUICK_CAPABILITY_MARKERS)
+    ):
+        objective = "介绍 haor"
+        reply = "你好，我是 haor。你可以让我查看态势、分析资产风险、扫描网段、验证风险、安装 Runner，或准备修复流程。"
+    else:
+        return None
+
+    return AgentPlaybookDecision(
+        playbook_id=PLAYBOOK_QUICK_SMALLTALK,
+        objective=objective,
+        reply_markdown=reply,
+        stop_reason="playbook_quick_smalltalk",
+    )
+
+
 def _playbook_configure_ssh_credential(
     content: str,
     *,
@@ -590,6 +689,7 @@ def match_registered_playbook(
         return None
 
     matchers = (
+        lambda: _playbook_quick_smalltalk(normalized),
         lambda: _playbook_configure_ssh_credential(
             normalized,
             page_context=page_context,

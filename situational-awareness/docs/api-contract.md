@@ -126,6 +126,16 @@
 - `GET /api/v1/remediation/tasks/{task_id}/evidence`
   - 全部为管理员鉴权
 
+### Reports
+- `POST /api/v1/reports/jobs/{job_id}/generate`
+- `POST /api/v1/reports/assets/{asset_id}/generate`
+- `GET /api/v1/reports/jobs/{job_id}/latest`
+- `GET /api/v1/reports/assets/{asset_id}/latest`
+- `GET /api/v1/reports/{report_id}`
+- `GET /api/v1/reports/{report_id}/download/html`
+- `GET /api/v1/reports/{report_id}/download/pdf`
+  - 全部为用户鉴权
+
 ### Runner
 - `POST /api/v1/runner/register`
   - 机器接口
@@ -187,7 +197,6 @@
 
 ## 说明与限制
 - 本文档以 `backend/app/api/v1/router.py` 为准；存在实现文件但未挂载的接口，不属于当前标准 API。
-- 当前 `backend/app/api/v1/endpoints/reports.py` 未挂载到主路由，因此不在本文件范围内。
 
 ## 关键代码入口
 - `backend/app/api/v1/router.py`

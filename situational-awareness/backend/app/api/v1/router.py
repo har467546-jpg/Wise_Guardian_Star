@@ -12,6 +12,7 @@ from app.api.v1.endpoints import (
     mobile,
     monitoring,
     remediation,
+    reports,
     risks,
     runner,
     settings,
@@ -31,6 +32,7 @@ api_router.include_router(assets.router, prefix="/assets", tags=["assets"])
 api_router.include_router(collection.router, prefix="/collection", tags=["collection"])
 api_router.include_router(risks.router, prefix="/risks", tags=["risks"])
 api_router.include_router(remediation.router, prefix="/remediation", tags=["remediation"])
+api_router.include_router(reports.router, prefix="/reports", tags=["reports"])
 api_router.include_router(runner.router, prefix="/runner", tags=["runner"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(tasks.router, prefix="/tasks", tags=["tasks"])

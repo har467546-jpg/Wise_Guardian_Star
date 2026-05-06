@@ -25,8 +25,12 @@ import {
 } from "antd";
 
 import {
+  fetchReportHtml,
+  fetchReportPdf,
+  generateAssetReport,
   getAsset,
   getAssetCredential,
+  getLatestAssetReport,
   getLatestAssetCollection,
   getLatestAssetInitial,
   listAssetRisks,
@@ -45,6 +49,7 @@ import {
   CredentialAuthType,
 } from "@/types/collection";
 import { RiskFinding } from "@/types/risk";
+import { Report } from "@/types/report";
 import CollapsibleJsonBlock from "@/components/CollapsibleJsonBlock";
 import DesktopPageHeader from "@/components/DesktopPageHeader";
 import OverflowText from "@/components/OverflowText";
@@ -254,14 +259,26 @@ function buildNseSummaryView(input: unknown): {
   return { requestedScripts, hitScripts, summaryLines };
 }
 
+function triggerBrowserDownload(blob: Blob, filename: string) {
+  const url = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.URL.revokeObjectURL(url);
+}
+
 export default function AssetDetailView({ assetId }: { assetId: string }) {
   const router = useRouter();
   const [asset, setAsset] = useState<Asset | null>(null);
   const [risks, setRisks] = useState<RiskFinding[]>([]);
+  const [latestReport, setLatestReport] = useState<Report | null>(null);
   const [credentialMeta, setCredentialMeta] = useState<AssetCredentialReadResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastTaskId, setLastTaskId] = useState<string | null>(null);
-  const [actionLoading, setActionLoading] = useState<"collect" | "verify" | null>(null);
+  const [actionLoading, setActionLoading] = useState<"collect" | "verify" | "report-generate" | "report-html" | "report-pdf" | null>(null);
   const [credentialVerifyLoading, setCredentialVerifyLoading] = useState(false);
   const [credentialVerifyResult, setCredentialVerifyResult] = useState<AssetCredentialVerifyResponse | null>(null);
   const [latestInitial, setLatestInitial] = useState<AssetLatestInitialResponse | null>(null);
@@ -278,6 +295,7 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
   const [leftStackHeight, setLeftStackHeight] = useState(0);
   const [credentialForm] = Form.useForm<CredentialFormValues>();
   const leftStackRef = useRef<HTMLDivElement | null>(null);
+  const reportPollingTimerRef = useRef<number | null>(null);
   const credentialAuthType = Form.useWatch("auth_type", credentialForm) || "password";
 
   useEffect(() => {
@@ -286,16 +304,18 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
       getAsset(assetId),
       listAssetRisks(assetId),
       getAssetCredential(assetId),
+      getLatestAssetReport(assetId).catch(() => null),
       getLatestAssetInitial(assetId).catch(() => null),
       getLatestAssetCollection(assetId).catch(() => null),
     ])
-      .then(([assetData, riskData, credentialData, initialSnapshot, latestCollectionResult]) => {
+      .then(([assetData, riskData, credentialData, latestReportResult, initialSnapshot, latestCollectionResult]) => {
         if (cancelled) {
           return;
         }
         setAsset(assetData);
         setRisks(riskData.items);
         setCredentialMeta(credentialData);
+        setLatestReport(latestReportResult);
         setCredentialEditing(!credentialData.bound);
         if (initialSnapshot) {
           setLatestInitial(initialSnapshot);
@@ -746,6 +766,98 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
     }
   };
 
+  const refreshLatestReport = async () => {
+    if (!asset) {
+      return null;
+    }
+    try {
+      const report = await getLatestAssetReport(asset.id);
+      setLatestReport(report);
+      return report;
+    } catch {
+      setLatestReport(null);
+      return null;
+    }
+  };
+
+  const stopReportPolling = () => {
+    if (reportPollingTimerRef.current !== null) {
+      window.clearTimeout(reportPollingTimerRef.current);
+      reportPollingTimerRef.current = null;
+    }
+  };
+
+  const pollLatestReportUntilReady = (attempt = 0) => {
+    stopReportPolling();
+    reportPollingTimerRef.current = window.setTimeout(async () => {
+      const report = await refreshLatestReport();
+      if (report) {
+        message.success("漏洞报告已生成，可直接查看 HTML 或下载 PDF");
+        stopReportPolling();
+        return;
+      }
+      if (attempt >= 29) {
+        stopReportPolling();
+        return;
+      }
+      pollLatestReportUntilReady(attempt + 1);
+    }, attempt === 0 ? 2500 : 3000);
+  };
+
+  const handleGenerateReport = async () => {
+    if (!asset) {
+      return;
+    }
+    try {
+      stopReportPolling();
+      setActionLoading("report-generate");
+      const res = await generateAssetReport(asset.id);
+      setLastTaskId(res.task_id);
+      message.success(`漏洞报告生成任务已提交：${res.task_id}`);
+      pollLatestReportUntilReady();
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleDownloadHtmlReport = async () => {
+    if (!latestReport) {
+      message.warning("当前暂无可下载的 HTML 报告");
+      return;
+    }
+    try {
+      setActionLoading("report-html");
+      const { blob, filename } = await fetchReportHtml(latestReport.id);
+      triggerBrowserDownload(blob, filename || `${asset?.id || "asset"}.html`);
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleDownloadPdfReport = async () => {
+    if (!latestReport) {
+      message.warning("当前暂无可下载的报告");
+      return;
+    }
+    try {
+      setActionLoading("report-pdf");
+      const { blob, filename } = await fetchReportPdf(latestReport.id);
+      triggerBrowserDownload(blob, filename || `${asset?.id || "asset"}.pdf`);
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  useEffect(() => () => {
+    stopReportPolling();
+  }, []);
+
   if (error) {
     return <Alert type="error" showIcon message={error} />;
   }
@@ -791,11 +903,39 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
             >
               风险验证
             </Button>
+            <Button
+              loading={actionLoading === "report-generate"}
+              disabled={actionLoading !== null}
+              onClick={() => void handleGenerateReport()}
+            >
+              生成漏洞报告
+            </Button>
+            <Button
+              loading={actionLoading === "report-html"}
+              disabled={actionLoading !== null || !latestReport}
+              onClick={() => void handleDownloadHtmlReport()}
+            >
+              下载 HTML 报告
+            </Button>
+            <Button
+              loading={actionLoading === "report-pdf"}
+              disabled={actionLoading !== null || !latestReport}
+              onClick={() => void handleDownloadPdfReport()}
+            >
+              下载 PDF 报告
+            </Button>
           </Space>
         )}
       />
 
       {lastTaskId ? <Alert type="info" showIcon message={`最近任务：${lastTaskId}`} /> : null}
+      {latestReport ? (
+        <Alert
+          type="success"
+          showIcon
+          message={`最近报告：${new Date(latestReport.created_at).toLocaleString()} / ${latestReport.id}`}
+        />
+      ) : null}
 
       <Row gutter={[14, 14]} align="stretch" className="asset-overview-ports-row">
         <Col xs={24} xl={9}>

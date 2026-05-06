@@ -44,7 +44,7 @@ class RiskSummaryService:
             .where(Asset.id == asset_id)
             .options(
                 joinedload(Asset.ports),
-                joinedload(Asset.findings),
+                joinedload(Asset.findings).joinedload(RiskFinding.asset_port),
                 joinedload(Asset.snapshots),
             )
         ).unique().one_or_none()
@@ -67,7 +67,7 @@ class RiskSummaryService:
                 .where(Asset.ip.in_(ips))
                 .options(
                     joinedload(Asset.ports),
-                    joinedload(Asset.findings),
+                    joinedload(Asset.findings).joinedload(RiskFinding.asset_port),
                     joinedload(Asset.snapshots),
                 )
             ).unique().all()
@@ -108,12 +108,7 @@ class RiskSummaryService:
             "risk_priority": priority,
             "recommendations": self.recommendation_engine.build(open_findings),
             "asset_summaries": [
-                {
-                    "asset": item["asset"],
-                    "risk_summary": item["risk_summary"],
-                    "risk_priority": item["risk_priority"],
-                    "usage_hypothesis": item["usage_hypothesis"],
-                }
+                item
                 for item in asset_analyses
             ],
         }
@@ -136,16 +131,32 @@ class RiskSummaryService:
                 "ip": str(asset.ip),
                 "hostname": asset.hostname,
                 "os_name": asset.os_name,
+                "mac_address": asset.mac_address,
+                "vendor": asset.vendor,
+                "network_zone": asset.network_zone,
+                "network_vlan": asset.network_vlan,
+                "building": asset.building,
+                "department": asset.department,
+                "asset_category": asset.asset_category,
+                "device_role": asset.device_role,
+                "identity_source": asset.identity_source,
+                "status": getattr(asset.status, "value", str(asset.status)),
+                "first_seen_at": asset.first_seen_at.isoformat() if asset.first_seen_at else None,
+                "last_seen_at": asset.last_seen_at.isoformat() if asset.last_seen_at else None,
             },
             "services": [
                 {
+                    "id": port.id,
                     "port": port.port,
+                    "protocol": port.protocol,
                     "service_name": port.service_name,
                     "service_version": port.service_version,
                     "state": port.state,
+                    "fingerprint_json": port.fingerprint_json if isinstance(port.fingerprint_json, dict) else {},
                 }
                 for port in sorted(asset.ports, key=lambda item: item.port)
             ],
+            "findings": [self._serialize_finding(item) for item in context.open_findings],
             "risk_summary": {
                 "highest_severity": self._highest_severity(context.open_findings),
                 "open_findings": len(context.open_findings),
@@ -155,6 +166,43 @@ class RiskSummaryService:
             "risk_priority": priority,
             "recommendations": self.recommendation_engine.build(context.open_findings),
             "usage_hypothesis": usage,
+        }
+
+    def _serialize_finding(self, finding: RiskFinding) -> dict[str, Any]:
+        evidence = finding.evidence()
+        asset_port = finding.asset_port
+        yaml_rule_id = finding.resolved_yaml_rule_id()
+        port = asset_port.port if asset_port is not None else evidence.get("port")
+        protocol = asset_port.protocol if asset_port is not None else evidence.get("protocol")
+        service_name = (
+            asset_port.service_name
+            if asset_port is not None and asset_port.service_name
+            else evidence.get("service_name")
+        )
+        service_version = (
+            asset_port.service_version
+            if asset_port is not None and asset_port.service_version
+            else evidence.get("service_version")
+        )
+        return {
+            "id": finding.id,
+            "asset_id": finding.asset_id,
+            "asset_port_id": finding.asset_port_id,
+            "yaml_rule_id": yaml_rule_id,
+            "severity": getattr(finding.severity, "value", str(finding.severity)).lower(),
+            "status": getattr(finding.status, "value", str(finding.status)).lower(),
+            "title": finding.title,
+            "description": finding.description,
+            "detected_at": finding.detected_at.isoformat() if finding.detected_at else None,
+            "resolved_at": finding.resolved_at.isoformat() if finding.resolved_at else None,
+            "port": port,
+            "protocol": protocol,
+            "service_name": service_name,
+            "service_version": service_version,
+            "verification_status": finding.resolved_verification_status(),
+            "match_source": finding.resolved_match_source(),
+            "evidence_scope": finding.resolved_evidence_scope(),
+            "evidence_json": evidence,
         }
 
     def _severity_counts(self, findings: list[RiskFinding]) -> dict[str, int]:

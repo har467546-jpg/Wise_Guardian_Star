@@ -8,7 +8,7 @@ import type { ColumnsType } from "antd/es/table";
 import DesktopPageHeader from "@/components/DesktopPageHeader";
 import OverflowText from "@/components/OverflowText";
 import StatusTag from "@/components/StatusTag";
-import { cancelTask, getTask, getTaskEvents } from "@/services/api";
+import { cancelTask, fetchReportHtml, fetchReportPdf, getTask, getTaskEvents } from "@/services/api";
 import { TaskEvent, TaskLogLevel, TaskRunDetail } from "@/types/task";
 import {
   formatDateTime,
@@ -32,6 +32,17 @@ function levelColor(level: TaskLogLevel): string {
   return "processing";
 }
 
+function triggerBrowserDownload(blob: Blob, filename: string) {
+  const url = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.URL.revokeObjectURL(url);
+}
+
 export default function TaskDetailView({ taskId }: { taskId: string }) {
   const screens = Grid.useBreakpoint();
   const router = useRouter();
@@ -41,6 +52,7 @@ export default function TaskDetailView({ taskId }: { taskId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [level, setLevel] = useState<TaskLogLevel | "all">("all");
   const [canceling, setCanceling] = useState(false);
+  const [reportActionLoading, setReportActionLoading] = useState<"html" | "pdf" | null>(null);
 
   const load = async () => {
     try {
@@ -126,6 +138,40 @@ export default function TaskDetailView({ taskId }: { taskId: string }) {
     }
   };
 
+  const rawReportId = task?.result_json ? task.result_json["report_id"] : null;
+  const reportId = typeof rawReportId === "string" ? rawReportId : "";
+  const canAccessGeneratedReport = task?.task_type === "report_generate" && Boolean(reportId);
+
+  const onDownloadReportHtml = async () => {
+    if (!reportId) {
+      return;
+    }
+    try {
+      setReportActionLoading("html");
+      const { blob, filename } = await fetchReportHtml(reportId);
+      triggerBrowserDownload(blob, filename || `${reportId}.html`);
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setReportActionLoading(null);
+    }
+  };
+
+  const onDownloadReportPdf = async () => {
+    if (!reportId) {
+      return;
+    }
+    try {
+      setReportActionLoading("pdf");
+      const { blob, filename } = await fetchReportPdf(reportId);
+      triggerBrowserDownload(blob, filename || `${reportId}.pdf`);
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setReportActionLoading(null);
+    }
+  };
+
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
       <DesktopPageHeader
@@ -150,6 +196,16 @@ export default function TaskDetailView({ taskId }: { taskId: string }) {
               >
                 <Button danger loading={canceling}>中断任务</Button>
               </Popconfirm>
+            ) : null}
+            {canAccessGeneratedReport ? (
+              <Button onClick={() => void onDownloadReportHtml()} loading={reportActionLoading === "html"}>
+                下载 HTML 报告
+              </Button>
+            ) : null}
+            {canAccessGeneratedReport ? (
+              <Button onClick={() => void onDownloadReportPdf()} loading={reportActionLoading === "pdf"}>
+                下载 PDF 报告
+              </Button>
             ) : null}
             <Button onClick={() => router.push(`/tasks/logs?task_id=${taskId}`)}>查看全局日志</Button>
             <Button onClick={() => void load()} loading={loading}>刷新</Button>

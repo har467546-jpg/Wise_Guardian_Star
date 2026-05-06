@@ -98,6 +98,7 @@ import {
   VulnRuleInput,
   VulnRuleListResponse,
 } from "@/types/vuln-library";
+import { GenerateReportResponse, Report } from "@/types/report";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "/api/v1").replace(/\/$/, "");
 const REQUEST_ERROR_MESSAGE = "前端无法连接 API 代理或后端未启动，请检查服务状态后重试";
@@ -326,6 +327,9 @@ function mapErrorMessage(status: number, detail: string): string {
   }
   if (detailLower.includes("unsupported active_check.trigger")) {
     return "主动探测触发方式不受支持";
+  }
+  if (detail.includes("PDF 导出依赖未安装")) {
+    return detail;
   }
   if (detailLower.includes("invalid private key")) {
     return "私钥格式无效，请检查后重试";
@@ -832,6 +836,28 @@ export function getLatestAssetInitial(assetId: string) {
 
 export function getLatestAssetCollection(assetId: string) {
   return apiFetch<AssetLatestCollectionResponse>(`/collection/assets/${assetId}/latest`);
+}
+
+export function generateAssetReport(assetId: string) {
+  return apiFetch<GenerateReportResponse>(`/reports/assets/${assetId}/generate`, {
+    method: "POST",
+  });
+}
+
+export function getLatestAssetReport(assetId: string) {
+  return apiFetch<Report>(`/reports/assets/${assetId}/latest`);
+}
+
+export function getLatestJobReport(jobId: string) {
+  return apiFetch<Report>(`/reports/jobs/${jobId}/latest`);
+}
+
+export function fetchReportHtml(reportId: string) {
+  return apiFetchBlob(`/reports/${reportId}/download/html`);
+}
+
+export function fetchReportPdf(reportId: string) {
+  return apiFetchBlob(`/reports/${reportId}/download/pdf`);
 }
 
 export function runAssetCollectionBatch(payload: {

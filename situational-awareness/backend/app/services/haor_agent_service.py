@@ -237,6 +237,8 @@ MAX_MODEL_VISIBLE_ACTIONS = 8
 MAX_MODEL_DOM_SNAPSHOT_NODES = 12
 MAX_MODEL_UI_RESULTS = 4
 MAX_MODEL_PLANNED_STEPS = 6
+MAX_ASSISTANT_MESSAGE_CHARS = 20000
+MAX_REPLY_REWRITE_CHARS = 3000
 MESSAGE_TURN_STALE_SECONDS = 120
 UI_FEEDBACK_STALE_SECONDS = 300
 
@@ -2636,7 +2638,7 @@ def _compact_reply_tool_traces(tool_traces: list[dict[str, Any]]) -> list[dict[s
 
 
 def _normalize_reply_signature(value: str) -> str:
-    return re.sub(r"\s+", " ", sanitize_text(value, max_length=4000) or "").strip()
+    return re.sub(r"\s+", " ", sanitize_text(value, max_length=MAX_ASSISTANT_MESSAGE_CHARS) or "").strip()
 
 
 _THINK_BLOCK_PATTERN = re.compile(r"(?is)<think\b[^>]*>.*?</think>")
@@ -2664,7 +2666,7 @@ _INTERNAL_REPLY_LEAK_META_HINTS = (
 
 
 def _looks_like_internal_reply_leak_block(block: str) -> bool:
-    normalized = sanitize_text(block, max_length=4000) or ""
+    normalized = sanitize_text(block, max_length=MAX_ASSISTANT_MESSAGE_CHARS) or ""
     if not normalized:
         return False
     lower_block = normalized.lower()
@@ -2681,7 +2683,7 @@ def _looks_like_internal_reply_leak_block(block: str) -> bool:
 
 
 def _scrub_assistant_reply_leaks(content: str) -> str:
-    normalized = sanitize_text(content, max_length=4000) or ""
+    normalized = sanitize_text(content, max_length=MAX_ASSISTANT_MESSAGE_CHARS) or ""
     if not normalized:
         return ""
     without_think = _THINK_BLOCK_PATTERN.sub("\n\n", normalized)
@@ -2778,7 +2780,7 @@ def _trim_incomplete_think_suffix(content: str) -> str:
 
 
 def _normalize_streaming_assistant_reply_content(content: str) -> str:
-    normalized = sanitize_text(content, max_length=4000) or ""
+    normalized = sanitize_text(content, max_length=MAX_ASSISTANT_MESSAGE_CHARS) or ""
     if not normalized:
         return ""
     visible_source = _trim_incomplete_think_suffix(normalized)
@@ -2928,7 +2930,7 @@ def _append_message(
         session_id=session.id,
         role=_sanitize_line(role, max_length=32) or "assistant",
         message_type=_sanitize_line(message_type, max_length=32) or "text",
-        content=sanitize_text(content, max_length=4000) or "",
+        content=sanitize_text(content, max_length=MAX_ASSISTANT_MESSAGE_CHARS) or "",
         payload_json=sanitize_json_value(payload_json or {}),
     )
     session.updated_at = _now()
@@ -2952,6 +2954,11 @@ def _append_or_stream_assistant_message(
     turn_id: str | None = None,
 ) -> AgentMessage:
     fallback_content = _normalize_assistant_reply_content(content)
+    skip_reply_rewrite = (
+        bool(payload_json.get("skip_reply_rewrite"))
+        or len(str(content or "")) > MAX_REPLY_REWRITE_CHARS
+        or len(fallback_content) > MAX_REPLY_REWRITE_CHARS
+    )
     if stream_emitter is None or not turn_id or message_type not in {"text", "clarifying", "plan"}:
         return _append_message(
             db,
@@ -2968,7 +2975,7 @@ def _append_or_stream_assistant_message(
     )
     final_content = fallback_content
     emitted_content = ""
-    if fallback_content and _runtime_provider_mode() != "mock" and _haor_reply_rewrite_enabled():
+    if fallback_content and not skip_reply_rewrite and _runtime_provider_mode() != "mock" and _haor_reply_rewrite_enabled():
         reply_request = _build_reply_stream_request(
             user_content=user_content,
             message_type=message_type,
@@ -7520,6 +7527,7 @@ def _apply_agent_decision(
         auto_execute_results=auto_execute_results,
     )
     decision_summary = planned_step.reason or sanitize_text(str(decision.stop_reason or decision.objective or ""), max_length=280) or None
+    skip_reply_rewrite = decision.stop_reason == "playbook_quick_smalltalk"
     base_assistant_payload = {
         "tool_traces": tool_traces,
         "ui_actions": normalized_ui_actions,
@@ -7532,6 +7540,8 @@ def _apply_agent_decision(
         "browser_context": browser_context,
         "working_context": final_working_context,
         "followup_hint": followup_hint,
+        "stop_reason": decision.stop_reason,
+        "skip_reply_rewrite": skip_reply_rewrite,
     }
     rendered_content = _render_planned_step_content(
         planned_step,

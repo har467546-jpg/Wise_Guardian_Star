@@ -24,11 +24,11 @@ def generate_job_report(self: Task, job_id: str, task_run_id: str | None = None)
             with tracked_task(task_run_id, celery_task_id=self.request.id, retry_count=self.request.retries):
                 ensure_task_not_canceled(task_run_id)
                 set_task_progress(task_run_id, 20, "正在生成任务报告", {"job_id": job_id}, stage_code="generate_report", stage_name="报告生成")
-                report_id = _create_job_report(job_id)
+                report_id = _create_job_report(job_id, task_run_id)
                 ensure_task_not_canceled(task_run_id)
                 set_task_success(task_run_id, "任务报告已生成", {"job_id": job_id, "report_id": report_id})
                 return report_id
-        return _create_job_report(job_id)
+        return _create_job_report(job_id, task_run_id)
     except TaskCanceledError:
         return task_run_id or job_id
     except Exception as exc:
@@ -48,11 +48,11 @@ def generate_asset_report(self: Task, asset_id: str, task_run_id: str | None = N
             with tracked_task(task_run_id, celery_task_id=self.request.id, retry_count=self.request.retries):
                 ensure_task_not_canceled(task_run_id)
                 set_task_progress(task_run_id, 20, "正在生成资产报告", {"asset_id": asset_id}, stage_code="generate_report", stage_name="报告生成")
-                report_id = _create_asset_report(asset_id)
+                report_id = _create_asset_report(asset_id, task_run_id)
                 ensure_task_not_canceled(task_run_id)
                 set_task_success(task_run_id, "资产报告已生成", {"asset_id": asset_id, "report_id": report_id})
                 return report_id
-        return _create_asset_report(asset_id)
+        return _create_asset_report(asset_id, task_run_id)
     except TaskCanceledError:
         return task_run_id or asset_id
     except Exception as exc:
@@ -65,9 +65,10 @@ def generate_asset_report(self: Task, asset_id: str, task_run_id: str | None = N
         raise
 
 
-def _create_job_report(job_id: str) -> str:
+def _create_job_report(job_id: str, task_run_id: str | None = None) -> str:
     with SessionLocal() as db:
         analysis = RiskSummaryService().summarize_job(db, job_id)
+        analysis["task_id"] = task_run_id
         analysis_json, overview, summary_md = ReportGenerator().build_job_report(analysis)
 
         report = AIReport(
@@ -83,9 +84,10 @@ def _create_job_report(job_id: str) -> str:
         return report.id
 
 
-def _create_asset_report(asset_id: str) -> str:
+def _create_asset_report(asset_id: str, task_run_id: str | None = None) -> str:
     with SessionLocal() as db:
         analysis = RiskSummaryService().summarize_asset(db, asset_id)
+        analysis["task_id"] = task_run_id
         analysis_json, overview, summary_md = ReportGenerator().build_asset_report(analysis)
 
         report = AIReport(

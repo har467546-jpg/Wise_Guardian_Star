@@ -481,6 +481,76 @@ def test_append_or_stream_assistant_message_scrubs_reply_stream_output_when_rewr
     assert message.content == "你好！有什么我可以帮助你的吗？"
 
 
+def test_append_or_stream_assistant_message_skips_rewrite_when_payload_requests_it(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    events: list[dict] = []
+    session = SimpleNamespace(id="session-1", updated_at=None)
+
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "_haor_reply_rewrite_enabled", lambda: True)
+
+    def _unexpected_provider():
+        raise AssertionError("quick local replies should not call reply rewrite provider")
+
+    monkeypatch.setattr(haor_agent_service, "_build_runtime_provider", _unexpected_provider)
+
+    message = haor_agent_service._append_or_stream_assistant_message(
+        _FakeUnitDB(),
+        session=session,
+        message_type="text",
+        content="你好，我是 haor。",
+        payload_json={"skip_reply_rewrite": True, "stop_reason": "playbook_quick_smalltalk"},
+        user_content="你好",
+        tool_traces=[],
+        working_context={},
+        stream_emitter=events.append,
+        turn_id="turn-text",
+    )
+
+    delta_text = "".join(str(item.get("delta") or "") for item in events if item.get("type") == "assistant_message_delta")
+    done_event = next(item for item in events if item.get("type") == "assistant_message_done")
+
+    assert delta_text == "你好，我是 haor。"
+    assert done_event["message"]["content"] == "你好，我是 haor。"
+    assert message.content == "你好，我是 haor。"
+
+
+def test_append_or_stream_assistant_message_skips_rewrite_for_long_reply(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    events: list[dict] = []
+    session = SimpleNamespace(id="session-1", updated_at=None)
+    long_reply = "\n".join(
+        f"- 风险项 {index}: 资产 asset-{index:03d} 需要复核访问控制和补丁状态。"
+        for index in range(180)
+    )
+
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "_haor_reply_rewrite_enabled", lambda: True)
+
+    def _unexpected_provider():
+        raise AssertionError("long replies should not call reply rewrite provider")
+
+    monkeypatch.setattr(haor_agent_service, "_build_runtime_provider", _unexpected_provider)
+
+    message = haor_agent_service._append_or_stream_assistant_message(
+        _FakeUnitDB(),
+        session=session,
+        message_type="text",
+        content=long_reply,
+        payload_json={},
+        user_content="帮我输出一份安全报告",
+        tool_traces=[],
+        working_context={},
+        stream_emitter=events.append,
+        turn_id="turn-text",
+    )
+
+    delta_text = "".join(str(item.get("delta") or "") for item in events if item.get("type") == "assistant_message_delta")
+    done_event = next(item for item in events if item.get("type") == "assistant_message_done")
+
+    assert delta_text == long_reply
+    assert done_event["message"]["content"] == long_reply
+    assert message.content == long_reply
+
+
 def test_append_or_stream_assistant_message_passthroughs_upstream_chunks_when_rewrite_enabled(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     class _FakeProvider:
         def stream_generate(self, _request):

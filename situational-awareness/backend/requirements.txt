@@ -20,3 +20,4 @@ python-multipart==0.0.20
 alembic==1.16.5
 pytest==8.4.2
 httpx==0.28.1
+reportlab==4.2.5

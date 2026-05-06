@@ -867,6 +867,84 @@ function hasRemediationAutoSubmitPlan(actions: AgentProposedAction[]): boolean {
   return actions.some((action) => isRemediationAutoSubmitAction(action));
 }
 
+function planActionFallbackTitle(action: AgentProposedAction): string {
+  switch (action.action_type) {
+    case "create_discovery_job":
+      return "发起扫描任务";
+    case "verify_asset_risks":
+      return "触发风险验证";
+    case "install_runner":
+      return "安装 Runner";
+    case "create_or_resume_remediation_session":
+      return "创建修复会话";
+    case "approve_remediation_session":
+      return "批准修复会话";
+    case "configure_ssh_credential":
+      return "配置 SSH 凭据";
+    default:
+      return "待执行动作";
+  }
+}
+
+function buildPendingPlanParamLines(action: AgentProposedAction): string[] {
+  const params = action.params || {};
+  const lines: string[] = [];
+
+  const label = typeof params.label === "string" ? params.label.trim() : "";
+  if (label) {
+    lines.push(`标签：${label}`);
+  }
+
+  const maintenanceWindowId = typeof params.maintenance_window_id === "string" ? params.maintenance_window_id.trim() : "";
+  if (maintenanceWindowId) {
+    lines.push(`维护窗口：${maintenanceWindowId}`);
+  }
+
+  const changeTicket = typeof params.change_ticket === "string" ? params.change_ticket.trim() : "";
+  if (changeTicket) {
+    lines.push(`变更单：${changeTicket}`);
+  }
+
+  const executionMode = typeof params.execution_mode === "string" ? params.execution_mode.trim().toLowerCase() : "";
+  if (executionMode === "apply") {
+    lines.push("执行方式：正式执行");
+  } else if (executionMode === "dry_run") {
+    lines.push("执行方式：演练");
+  }
+
+  if (action.action_type === "configure_ssh_credential") {
+    const mode = typeof params.mode === "string" ? params.mode.trim() : "";
+    if (mode === "single_asset") {
+      lines.push("配置范围：当前资产");
+    } else if (mode === "batch_choice" || mode === "same_credential_batch") {
+      lines.push("配置范围：批量资产");
+    } else if (mode === "per_asset_guided") {
+      lines.push("配置范围：逐台引导");
+    }
+
+    const assetIds = Array.isArray(params.asset_ids)
+      ? params.asset_ids.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+    if (assetIds.length > 1) {
+      lines.push(`资产数量：${assetIds.length} 台`);
+    }
+
+    const authType = typeof params.auth_type === "string" ? params.auth_type.trim().toLowerCase() : "";
+    if (authType === "password") {
+      lines.push("认证方式：密码");
+    } else if (authType === "key") {
+      lines.push("认证方式：私钥");
+    }
+
+    const username = typeof params.username === "string" ? params.username.trim() : "";
+    if (username) {
+      lines.push(`用户名：${username}`);
+    }
+  }
+
+  return lines;
+}
+
 function buildPendingPlanDetails(actions: AgentProposedAction[]) {
   if (!actions.length) {
     return "";
@@ -874,8 +952,7 @@ function buildPendingPlanDetails(actions: AgentProposedAction[]) {
 
   const lines = ["待执行动作："];
   for (const [index, action] of actions.entries()) {
-    lines.push(`${index + 1}. ${action.title}`);
-    lines.push(`动作类型：${action.action_type}`);
+    lines.push(`${index + 1}. ${String(action.title || "").trim() || planActionFallbackTitle(action)}`);
     const target = planTargetLabel(action);
     if (target) {
       lines.push(`目标：${target}`);
@@ -887,13 +964,7 @@ function buildPendingPlanDetails(actions: AgentProposedAction[]) {
       lines.push("执行方式：满足条件时直接提交自动修复。");
       lines.push("条件不足时：仅创建修复会话，并在聊天里说明阻塞原因和下一步。");
     }
-    const paramsText = Object.entries(action.params || {})
-      .filter(([key]) => key !== "submit_if_ready")
-      .map(([key, value]) => `${key}=${String(value)}`)
-      .join("，");
-    if (paramsText) {
-      lines.push(`参数：${paramsText}`);
-    }
+    lines.push(...buildPendingPlanParamLines(action));
     if (index < actions.length - 1) {
       lines.push("");
     }
