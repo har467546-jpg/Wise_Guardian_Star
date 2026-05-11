@@ -1642,11 +1642,20 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     }
     const nextRuntime = toBrowserRuntime(nextSession);
     const nextPhase = typeof nextRuntime.phase === "string" ? nextRuntime.phase.trim() : "";
+    const nextInputState = nextSession.runtime_snapshot?.input_state || "enabled";
     const nextCurrentMessageRequestId =
       typeof nextRuntime.current_message_request_id === "string" ? nextRuntime.current_message_request_id.trim() : "";
     const nextLastMessageRequestId =
       typeof nextRuntime.last_message_request_id === "string" ? nextRuntime.last_message_request_id.trim() : "";
-    if (nextCurrentMessageRequestId && nextCurrentMessageRequestId === current.clientMessageId) {
+    if (nextLastMessageRequestId && nextLastMessageRequestId === current.clientMessageId && nextPhase !== "awaiting_agent_reply") {
+      settlePendingMessageTurn(current.clientMessageId);
+      return;
+    }
+    if (current.acked && nextInputState !== "locked" && nextPhase !== "awaiting_agent_reply") {
+      settlePendingMessageTurn(current.clientMessageId);
+      return;
+    }
+    if (nextCurrentMessageRequestId && nextCurrentMessageRequestId === current.clientMessageId && nextPhase === "awaiting_agent_reply") {
       markPendingMessageTurnAcked(current.clientMessageId);
       setSending(true);
       setAssistantPlaceholder((currentPlaceholder) =>
@@ -1658,10 +1667,6 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
               content: "正在生成…",
             },
       );
-      return;
-    }
-    if (nextLastMessageRequestId && nextLastMessageRequestId === current.clientMessageId && nextPhase !== "awaiting_agent_reply") {
-      settlePendingMessageTurn(current.clientMessageId);
       return;
     }
     if (current.acked && !nextCurrentMessageRequestId) {

@@ -3082,6 +3082,29 @@ def _is_duplicate_step_request(browser_runtime: dict[str, Any], *, step_request_
     )
 
 
+def _has_completed_assistant_message_for_client_message_id(session: AgentSession, *, client_message_id: str) -> bool:
+    normalized_client_message_id = _normalize_client_message_id(client_message_id)
+    if not normalized_client_message_id:
+        return False
+
+    assistant_after_user = False
+    for item in reversed(list(getattr(session, "messages", None) or [])[-24:]):
+        payload = item.payload_json if isinstance(getattr(item, "payload_json", None), dict) else {}
+        role = str(getattr(item, "role", "") or "").strip().lower()
+        message_type = str(getattr(item, "message_type", "") or "").strip().lower()
+        payload_client_message_id = _normalize_client_message_id(payload.get("client_message_id"))
+
+        if role == "assistant" and message_type in {"text", "clarifying", "plan", "action_update", "error"}:
+            if payload_client_message_id == normalized_client_message_id:
+                return True
+            assistant_after_user = True
+            continue
+
+        if role == "user" and payload_client_message_id == normalized_client_message_id:
+            return assistant_after_user
+    return False
+
+
 def _append_interrupted_task_message(
     db: Session,
     *,
@@ -3179,6 +3202,54 @@ def _reconcile_stale_message_turn_state(
             "agent_client_message_id": client_message_id,
             "agent_phase": "awaiting_agent_reply",
             "agent_result": "stale",
+            "agent_source": source,
+        },
+    )
+    return True
+
+
+def _reconcile_completed_message_turn_state(
+    db: Session,
+    *,
+    session: AgentSession,
+    source: str = "message_turn_completed_reconcile",
+) -> bool:
+    browser_runtime = _normalize_browser_runtime(
+        session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
+    )
+    if str(browser_runtime.get("phase") or "") != "awaiting_agent_reply":
+        return False
+    client_message_id = _normalize_client_message_id(browser_runtime.get("current_message_request_id"))
+    if not client_message_id:
+        return False
+    if not _has_completed_assistant_message_for_client_message_id(session, client_message_id=client_message_id):
+        return False
+
+    browser_context = _normalize_browser_context(
+        browser_runtime.get("last_browser_context") if isinstance(browser_runtime.get("last_browser_context"), dict) else {}
+    )
+    _clear_browser_runtime(
+        session,
+        browser_context=browser_context,
+        last_user_intent=str(browser_runtime.get("last_user_intent") or "") or None,
+        current_objective=str(browser_runtime.get("current_objective") or "") or None,
+        objective_kind=str(browser_runtime.get("objective_kind") or "") or None,
+        auto_executed_actions=browser_runtime.get("auto_executed_actions")
+        if isinstance(browser_runtime.get("auto_executed_actions"), list)
+        else [],
+        last_message_request_id=client_message_id,
+        last_message_ack_at=_now(),
+    )
+    if str(session.status or "") not in {"waiting_approval", "running"}:
+        session.status = "active"
+    db.add(session)
+    logger.info(
+        "haor completed message turn reconciled",
+        extra={
+            "agent_session_id": session.id,
+            "agent_client_message_id": client_message_id,
+            "agent_phase": "awaiting_agent_reply",
+            "agent_result": "completed_reconciled",
             "agent_source": source,
         },
     )
@@ -3374,12 +3445,15 @@ def _reconcile_session_runtime_state(
     *,
     session: AgentSession,
     interrupted_source: str = "session_reconcile",
+    completed_message_source: str = "message_turn_completed_reconcile",
     message_stale_source: str = "message_turn_reconcile",
     stale_source: str = "ui_feedback_reconcile",
     repair_source: str = "session_recover",
 ) -> bool:
     changed = False
     if _reconcile_running_session_state(db, session=session, interrupted_source=interrupted_source):
+        changed = True
+    if _reconcile_completed_message_turn_state(db, session=session, source=completed_message_source):
         changed = True
     if _reconcile_stale_message_turn_state(db, session=session, source=message_stale_source):
         changed = True
@@ -3516,6 +3590,7 @@ def recover_agent_session(db: Session, *, user: User) -> AgentSessionRead:
         db,
         session=session,
         interrupted_source="recover_running_state",
+        completed_message_source="recover_completed_message_state",
         message_stale_source="recover_message_state",
         stale_source="recover_ui_state",
         repair_source="recover_session_state",

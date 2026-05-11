@@ -183,7 +183,6 @@ export default function AppShell({ children }: { children: ReactNode }) {
                 <div className="console-brand">
                   <span className="console-brand-kicker">Unified Security Workspace</span>
                   <h1 className="console-brand-title">资产态势感知</h1>
-                  <p className="console-brand-description">冷白科技风格的统一安全工作台，覆盖资产、风险、修复与规则治理。</p>
                 </div>
                 <Button
                   type="text"

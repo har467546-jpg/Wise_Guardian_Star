@@ -2,3 +2,5 @@
 .pytest_cache/
 sa_screen.png
 .DS_Store
+.codex
+.playwright-cli/

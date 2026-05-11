@@ -488,6 +488,77 @@ def test_get_haor_session_reconciles_stale_pending_message_turn_once(monkeypatch
     assert len(second_stale_messages) == 1
 
 
+def test_post_haor_message_unlocks_completed_pending_message_turn(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client, user_id = _build_client()
+    monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")
+    now = datetime.now(timezone.utc)
+
+    with SessionLocal() as db:
+        session = AgentSession(
+            id=str(uuid4()),
+            agent_id="haor",
+            user_id=user_id,
+            status="active",
+            route_context_json=_page_context(pathname="/"),
+            working_context_json={},
+            dialog_state_json={},
+            pending_plan_json={},
+            browser_runtime_json={
+                "phase": "awaiting_agent_reply",
+                "current_message_request_id": "client-msg-finished-1",
+                "message_pending_since": now.isoformat(),
+                "last_message_request_id": "client-msg-finished-1",
+                "last_message_ack_at": now.isoformat(),
+                "last_browser_context": _browser_context(pathname="/"),
+                "last_user_intent": "你好",
+            },
+            updated_at=now,
+            created_at=now,
+        )
+        db.add(session)
+        db.flush()
+        db.add(
+            AgentMessage(
+                session_id=session.id,
+                role="user",
+                message_type="text",
+                content="你好",
+                payload_json={"client_message_id": "client-msg-finished-1"},
+                created_at=now,
+            )
+        )
+        db.add(
+            AgentMessage(
+                session_id=session.id,
+                role="assistant",
+                message_type="text",
+                content="你好，我是 haor。",
+                payload_json={"stop_reason": "playbook_quick_smalltalk"},
+                created_at=now + timedelta(milliseconds=1),
+            )
+        )
+        db.commit()
+
+    response = client.post(
+        "/api/v1/agent/haor/session/messages",
+        json={
+            "client_message_id": "client-msg-finished-2",
+            "content": "你好",
+            "page_context": _page_context(pathname="/"),
+            "browser_context": _browser_context(pathname="/"),
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["browser_runtime_json"]["phase"] == "idle"
+    assert body["browser_runtime_json"]["current_message_request_id"] is None
+    assert body["browser_runtime_json"]["last_message_request_id"] == "client-msg-finished-2"
+    assert len([item for item in body["messages"] if item["role"] == "user"]) == 2
+    assert body["messages"][-1]["role"] == "assistant"
+    assert "上一轮消息" not in body["messages"][-1]["content"]
+
+
 def test_post_haor_message_returns_clarifying_message_when_context_missing(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     client, _ = _build_client()
     monkeypatch.setattr(haor_agent_service.settings, "LLM_PROVIDER", "mock")

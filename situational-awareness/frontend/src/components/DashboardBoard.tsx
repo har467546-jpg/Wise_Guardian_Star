@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import type { CSSProperties } from "react";
 import { Alert, Card, Col, Empty, List, Progress, Row, Skeleton, Space, Typography } from "antd";
 
 import StatusTag from "@/components/StatusTag";
@@ -152,6 +153,8 @@ export default function DashboardBoard() {
   const [liveMetrics, setLiveMetrics] = useState<PlatformLiveMetrics | null>(null);
   const [liveMetricHistory, setLiveMetricHistory] = useState<LiveMetricHistoryPoint[]>([]);
   const [liveMetricsError, setLiveMetricsError] = useState<string | null>(null);
+  const [topRowCardHeight, setTopRowCardHeight] = useState<number | null>(null);
+  const liveMonitoringCardRef = useRef<HTMLDivElement | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [, startLiveMetricsTransition] = useTransition();
@@ -230,6 +233,37 @@ export default function DashboardBoard() {
     };
   }, [startLiveMetricsTransition]);
 
+  useEffect(() => {
+    if (loading) {
+      setTopRowCardHeight(null);
+      return;
+    }
+
+    const node = liveMonitoringCardRef.current;
+    if (!node || typeof window === "undefined") {
+      return;
+    }
+
+    const updateTopRowCardHeight = () => {
+      const nextHeight = Math.ceil(node.getBoundingClientRect().height);
+      setTopRowCardHeight((current) => (current === nextHeight ? current : nextHeight));
+    };
+
+    updateTopRowCardHeight();
+    window.addEventListener("resize", updateTopRowCardHeight);
+
+    let resizeObserver: ResizeObserver | null = null;
+    if ("ResizeObserver" in window) {
+      resizeObserver = new ResizeObserver(updateTopRowCardHeight);
+      resizeObserver.observe(node);
+    }
+
+    return () => {
+      window.removeEventListener("resize", updateTopRowCardHeight);
+      resizeObserver?.disconnect();
+    };
+  }, [loading]);
+
   const liveTrendData = useMemo(() => {
     const cpuSeries = liveMetricHistory.map((item) => item.cpuUsage);
     const memorySeries = liveMetricHistory.map((item) => item.memoryUsage);
@@ -245,6 +279,10 @@ export default function DashboardBoard() {
     };
   }, [liveMetricHistory]);
 
+  const topRowStyle = topRowCardHeight
+    ? ({ "--dashboard-top-card-height": `${topRowCardHeight}px` } as CSSProperties)
+    : undefined;
+
   if (loading) {
     return <Skeleton active paragraph={{ rows: 12 }} />;
   }
@@ -253,96 +291,98 @@ export default function DashboardBoard() {
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
       {error ? <Alert type="error" showIcon message={error} /> : null}
 
-      <Row gutter={[14, 14]} className="dashboard-grid-row">
+      <Row gutter={[14, 14]} className="dashboard-grid-row dashboard-top-row" style={topRowStyle}>
         <Col xs={24} lg={11}>
-          <Card
-            className="panel-card dashboard-panel-card"
-            data-haor-section="平台实时监控"
-            title="平台实时监控"
-            extra={
-              <Space size={10} wrap>
-                <span className={`live-monitoring-chip${liveMetricsError ? " is-stale" : ""}`}>
-                  <span className="live-monitoring-chip-dot" />
-                  {liveMetricsError ? "刷新中断" : "实时监控中"}
-                </span>
-                <Typography.Text type="secondary">
-                  {liveMetrics
-                    ? `${formatDateTime(liveMetrics.sampled_at)} · ${liveMetrics.sample_window_seconds.toFixed(1)}s 窗口`
-                    : "正在采样"}
-                </Typography.Text>
-              </Space>
-            }
-          >
-            {liveMetrics ? (
-              <Space direction="vertical" size={14} style={{ width: "100%" }}>
-                <div className="platform-trends-grid">
-                  <LiveTrendCard
-                    label="CPU"
-                    color="#38bdf8"
-                    value={`${liveMetrics.cpu.usage_percent.toFixed(1)}%`}
-                    detail={`${liveMetrics.cpu.logical_cores || "-"} 核 · 1 分钟负载 ${liveMetrics.cpu.load_avg_1m ?? "-"}`}
-                    series={liveTrendData.cpuSeries}
-                    scaleLabel={`峰值 ${Math.max(...liveTrendData.cpuSeries, 0).toFixed(0)}%`}
-                    maxValue={100}
-                  />
-                  <LiveTrendCard
-                    label="内存"
-                    color="#f59e0b"
-                    value={`${liveMetrics.memory.usage_percent.toFixed(1)}%`}
-                    detail={`已用 ${formatBytes(liveMetrics.memory.used_bytes)} / 总量 ${formatBytes(liveMetrics.memory.total_bytes)}`}
-                    series={liveTrendData.memorySeries}
-                    scaleLabel={`峰值 ${Math.max(...liveTrendData.memorySeries, 0).toFixed(0)}%`}
-                    maxValue={100}
-                  />
-                  <LiveTrendCard
-                    label="磁盘"
-                    color="#f87171"
-                    value={`${liveMetrics.disk.usage_percent.toFixed(1)}%`}
-                    detail={`${liveMetrics.disk.mount_path} · 已用 ${formatBytes(liveMetrics.disk.used_bytes)}`}
-                    series={liveTrendData.diskSeries}
-                    scaleLabel={`峰值 ${Math.max(...liveTrendData.diskSeries, 0).toFixed(0)}%`}
-                    maxValue={100}
-                  />
-                  <LiveTrendCard
-                    label="网络"
-                    color="#22c55e"
-                    value={formatRate(liveMetrics.network.total_bytes_per_sec)}
-                    detail={`接收 ${formatRate(liveMetrics.network.received_bytes_per_sec)} · 发送 ${formatRate(liveMetrics.network.transmitted_bytes_per_sec)}`}
-                    series={liveTrendData.networkSeries}
-                    scaleLabel={`峰值 ${formatRate(liveTrendData.networkPeak)}`}
-                  />
-                </div>
-                <div className="live-monitoring-footer">
+          <div className="dashboard-top-card-measure" ref={liveMonitoringCardRef}>
+            <Card
+              className="panel-card dashboard-panel-card dashboard-live-monitoring-card"
+              data-haor-section="平台实时监控"
+              title="平台实时监控"
+              extra={
+                <Space size={10} wrap>
+                  <span className={`live-monitoring-chip${liveMetricsError ? " is-stale" : ""}`}>
+                    <span className="live-monitoring-chip-dot" />
+                    {liveMetricsError ? "刷新中断" : "实时监控中"}
+                  </span>
                   <Typography.Text type="secondary">
-                    最近 {liveMetricHistory.length || 1} 个样本，按 {LIVE_METRICS_POLL_INTERVAL_MS / 1000} 秒频率刷新。
+                    {liveMetrics
+                      ? `${formatDateTime(liveMetrics.sampled_at)} · ${liveMetrics.sample_window_seconds.toFixed(1)}s 窗口`
+                      : "正在采样"}
                   </Typography.Text>
-                  <Typography.Text type="secondary">最新采样时间 {formatDateTime(liveMetrics.sampled_at)}</Typography.Text>
-                </div>
-                {liveMetricsError ? (
-                  <Alert
-                    showIcon
-                    type="warning"
-                    message={`实时刷新暂时中断，当前展示最近一次样本：${liveMetricsError}`}
-                  />
-                ) : null}
-              </Space>
-            ) : (
-              <Alert
-                showIcon
-                type={liveMetricsError ? "warning" : "info"}
-                message={liveMetricsError || "正在建立平台实时监控流，请稍候。"}
-              />
-            )}
-          </Card>
+                </Space>
+              }
+            >
+              {liveMetrics ? (
+                <Space className="dashboard-live-monitoring-stack" direction="vertical" size={14} style={{ width: "100%" }}>
+                  <div className="platform-trends-grid">
+                    <LiveTrendCard
+                      label="CPU"
+                      color="#38bdf8"
+                      value={`${liveMetrics.cpu.usage_percent.toFixed(1)}%`}
+                      detail={`${liveMetrics.cpu.logical_cores || "-"} 核 · 1 分钟负载 ${liveMetrics.cpu.load_avg_1m ?? "-"}`}
+                      series={liveTrendData.cpuSeries}
+                      scaleLabel={`峰值 ${Math.max(...liveTrendData.cpuSeries, 0).toFixed(0)}%`}
+                      maxValue={100}
+                    />
+                    <LiveTrendCard
+                      label="内存"
+                      color="#f59e0b"
+                      value={`${liveMetrics.memory.usage_percent.toFixed(1)}%`}
+                      detail={`已用 ${formatBytes(liveMetrics.memory.used_bytes)} / 总量 ${formatBytes(liveMetrics.memory.total_bytes)}`}
+                      series={liveTrendData.memorySeries}
+                      scaleLabel={`峰值 ${Math.max(...liveTrendData.memorySeries, 0).toFixed(0)}%`}
+                      maxValue={100}
+                    />
+                    <LiveTrendCard
+                      label="磁盘"
+                      color="#f87171"
+                      value={`${liveMetrics.disk.usage_percent.toFixed(1)}%`}
+                      detail={`${liveMetrics.disk.mount_path} · 已用 ${formatBytes(liveMetrics.disk.used_bytes)}`}
+                      series={liveTrendData.diskSeries}
+                      scaleLabel={`峰值 ${Math.max(...liveTrendData.diskSeries, 0).toFixed(0)}%`}
+                      maxValue={100}
+                    />
+                    <LiveTrendCard
+                      label="网络"
+                      color="#22c55e"
+                      value={formatRate(liveMetrics.network.total_bytes_per_sec)}
+                      detail={`接收 ${formatRate(liveMetrics.network.received_bytes_per_sec)} · 发送 ${formatRate(liveMetrics.network.transmitted_bytes_per_sec)}`}
+                      series={liveTrendData.networkSeries}
+                      scaleLabel={`峰值 ${formatRate(liveTrendData.networkPeak)}`}
+                    />
+                  </div>
+                  <div className="live-monitoring-footer">
+                    <Typography.Text type="secondary">
+                      最近 {liveMetricHistory.length || 1} 个样本，按 {LIVE_METRICS_POLL_INTERVAL_MS / 1000} 秒频率刷新。
+                    </Typography.Text>
+                    <Typography.Text type="secondary">最新采样时间 {formatDateTime(liveMetrics.sampled_at)}</Typography.Text>
+                  </div>
+                  {liveMetricsError ? (
+                    <Alert
+                      showIcon
+                      type="warning"
+                      message={`实时刷新暂时中断，当前展示最近一次样本：${liveMetricsError}`}
+                    />
+                  ) : null}
+                </Space>
+              ) : (
+                <Alert
+                  showIcon
+                  type={liveMetricsError ? "warning" : "info"}
+                  message={liveMetricsError || "正在建立平台实时监控流，请稍候。"}
+                />
+              )}
+            </Card>
+          </div>
         </Col>
         <Col xs={24} lg={13}>
           <Card
-            className="panel-card dashboard-panel-card"
+            className="panel-card dashboard-panel-card dashboard-discovery-risk-card"
             data-haor-section="发现队列与最新风险"
             title="发现队列与最新风险"
           >
             {overview ? (
-              <Space direction="vertical" size={14} style={{ width: "100%" }}>
+              <Space className="dashboard-discovery-risk-stack" direction="vertical" size={14} style={{ width: "100%" }}>
                 <div className="dashboard-threat-band">
                   <div className="dashboard-threat-column">
                     <span>待执行发现</span>
@@ -363,7 +403,7 @@ export default function DashboardBoard() {
                 </div>
                 {overview.recent_risks.length ? (
                   <List
-                    className="console-list"
+                    className="console-list dashboard-risk-queue-list"
                     dataSource={overview.recent_risks}
                     renderItem={(item) => (
                       <List.Item className="console-list-item">

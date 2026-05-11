@@ -843,6 +843,67 @@ def test_recover_agent_session_repairs_stale_wait_and_unlocks_input(monkeypatch)
     assert result.runtime_snapshot.input_state == "enabled"
 
 
+def test_recover_agent_session_unlocks_completed_pending_message_turn(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    now = datetime.now(UTC)
+    session = SimpleNamespace(
+        id="session-1",
+        agent_id="haor",
+        status="active",
+        route_context_json={},
+        working_context_json={},
+        dialog_state_json={},
+        pending_plan_json={},
+        browser_runtime_json={
+            "phase": "awaiting_agent_reply",
+            "current_message_request_id": "client-msg-1",
+            "message_pending_since": now.isoformat(),
+            "last_message_request_id": "client-msg-1",
+            "last_message_ack_at": now.isoformat(),
+            "last_browser_context": {"pathname": "/", "query": {}},
+            "last_user_intent": "你好",
+            "current_objective": "快速寒暄",
+            "objective_kind": "general",
+        },
+        agent_state_json={},
+        current_goal=None,
+        current_goal_id=None,
+        last_task_id=None,
+        messages=[
+            SimpleNamespace(
+                id="msg-user-1",
+                role="user",
+                message_type="text",
+                content="你好",
+                payload_json={"client_message_id": "client-msg-1"},
+                created_at=now,
+            ),
+            SimpleNamespace(
+                id="msg-assistant-1",
+                role="assistant",
+                message_type="text",
+                content="你好，我是 haor。",
+                payload_json={"stop_reason": "playbook_quick_smalltalk"},
+                created_at=now,
+            ),
+        ],
+        created_at=now,
+        updated_at=now,
+    )
+    db = _FakeRecoverDB()
+
+    monkeypatch.setattr(haor_agent_service, "_load_recent_session", lambda _db, user_id: session)
+
+    result = haor_agent_service.recover_agent_session(db, user=SimpleNamespace(id="user-1"))
+
+    assert db.committed is True
+    assert session.browser_runtime_json["phase"] == "idle"
+    assert session.browser_runtime_json["current_message_request_id"] is None
+    assert session.browser_runtime_json["last_message_request_id"] == "client-msg-1"
+    assert not any(item.payload_json.get("stale_message_turn") for item in session.messages)
+    assert result.runtime_snapshot.phase == "idle"
+    assert result.runtime_snapshot.input_state == "enabled"
+
+
 def test_recover_agent_session_unlocks_when_terminal_followup_already_exists(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     now = datetime.now(UTC)
     session = SimpleNamespace(

@@ -5341,11 +5341,66 @@ a {
   display: flex;
 }
 
+.dashboard-top-row {
+  --dashboard-top-card-height: auto;
+  align-items: flex-start;
+}
+
+.dashboard-top-row > .ant-col {
+  align-self: flex-start;
+}
+
+.dashboard-top-card-measure {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+}
+
 .dashboard-panel-card {
   width: 100%;
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+.dashboard-live-monitoring-card {
+  min-height: 0;
+}
+
+.dashboard-discovery-risk-card {
+  height: var(--dashboard-top-card-height);
+  min-height: var(--dashboard-top-card-height);
+  max-height: var(--dashboard-top-card-height);
+}
+
+.dashboard-live-monitoring-stack,
+.dashboard-live-monitoring-stack.ant-space,
+.dashboard-discovery-risk-stack,
+.dashboard-discovery-risk-stack.ant-space {
+  flex: 1;
+  min-height: 0;
+}
+
+.dashboard-discovery-risk-card .ant-card-body {
+  overflow: hidden;
+}
+
+.dashboard-discovery-risk-stack {
+  height: 100%;
+}
+
+.dashboard-discovery-risk-stack > .ant-space-item:last-child {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
+.dashboard-risk-queue-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 .dashboard-panel-card .ant-card-head {
@@ -5376,5 +5431,21 @@ a {
 
   .dashboard-panel-card {
     height: auto;
+  }
+
+  .dashboard-discovery-risk-card {
+    height: auto;
+    min-height: 0;
+    max-height: none;
+  }
+
+  .dashboard-discovery-risk-stack > .ant-space-item:last-child {
+    display: block;
+  }
+
+  .dashboard-risk-queue-list {
+    max-height: none;
+    overflow-y: visible;
+    padding-right: 0;
   }
 }
