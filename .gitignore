@@ -4,3 +4,4 @@ sa_screen.png
 .DS_Store
 .codex
 .playwright-cli/
+.spring-api-helper.json
