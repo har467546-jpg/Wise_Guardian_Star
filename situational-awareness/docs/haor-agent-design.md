@@ -46,6 +46,7 @@
   - 读工具：查资产、风险、任务、修复对象、漏洞规则
   - UI 动作：跳转、点击、输入、选择、提交、等待
   - 写动作：创建扫描任务、验证风险、安装 Runner、创建修复会话、审批修复、配置 SSH 凭据
+- 写动作策略已收敛到 `backend/app/services/haor/action_policy.py`，统一声明支持动作、风险等级、必填槽位、审批要求、自动执行权限和后续跟踪策略。
 - 当前动作策略核心约束：
   - 低风险动作可自动执行
   - 高风险动作必须审批
@@ -62,6 +63,9 @@
 ## 关键代码入口
 - `backend/app/api/v1/endpoints/agent.py`
 - `backend/app/services/haor_agent_service.py`
+- `backend/app/services/haor/action_policy.py`
+- `backend/app/services/haor/observability.py`
+- `backend/app/services/agent/llm_replay_evaluation.py`
 - `backend/app/services/agent_playbook_service.py`
 - `backend/app/services/agent_goal_service.py`
 - `backend/app/services/agent/session_service.py`
@@ -75,6 +79,32 @@
 - `mock` 模式保留完整链路，但不会真正执行高风险写操作。
 - Haor 当前是单智能体多 playbook 架构，不是多个自治人格协作。
 
+## 评测与质量控制
+- 当前已提供 Haor playbook 离线回归评测，用于验证意图匹配、工具选择、低风险自动执行、高风险审批、敏感输入引导和关键参数保留。
+- 同时增加默认 playbook 到运行时决策 schema 的转换回归，要求 playbook 产出的读工具、自动动作和待处理动作在 `haor_agent_service` 中完整保留。
+- 新增 LLM 输出回放评测，用于复盘真实或记录下来的模型 JSON 输出，验证模型输出解析、读工具选择、自动动作边界和审批边界。
+- 运行时会在 `agent_state_json.traces` 中记录最近轮次 trace，包含模型调用次数、估算 token、模型延迟、读工具延迟、动作延迟、动作数量和端到端成功字段。
+- 评测入口：
+  - `backend/app/services/agent/evaluation.py`
+  - `backend/app/services/agent/llm_replay_evaluation.py`
+  - `scripts/haor_playbook_eval.py`
+  - `scripts/haor_llm_replay_eval.py`
+  - `backend/tests/unit/test_agent_evaluation.py`
+  - `backend/tests/unit/test_haor_agent_service.py`
+- 默认通过标准：
+  - `pass_rate = 100%`
+  - `unsafe_auto_execute_count = 0`
+- 运行命令：
+
+```bash
+cd situational-awareness
+python scripts/haor_playbook_eval.py --fail-under 1.0
+python scripts/haor_llm_replay_eval.py --fail-under 1.0
+```
+
+- 当前评测仍不等同于完整生产质量评测。后续应继续把真实线上 trace 抽样固化为 replay fixture，并补充浏览器端端到端任务成功率、误执行率、澄清率和审批触发率。
+- 新增动作类型时必须先更新 `haor/action_policy.py`，再同步执行器和前端安全输入/审批 UI；`_ProposedWriteAction` 已从该策略源校验动作类型，避免跨层白名单漂移。
+
 ## 相关文档
 - 项目总入口：[../README.md](../README.md)
 - 总体架构：[architecture.md](architecture.md)
@@ -82,3 +112,4 @@
 - 后端设计：[backend-design.md](backend-design.md)
 - 数据模型：[database-schema.md](database-schema.md)
 - 接口说明：[api-contract.md](api-contract.md)
+- Haor 评测：[agent-evaluation.md](agent-evaluation.md)

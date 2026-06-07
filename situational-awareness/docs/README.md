@@ -14,6 +14,7 @@
 7. 运行手册：[runbook.md](runbook.md)
 8. 测试与验收：[testing-and-acceptance.md](testing-and-acceptance.md)
 9. Haor 设计：[haor-agent-design.md](haor-agent-design.md)
+10. Haor 评测：[agent-evaluation.md](agent-evaluation.md)
 
 ## 标准文档
 
@@ -28,6 +29,8 @@
   - 说明 FastAPI、service/task/repository 分层、配置、安全、日志与监控。
 - [haor-agent-design.md](haor-agent-design.md)
   - 说明 Haor 的会话模型、playbook、动作策略、审批、恢复与流式反馈。
+- [agent-evaluation.md](agent-evaluation.md)
+  - 说明 Haor playbook 与动作策略的离线评测集、运行方式、指标和扩展方向。
 
 ### 数据与接口
 - [database-schema.md](database-schema.md)

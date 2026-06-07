@@ -2596,6 +2596,98 @@ def test_match_registered_playbook_routes_blocked_goal_to_secure_ssh_input() -> 
     assert decision.proposed_write_actions[0]["params"]["asset_ids"] == ["asset-1", "asset-2"]
 
 
+def test_playbook_secure_ssh_action_survives_runtime_decision_conversion() -> None:
+    playbook = agent_playbook_service.AgentPlaybookDecision(
+        playbook_id="configure_ssh_credential",
+        objective="为资产 asset-1 配置 SSH 凭据",
+        reply_markdown="我会打开 SSH 凭据安全配置弹层。",
+        proposed_write_actions=[
+            {
+                "action_type": "configure_ssh_credential",
+                "title": "为资产 asset-1 配置 SSH 凭据",
+                "reason": "当前目标缺少可用 SSH 管理员凭据，需要进入安全输入流程。",
+                "params": {
+                    "asset_id": "asset-1",
+                    "asset_ids": ["asset-1"],
+                    "asset_labels": ["资产 asset-1"],
+                    "mode": "single_asset",
+                    "auto_verify": True,
+                    "auto_resume": True,
+                },
+            }
+        ],
+    )
+
+    decision = haor_agent_service._build_model_decision_from_playbook(playbook)
+
+    assert len(decision.proposed_write_actions) == 1
+    action = decision.proposed_write_actions[0]
+    assert action.action_type == "configure_ssh_credential"
+    assert action.params["asset_id"] == "asset-1"
+    assert action.params["auto_verify"] is True
+    assert decision.conversation_state == "plan"
+
+
+def test_proposed_write_action_schema_uses_unified_policy_source() -> None:
+    assert haor_agent_service._ProposedWriteAction(
+        action_type="configure_ssh_credential",
+        title="配置 SSH 凭据",
+        reason="进入安全输入流程",
+        params={"asset_id": "asset-1"},
+    ).action_type == "configure_ssh_credential"
+
+    try:
+        haor_agent_service._ProposedWriteAction(
+            action_type="unknown_action",
+            title="未知动作",
+            reason="不应被接受",
+            params={},
+        )
+    except Exception as exc:
+        assert "unsupported write action" in str(exc)
+    else:
+        raise AssertionError("unknown action should be rejected by unified action policy")
+
+
+def test_collect_missing_slots_supports_alternative_required_slots() -> None:
+    missing = haor_agent_service._collect_missing_slots(
+        [
+            {
+                "action_type": "configure_ssh_credential",
+                "params": {"asset_ids": ["asset-1"]},
+            }
+        ]
+    )
+
+    assert missing == []
+
+
+def test_default_playbook_actions_survive_runtime_decision_conversion() -> None:
+    from app.services.agent.evaluation import DEFAULT_PLAYBOOK_EVAL_CASES
+
+    for case in DEFAULT_PLAYBOOK_EVAL_CASES:
+        playbook = agent_playbook_service.match_registered_playbook(
+            content=case.content,
+            page_context=case.page_context,
+            browser_context=case.browser_context,
+            working_context=case.working_context,
+            current_goal=case.current_goal,
+        )
+        assert playbook is not None, case.case_id
+
+        decision = haor_agent_service._build_model_decision_from_playbook(playbook)
+
+        assert [item.tool_name for item in decision.read_tool_calls] == [
+            item["tool_name"] for item in playbook.read_tool_calls
+        ], case.case_id
+        assert [item.action_type for item in decision.auto_execute_actions] == [
+            item["action_type"] for item in playbook.auto_execute_actions
+        ], case.case_id
+        assert [item.action_type for item in decision.proposed_write_actions] == [
+            item["action_type"] for item in playbook.proposed_write_actions
+        ], case.case_id
+
+
 def test_build_runtime_snapshot_locks_input_for_secure_input_phase() -> None:
     session = SimpleNamespace(
         status="active",

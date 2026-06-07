@@ -18,12 +18,13 @@ from .session_service import (
     reset_agent_session,
     restore_session_from_running_state,
 )
-from .execution_registry import (
-    ACTION_EXECUTORS,
-    AgentActionExecutorContext,
-    AgentExecutionResult,
-    execute_registered_action,
-)
+
+_LAZY_EXPORTS = {
+    "ACTION_EXECUTORS",
+    "AgentActionExecutorContext",
+    "AgentExecutionResult",
+    "execute_registered_action",
+}
 
 __all__ = [
     "ACTIVE_PUBLIC_SESSION_STATUSES",
@@ -47,3 +48,11 @@ __all__ = [
     "set_runtime_state",
     "set_runtime_state_from_internal",
 ]
+
+
+def __getattr__(name: str):
+    if name in _LAZY_EXPORTS:
+        from . import execution_registry
+
+        return getattr(execution_registry, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

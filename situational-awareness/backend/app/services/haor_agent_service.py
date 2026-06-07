@@ -10,7 +10,7 @@ from typing import Any, Callable, Literal
 from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
@@ -72,6 +72,23 @@ from app.services.ai.providers import LLMMessage, LLMRequest, build_provider
 from app.services.agent.context_service import sanitize_browser_context_summary
 from app.services.agent.execution_registry import AgentActionExecutorContext, AgentExecutionResult
 from app.services.agent.execution_service import AgentExecutionService
+from app.services.haor.action_policy import (
+    ACTION_POLICY_REGISTRY,
+    AUTO_EXECUTE_ACTIONS,
+    SUPPORTED_WRITE_ACTIONS,
+    get_action_policy,
+)
+from app.services.haor.observability import (
+    HaorTurnTrace,
+    append_trace_payload,
+    elapsed_ms,
+    finalize_trace,
+    new_trace,
+    record_action,
+    record_model_call,
+    record_read_tool,
+    start_timer,
+)
 from app.services.agent_goal_service import (
     attach_goal_to_session,
     ensure_goal_for_message,
@@ -134,20 +151,7 @@ SUPPORTED_READ_TOOLS = {
     "list_vuln_rules",
     "get_vuln_rule",
 }
-SUPPORTED_WRITE_ACTIONS = {
-    "create_discovery_job",
-    "verify_asset_risks",
-    "install_runner",
-    "create_or_resume_remediation_session",
-    "approve_remediation_session",
-    "configure_ssh_credential",
-}
 AGENT_EXECUTION_SERVICE = AgentExecutionService(supported_action_types=SUPPORTED_WRITE_ACTIONS)
-AUTO_EXECUTE_ACTIONS = {
-    "create_discovery_job",
-    "verify_asset_risks",
-    "install_runner",
-}
 SSH_CREDENTIAL_BLOCKER_CODES = {
     "missing_ssh_credential",
     "authorization_unconfirmed",
@@ -163,50 +167,6 @@ RENDER_BLOCKER_CODES = {
     "unstable_render",
     "missing_target",
     "missing_adapter",
-}
-ACTION_POLICY_REGISTRY: dict[str, dict[str, Any]] = {
-    "create_discovery_job": {
-        "required_slots": ["cidr"],
-        "risk_level": "low",
-        "needs_confirmation": False,
-        "auto_execute_allowed": True,
-        "task_followup_strategy": "watch_task",
-    },
-    "verify_asset_risks": {
-        "required_slots": ["asset_id"],
-        "risk_level": "low",
-        "needs_confirmation": False,
-        "auto_execute_allowed": True,
-        "task_followup_strategy": "watch_task",
-    },
-    "install_runner": {
-        "required_slots": ["asset_id"],
-        "risk_level": "low",
-        "needs_confirmation": False,
-        "auto_execute_allowed": True,
-        "task_followup_strategy": "watch_task",
-    },
-    "create_or_resume_remediation_session": {
-        "required_slots": ["asset_id"],
-        "risk_level": "high",
-        "needs_confirmation": True,
-        "auto_execute_allowed": False,
-        "task_followup_strategy": "session",
-    },
-    "approve_remediation_session": {
-        "required_slots": ["session_id"],
-        "risk_level": "high",
-        "needs_confirmation": True,
-        "auto_execute_allowed": False,
-        "task_followup_strategy": "watch_task",
-    },
-    "configure_ssh_credential": {
-        "required_slots": ["asset_id|asset_ids"],
-        "risk_level": "sensitive_input",
-        "needs_confirmation": False,
-        "auto_execute_allowed": False,
-        "task_followup_strategy": "secure_input",
-    },
 }
 SUPPORTED_UI_ACTIONS = {
     "navigate",
@@ -323,16 +283,18 @@ class _ReadToolCall(BaseModel):
 
 
 class _ProposedWriteAction(BaseModel):
-    action_type: Literal[
-        "create_discovery_job",
-        "verify_asset_risks",
-        "install_runner",
-        "create_or_resume_remediation_session",
-        "approve_remediation_session",
-    ]
+    action_type: str
     title: str
     reason: str
     params: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("action_type")
+    @classmethod
+    def _validate_action_type(cls, value: str) -> str:
+        action_type = _sanitize_line(str(value or ""), max_length=64)
+        if action_type not in SUPPORTED_WRITE_ACTIONS:
+            raise ValueError(f"unsupported write action: {action_type or '<empty>'}")
+        return action_type
 
 
 class _UIAction(BaseModel):
@@ -1603,12 +1565,21 @@ def _normalize_agent_state(payload: dict[str, Any] | None, *, last_task_id: str 
         "watching": normalized_watching,
         "last_task_message": sanitize_text(str(watch.get("last_task_message") or ""), max_length=280) or None,
     }
+    traces = raw.get("traces") if isinstance(raw.get("traces"), list) else []
+    normalized_traces = sanitize_json_value([item for item in traces if isinstance(item, dict)][-20:])
+    last_trace = raw.get("last_trace") if isinstance(raw.get("last_trace"), dict) else (normalized_traces[-1] if normalized_traces else {})
+    metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else (
+        last_trace.get("outcome") if isinstance(last_trace, dict) and isinstance(last_trace.get("outcome"), dict) else {}
+    )
 
     return {
         "focus": normalized_focus,
         "execution": normalized_execution,
         "explanation": normalized_explanation,
         "watch": normalized_watch,
+        "traces": normalized_traces,
+        "last_trace": sanitize_json_value(last_trace if isinstance(last_trace, dict) else {}),
+        "metrics": sanitize_json_value(metrics if isinstance(metrics, dict) else {}),
     }
 
 
@@ -1690,20 +1661,31 @@ def _collect_missing_slots(actions: list[dict[str, Any]]) -> list[str]:
             continue
         action_type = _sanitize_line(str(action.get("action_type") or ""), max_length=64)
         params = action.get("params") if isinstance(action.get("params"), dict) else {}
-        policy = ACTION_POLICY_REGISTRY.get(action_type) or {}
-        for slot in policy.get("required_slots", []):
+        policy = get_action_policy(action_type)
+        required_slots = policy.required_slots if policy is not None else ()
+        for slot in required_slots:
             normalized_slot = _sanitize_line(str(slot or ""), max_length=64)
             if not normalized_slot:
                 continue
-            value = params.get(normalized_slot)
-            if normalized_slot == "cidr":
-                if _extract_cidr_target(str(value or "")):
-                    continue
-            elif _sanitize_line(str(value or ""), max_length=64):
+            alternatives = [
+                _sanitize_line(str(item or ""), max_length=64)
+                for item in normalized_slot.split("|")
+                if _sanitize_line(str(item or ""), max_length=64)
+            ]
+            if any(_action_slot_is_present(slot_name, params) for slot_name in alternatives):
                 continue
             if normalized_slot not in missing:
                 missing.append(normalized_slot)
     return missing
+
+
+def _action_slot_is_present(slot_name: str, params: dict[str, Any]) -> bool:
+    value = params.get(slot_name)
+    if slot_name == "cidr":
+        return bool(_extract_cidr_target(str(value or "")))
+    if isinstance(value, list):
+        return any(_sanitize_line(str(item or ""), max_length=64) for item in value)
+    return bool(_sanitize_line(str(value or ""), max_length=64))
 
 
 def _plan_agent_step(
@@ -6125,6 +6107,7 @@ def _run_model_once(
     tool_traces: list[dict[str, Any]],
     allow_write_plans: bool,
     allow_auto_execute_actions: bool,
+    turn_trace: HaorTurnTrace | None = None,
 ) -> _AgentModelDecision:
     current_content = sanitize_text(
         str(session.messages[-1].content if session.messages else ""),
@@ -6161,17 +6144,48 @@ def _run_model_once(
         followup_hint=followup_hint,
     )
     followup_reply_kind = _sanitize_line(str(followup_hint.get("reply_kind") or ""), max_length=32)
+    request_text = request.flattened_text()
+    started_at = start_timer()
     content = provider_result.provider.generate(request)
+    latency_ms = elapsed_ms(started_at)
+    provider_name = (
+        _sanitize_line(str(getattr(provider_result, "provider_name", "") or _runtime_provider_mode()), max_length=64)
+        or _runtime_provider_mode()
+    )
+    wire_api = _sanitize_line(str(getattr(provider_result.provider, "wire_api", "") or ""), max_length=32) or _sanitize_line(
+        str(read_runtime_env_value("LLM_WIRE_API", str(settings.LLM_WIRE_API or "responses")) or ""),
+        max_length=32,
+    )
     try:
-        return _parse_model_decision(content)
+        decision = _parse_model_decision(content)
+        record_model_call(
+            turn_trace,
+            provider_name=provider_name,
+            model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
+            wire_api=wire_api,
+            latency_ms=latency_ms,
+            request_text=request_text,
+            response_text=content,
+            parsed=True,
+        )
+        return decision
     except Exception as exc:
+        record_model_call(
+            turn_trace,
+            provider_name=provider_name,
+            model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
+            wire_api=wire_api,
+            latency_ms=latency_ms,
+            request_text=request_text,
+            response_text=content,
+            parsed=False,
+            error=sanitize_text(str(exc), max_length=240),
+        )
         if not _is_model_decision_contract_error(exc):
             raise
         _log_model_decision_contract_issue(
-            provider_name=_sanitize_line(str(getattr(provider_result, "provider_name", "") or _runtime_provider_mode()), max_length=64)
-            or _runtime_provider_mode(),
-            wire_api=_sanitize_line(str(getattr(provider_result.provider, "wire_api", "") or ""), max_length=32)
-            or _sanitize_line(str(read_runtime_env_value("LLM_WIRE_API", str(settings.LLM_WIRE_API or "responses")) or ""), max_length=32),
+            provider_name=provider_name,
+            wire_api=wire_api,
             resolved_base_url=_sanitize_line(str(getattr(provider_result, "resolved_base_url", "") or ""), max_length=255),
             objective_kind=objective_kind,
             followup_reply_kind=followup_reply_kind,
@@ -6185,19 +6199,43 @@ def _run_model_once(
             wire_api_override="chat_completions",
             chat_json_mode=True,
         )
+        retry_started_at = start_timer()
         retry_content = retry_provider_result.provider.generate(request)
+        retry_latency_ms = elapsed_ms(retry_started_at)
+        retry_provider_name = _sanitize_line(
+            str(getattr(retry_provider_result, "provider_name", "") or _runtime_provider_mode()),
+            max_length=64,
+        ) or _runtime_provider_mode()
+        retry_wire_api = _sanitize_line(str(getattr(retry_provider_result.provider, "wire_api", "") or ""), max_length=32) or "chat_completions"
         try:
-            return _parse_model_decision(retry_content)
+            retry_decision = _parse_model_decision(retry_content)
+            record_model_call(
+                turn_trace,
+                provider_name=retry_provider_name,
+                model=_sanitize_line(str(getattr(retry_provider_result, "model", "") or ""), max_length=128),
+                wire_api=retry_wire_api,
+                latency_ms=retry_latency_ms,
+                request_text=request_text,
+                response_text=retry_content,
+                parsed=True,
+            )
+            return retry_decision
         except Exception as retry_exc:
+            record_model_call(
+                turn_trace,
+                provider_name=retry_provider_name,
+                model=_sanitize_line(str(getattr(retry_provider_result, "model", "") or ""), max_length=128),
+                wire_api=retry_wire_api,
+                latency_ms=retry_latency_ms,
+                request_text=request_text,
+                response_text=retry_content,
+                parsed=False,
+                error=sanitize_text(str(retry_exc), max_length=240),
+            )
             if _is_model_decision_contract_error(retry_exc):
                 _log_model_decision_contract_issue(
-                    provider_name=_sanitize_line(
-                        str(getattr(retry_provider_result, "provider_name", "") or _runtime_provider_mode()),
-                        max_length=64,
-                    )
-                    or _runtime_provider_mode(),
-                    wire_api=_sanitize_line(str(getattr(retry_provider_result.provider, "wire_api", "") or ""), max_length=32)
-                    or "chat_completions",
+                    provider_name=retry_provider_name,
+                    wire_api=retry_wire_api,
                     resolved_base_url=_sanitize_line(str(getattr(retry_provider_result, "resolved_base_url", "") or ""), max_length=255),
                     objective_kind=objective_kind,
                     followup_reply_kind=followup_reply_kind,
@@ -6567,6 +6605,7 @@ def _run_agent_loop(
     allow_auto_execute_actions: bool,
     stream_emitter: _AgentStreamEmitter | None = None,
     turn_id: str | None = None,
+    turn_trace: HaorTurnTrace | None = None,
 ) -> tuple[_AgentModelDecision, list[dict[str, Any]]]:
     tool_traces: list[dict[str, Any]] = []
     working_context = _normalize_working_context(working_context)
@@ -6657,6 +6696,7 @@ def _run_agent_loop(
                     tool_traces=tool_traces,
                     allow_write_plans=loop_allow_write_plans,
                     allow_auto_execute_actions=loop_allow_auto_execute_actions,
+                    turn_trace=turn_trace,
                 )
             except Exception as exc:
                 if not _is_model_decision_contract_error(exc):
@@ -6726,6 +6766,7 @@ def _run_agent_loop(
             )
             _emit_agent_state(stream_emitter, session, turn_id=turn_id)
             try:
+                read_started_at = start_timer()
                 result = _execute_read_tool(db, tool_name=call.tool_name, arguments=call.arguments)
                 trace = {
                     "tool_name": call.tool_name,
@@ -6733,6 +6774,7 @@ def _run_agent_loop(
                     "ok": True,
                     "result": sanitize_json_value(result),
                 }
+                record_read_tool(turn_trace, trace, latency_ms=elapsed_ms(read_started_at))
                 tool_traces.append(trace)
                 if stream_emitter is not None and turn_id:
                     _emit_action_update(
@@ -6762,12 +6804,14 @@ def _run_agent_loop(
                 )
                 _emit_agent_state(stream_emitter, session, turn_id=turn_id)
             except Exception as exc:
+                read_latency_ms = elapsed_ms(read_started_at) if "read_started_at" in locals() else None
                 trace = {
                     "tool_name": call.tool_name,
                     "arguments": sanitize_json_value(call.arguments),
                     "ok": False,
                     "error": sanitize_text(str(exc), max_length=300),
                 }
+                record_read_tool(turn_trace, trace, latency_ms=read_latency_ms)
                 tool_traces.append(trace)
                 if stream_emitter is not None and turn_id:
                     _emit_action_update(
@@ -6856,14 +6900,26 @@ def _build_model_decision_from_playbook(playbook: AgentPlaybookDecision) -> _Age
     for item in playbook.proposed_write_actions:
         try:
             proposed_write_actions.append(_ProposedWriteAction.model_validate(item))
-        except ValidationError:
+        except ValidationError as exc:
+            logger.warning(
+                "Dropped invalid playbook proposed action: playbook=%s action_type=%s error=%s",
+                playbook.playbook_id,
+                item.get("action_type") if isinstance(item, dict) else None,
+                exc.errors()[0] if exc.errors() else str(exc),
+            )
             continue
 
     auto_execute_actions: list[_ProposedWriteAction] = []
     for item in playbook.auto_execute_actions:
         try:
             auto_execute_actions.append(_ProposedWriteAction.model_validate(item))
-        except ValidationError:
+        except ValidationError as exc:
+            logger.warning(
+                "Dropped invalid playbook auto action: playbook=%s action_type=%s error=%s",
+                playbook.playbook_id,
+                item.get("action_type") if isinstance(item, dict) else None,
+                exc.errors()[0] if exc.errors() else str(exc),
+            )
             continue
 
     conversation_state = "plan" if playbook.needs_confirmation or proposed_write_actions else playbook.conversation_state
@@ -7073,10 +7129,12 @@ def _execute_auto_actions(
     actions: list[dict[str, Any]],
     browser_context: dict[str, Any],
     platform_url: str,
+    turn_trace: HaorTurnTrace | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     resolved_platform_url = _resolve_platform_url_for_runtime(platform_url, browser_context)
     for item in actions:
+        started_at = start_timer()
         result = execute_approved_action(
             db,
             action=item,
@@ -7092,6 +7150,7 @@ def _execute_auto_actions(
             "payload": result.payload or {},
             "child_task_id": result.child_task_id,
         }
+        record_action(turn_trace, payload, latency_ms=elapsed_ms(started_at))
         if result.child_task_id and get_task_run(db, result.child_task_id) is not None:
             session.last_task_id = result.child_task_id
             sync_agent_task_watch_state(
@@ -7517,6 +7576,7 @@ def _apply_agent_decision(
     message_request_ack_at: datetime | None = None,
     stream_emitter: _AgentStreamEmitter | None = None,
     turn_id: str | None = None,
+    turn_trace: HaorTurnTrace | None = None,
 ) -> None:
     current_objective = _build_current_objective(user_content, dialog_state=dialog_state, followup_hint=followup_hint)
     session_last_task_id = _session_last_task_id(session)
@@ -7550,6 +7610,7 @@ def _apply_agent_decision(
                 actions=auto_execute_actions,
                 browser_context=browser_context,
                 platform_url=platform_url,
+                turn_trace=turn_trace,
             )
             auto_action_message = _append_auto_action_message(db, session=session, results=auto_execute_results)
             if auto_action_message is not None and stream_emitter is not None and turn_id:
@@ -7695,6 +7756,13 @@ def _apply_agent_decision(
             session.dialog_state_json["last_agent_question"] = message.content
             db.add(session)
         _sync_current_goal_state(db, session, latest_summary=message.content)
+        _finalize_session_turn_trace(
+            session,
+            turn_trace=turn_trace,
+            decision=decision,
+            status="clarifying",
+            end_to_end_success=False,
+        )
         _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
@@ -7776,6 +7844,13 @@ def _apply_agent_decision(
             turn_id=turn_id,
         )
         _sync_current_goal_state(db, session, status_override="blocked", blocked_reason="等待在安全弹层中完成 SSH 凭据配置", latest_summary=message.content)
+        _finalize_session_turn_trace(
+            session,
+            turn_trace=turn_trace,
+            decision=decision,
+            status="awaiting_secure_input",
+            end_to_end_success=False,
+        )
         _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
@@ -7845,6 +7920,13 @@ def _apply_agent_decision(
                 status_override="blocked",
                 blocked_reason="站内动作链路达到上限，请缩小目标范围后继续",
                 latest_summary=message.content,
+            )
+            _finalize_session_turn_trace(
+                session,
+                turn_trace=turn_trace,
+                decision=decision,
+                status="failed",
+                end_to_end_success=False,
             )
             _emit_agent_state(stream_emitter, session, turn_id=turn_id)
             return
@@ -7926,6 +8008,13 @@ def _apply_agent_decision(
                 content=rendered_content,
             )
         _sync_current_goal_state(db, session, latest_summary=message.content)
+        _finalize_session_turn_trace(
+            session,
+            turn_trace=turn_trace,
+            decision=decision,
+            status="awaiting_ui_feedback",
+            end_to_end_success=False,
+        )
         _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
@@ -8006,6 +8095,13 @@ def _apply_agent_decision(
                 pending_plan_json=session.pending_plan_json,
             )
         _sync_current_goal_state(db, session, latest_summary=message.content)
+        _finalize_session_turn_trace(
+            session,
+            turn_trace=turn_trace,
+            decision=decision,
+            status="waiting_approval",
+            end_to_end_success=False,
+        )
         _emit_agent_state(stream_emitter, session, turn_id=turn_id)
         return
 
@@ -8071,7 +8167,37 @@ def _apply_agent_decision(
         session,
         latest_summary=final_message.content if final_message is not None else rendered_content,
     )
+    _finalize_session_turn_trace(
+        session,
+        turn_trace=turn_trace,
+        decision=decision,
+        status="completed",
+        end_to_end_success=not bool(child_task_ids),
+    )
     _emit_agent_state(stream_emitter, session, turn_id=turn_id)
+
+
+def _finalize_session_turn_trace(
+    session: AgentSession,
+    *,
+    turn_trace: HaorTurnTrace | None,
+    decision: _AgentModelDecision,
+    status: str,
+    end_to_end_success: bool | None,
+) -> dict[str, Any]:
+    payload = finalize_trace(
+        turn_trace,
+        status=status,
+        decision_state=decision.conversation_state,
+        stop_reason=decision.stop_reason,
+        end_to_end_success=end_to_end_success,
+    )
+    if payload:
+        session.agent_state_json = append_trace_payload(
+            session.agent_state_json if isinstance(session.agent_state_json, dict) else {},
+            payload,
+        )
+    return payload
 
 
 def post_agent_message(
@@ -8092,6 +8218,7 @@ def post_agent_message(
     session_last_task_id = _session_last_task_id(session)
     session_is_running = str(session.status or "") == "running"
     client_message_id = _normalize_client_message_id(payload.client_message_id) or f"haor-msg-{uuid4().hex[:12]}"
+    turn_trace = new_trace(turn_id or client_message_id)
 
     current_browser_runtime = _normalize_browser_runtime(
         session.browser_runtime_json if isinstance(session.browser_runtime_json, dict) else {}
@@ -8482,6 +8609,7 @@ def post_agent_message(
             message_request_ack_at=accepted_at,
             stream_emitter=stream_emitter,
             turn_id=turn_id,
+            turn_trace=turn_trace,
         )
         db.commit()
         db.refresh(session)
@@ -8529,6 +8657,7 @@ def post_agent_message(
             message_request_ack_at=accepted_at,
             stream_emitter=stream_emitter,
             turn_id=turn_id,
+            turn_trace=turn_trace,
         )
         db.commit()
         db.refresh(session)
@@ -8669,6 +8798,7 @@ def post_agent_message(
             allow_auto_execute_actions=allow_auto_execute_actions,
             stream_emitter=stream_emitter,
             turn_id=turn_id,
+            turn_trace=turn_trace,
         )
     except Exception as exc:
         if not _refresh_message_turn_if_active(
@@ -8739,6 +8869,18 @@ def post_agent_message(
             blocked_reason=_humanize_ai_error(exc),
             latest_summary=message.content,
         )
+        failed_decision = _AgentModelDecision(
+            reply_markdown=message.content,
+            conversation_state="answer",
+            stop_reason="run_loop_error",
+        )
+        _finalize_session_turn_trace(
+            session,
+            turn_trace=turn_trace,
+            decision=failed_decision,
+            status="failed",
+            end_to_end_success=False,
+        )
         db.commit()
         db.refresh(session)
         _log_message_turn_event(
@@ -8800,6 +8942,7 @@ def post_agent_message(
         message_request_ack_at=accepted_at,
         stream_emitter=stream_emitter,
         turn_id=turn_id,
+        turn_trace=turn_trace,
     )
     db.commit()
     db.refresh(session)
@@ -10052,6 +10195,7 @@ def post_agent_step(
 
     accepted_at = _now()
     last_user_intent = sanitize_text(str(current_browser_runtime.get("last_user_intent") or ""), max_length=240) or "继续当前站内动作"
+    turn_trace = new_trace(turn_id or step_request_id)
     _set_browser_runtime(
         session,
         phase="resolving_ui_feedback",
@@ -10141,6 +10285,7 @@ def post_agent_step(
             allow_auto_execute_actions=allow_auto_execute_actions,
             stream_emitter=stream_emitter,
             turn_id=turn_id,
+            turn_trace=turn_trace,
         )
     except Exception as exc:
         _preserve_or_reset_pending_plan(
@@ -10197,6 +10342,18 @@ def post_agent_step(
             blocked_reason=_humanize_ai_error(exc),
             latest_summary=message.content,
         )
+        failed_decision = _AgentModelDecision(
+            reply_markdown=message.content,
+            conversation_state="answer",
+            stop_reason="ui_step_run_loop_error",
+        )
+        _finalize_session_turn_trace(
+            session,
+            turn_trace=turn_trace,
+            decision=failed_decision,
+            status="failed",
+            end_to_end_success=False,
+        )
         db.commit()
         db.refresh(session)
         logger.info(
@@ -10231,6 +10388,7 @@ def post_agent_step(
         platform_url=platform_url,
         stream_emitter=stream_emitter,
         turn_id=turn_id,
+        turn_trace=turn_trace,
     )
     db.commit()
     db.refresh(session)
