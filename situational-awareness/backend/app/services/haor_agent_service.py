@@ -10,7 +10,7 @@ from typing import Any, Callable, Literal
 from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
@@ -70,11 +70,50 @@ from app.schemas.agent import (
 )
 from app.services.ai.providers import LLMMessage, LLMRequest, build_provider
 from app.services.agent.async_state import AsyncStatePatch, merge_task_async_state, suspend_agent_session
+from app.services.agent.checkpoint_service import (
+    delete_agent_session_checkpoint,
+    restore_agent_session_checkpoint,
+    save_agent_session_checkpoint,
+)
 from app.services.agent.context_service import sanitize_browser_context_summary
+from app.services.agent.decision_validator import validate_agent_write_decisions
 from app.services.agent.dlp import redact_sensitive_payload, redact_sensitive_text
+from app.services.agent.error_monitor import record_agent_error
 from app.services.agent.execution_registry import AgentActionExecutorContext, AgentExecutionResult
 from app.services.agent.execution_service import AgentExecutionService
 from app.services.agent.identity import AGENT_DISPLAY_NAME, AGENT_ID
+from app.services.agent.model_contract import (
+    AgentModelDecision as _AgentModelDecision,
+    DialogState as _DialogState,
+    FollowupResolution as _FollowupResolution,
+    ProposedWriteAction as _ProposedWriteAction,
+    ReadToolCall as _ReadToolCall,
+    UIAction as _UIAction,
+    extract_json_block as _extract_json_block,
+    is_model_decision_contract_error as _is_model_decision_contract_error,
+    normalize_dialog_state_payload as _normalize_dialog_state_payload,
+    normalize_model_decision_payload as _normalize_model_decision_payload,
+    parse_model_decision as _parse_model_decision,
+)
+from app.services.agent.model_context_service import (
+    MAX_MODEL_DOM_SNAPSHOT_NODES,
+    MAX_MODEL_FORMS,
+    MAX_MODEL_HISTORY_CHARS,
+    MAX_MODEL_HISTORY_MESSAGES,
+    MAX_MODEL_OPEN_PANELS,
+    MAX_MODEL_PLANNED_STEPS,
+    MAX_MODEL_SECONDARY_ENTITIES,
+    MAX_MODEL_SEMANTIC_ACTIONS,
+    MAX_MODEL_SEMANTIC_FORMS,
+    MAX_MODEL_SELECTED_ENTITIES,
+    MAX_MODEL_SELECTED_ROWS,
+    MAX_MODEL_TOOL_TRACE_ITEMS,
+    MAX_MODEL_UI_RESULTS,
+    MAX_MODEL_VISIBLE_ACTIONS,
+    MAX_MODEL_VISIBLE_SECTIONS,
+    build_agent_model_request,
+    compact_page_context,
+)
 from app.services.haor.action_policy import (
     ACTION_POLICY_REGISTRY,
     AUTO_EXECUTE_ACTIONS,
@@ -184,21 +223,6 @@ SUPPORTED_UI_ACTIONS = {
 MAX_AGENT_LOOP_STEPS = 10
 MAX_UI_ACTION_BATCH = 6
 MAX_MODEL_DECISION_STEPS = 3
-MAX_MODEL_HISTORY_MESSAGES = 6
-MAX_MODEL_HISTORY_CHARS = 1800
-MAX_MODEL_TOOL_TRACE_ITEMS = 4
-MAX_MODEL_SECONDARY_ENTITIES = 6
-MAX_MODEL_VISIBLE_SECTIONS = 8
-MAX_MODEL_SEMANTIC_ACTIONS = 8
-MAX_MODEL_SEMANTIC_FORMS = 4
-MAX_MODEL_SELECTED_ROWS = 4
-MAX_MODEL_SELECTED_ENTITIES = 4
-MAX_MODEL_OPEN_PANELS = 4
-MAX_MODEL_FORMS = 2
-MAX_MODEL_VISIBLE_ACTIONS = 8
-MAX_MODEL_DOM_SNAPSHOT_NODES = 12
-MAX_MODEL_UI_RESULTS = 4
-MAX_MODEL_PLANNED_STEPS = 6
 MAX_ASSISTANT_MESSAGE_CHARS = 20000
 MAX_REPLY_REWRITE_CHARS = 3000
 MESSAGE_TURN_STALE_SECONDS = 120
@@ -230,14 +254,6 @@ _SHORT_FOLLOWUP_DENY_MARKERS = {
     "先不看",
     "别继续了",
 }
-_MODEL_DECISION_CONVERSATION_STATE_ALIASES = {
-    "completed": "answer",
-    "done": "answer",
-    "finish": "answer",
-    "final": "answer",
-}
-
-
 class AgentServiceError(Exception):
     def __init__(
         self,
@@ -277,89 +293,6 @@ class AgentConflictError(AgentServiceError):
 class AgentUpstreamError(AgentServiceError):
     def __init__(self, detail: str, *, session_id: str | None = None, stage: str | None = None) -> None:
         super().__init__(detail, status_code=502, session_id=session_id, stage=stage)
-
-
-class _ReadToolCall(BaseModel):
-    tool_name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
-
-
-class _ProposedWriteAction(BaseModel):
-    action_type: str
-    title: str
-    reason: str
-    params: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("action_type")
-    @classmethod
-    def _validate_action_type(cls, value: str) -> str:
-        action_type = _sanitize_line(str(value or ""), max_length=64)
-        if action_type not in SUPPORTED_WRITE_ACTIONS:
-            raise ValueError(f"unsupported write action: {action_type or '<empty>'}")
-        return action_type
-
-
-class _UIAction(BaseModel):
-    action_id: str = Field(default_factory=lambda: f"ui-{uuid4().hex[:12]}")
-    action_type: Literal[
-        "navigate",
-        "click",
-        "input",
-        "select",
-        "toggle",
-        "expand",
-        "scroll_into_view",
-        "submit",
-        "wait_for",
-    ]
-    semantic_action_id: str | None = None
-    target_node_id: str | None = None
-    selector: str | None = None
-    text_contains: str | None = None
-    label_contains: str | None = None
-    href: str | None = None
-    value: str | None = None
-    field_name: str | None = None
-    option_label: str | None = None
-    wait_ms: int | None = None
-    rationale: str | None = None
-    expected_outcome: str | None = None
-    expected_page_kind: str | None = None
-    expected_section: str | None = None
-    expected_entity: dict[str, Any] = Field(default_factory=dict)
-    retryable: bool | None = True
-
-
-class _DialogState(BaseModel):
-    status: Literal["idle", "awaiting_user_input"] = "idle"
-    intent_kind: Literal["read_followup", "analyze", "fill_slot", "prepare_plan"] | None = None
-    question_kind: Literal["confirm", "slot_fill", "disambiguate", "followup"] | None = None
-    intent_summary: str | None = None
-    last_agent_question: str | None = None
-    expected_slots: list[str] = Field(default_factory=list)
-    candidate_read_tools: list[_ReadToolCall] = Field(default_factory=list)
-    candidate_write_context: dict[str, Any] = Field(default_factory=dict)
-    targets_snapshot: dict[str, Any] = Field(default_factory=dict)
-
-
-class _FollowupResolution(BaseModel):
-    status: Literal["resolved", "canceled", "reframed", "needs_more_input", "unknown"] = "unknown"
-    summary: str | None = None
-
-
-class _AgentModelDecision(BaseModel):
-    reply_markdown: str
-    conversation_state: Literal["answer", "clarifying", "plan"] = "answer"
-    objective: str | None = None
-    clarifying_question: str | None = None
-    read_tool_calls: list[_ReadToolCall] = Field(default_factory=list)
-    ui_actions: list[_UIAction] = Field(default_factory=list)
-    proposed_write_actions: list[_ProposedWriteAction] = Field(default_factory=list)
-    auto_execute_actions: list[_ProposedWriteAction] = Field(default_factory=list)
-    needs_confirmation: bool = False
-    dialog_state_update: _DialogState | None = None
-    followup_resolution: _FollowupResolution | None = None
-    stop_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -1841,27 +1774,6 @@ def _normalize_dialog_state(dialog_state: dict[str, Any] | None) -> dict[str, An
     return normalized
 
 
-_DIALOG_STATE_INTENT_KIND_ALIASES = {
-    "operate_low_risk": "prepare_plan",
-    "operate_high_risk": "prepare_plan",
-    "navigate": "read_followup",
-    "inspect": "read_followup",
-    "ask": "analyze",
-    "answer": "analyze",
-}
-
-
-def _normalize_dialog_state_payload(dialog_state: dict[str, Any] | None) -> dict[str, Any]:
-    payload = sanitize_json_value(dialog_state if isinstance(dialog_state, dict) else {})
-    if not isinstance(payload, dict):
-        return {}
-    normalized = dict(payload)
-    intent_kind = str(normalized.get("intent_kind") or "").strip().lower()
-    if intent_kind in _DIALOG_STATE_INTENT_KIND_ALIASES:
-        normalized["intent_kind"] = _DIALOG_STATE_INTENT_KIND_ALIASES[intent_kind]
-    return normalized
-
-
 def _dialog_state_targets_snapshot(
     *,
     working_context: dict[str, Any],
@@ -1870,7 +1782,7 @@ def _dialog_state_targets_snapshot(
 ) -> dict[str, Any]:
     snapshot = {
         "working_context": sanitize_json_value(working_context),
-        "page_context": sanitize_json_value(_compact_page_context(page_context)),
+        "page_context": sanitize_json_value(compact_page_context(page_context)),
     }
     extra = sanitize_json_value(extra_targets if isinstance(extra_targets, dict) else {})
     if isinstance(extra, dict) and extra:
@@ -3115,6 +3027,8 @@ def _reconcile_running_session_state(
     session: AgentSession,
     interrupted_source: str = "session_reconcile",
 ) -> bool:
+    if isinstance(session, AgentSession) and restore_agent_session_checkpoint(session):
+        db.add(session)
     return reconcile_running_session_state(
         db,
         session=session,
@@ -5264,11 +5178,7 @@ def _runtime_provider_mode() -> str:
 
 
 def _haor_reply_rewrite_enabled() -> bool:
-    raw = read_runtime_env_value(
-        "HAOR_REPLY_REWRITE_ENABLED",
-        "true" if getattr(settings, "HAOR_REPLY_REWRITE_ENABLED", False) else "false",
-    )
-    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+    return bool(getattr(settings, "HAOR_REPLY_REWRITE_ENABLED", False))
 
 
 def _build_runtime_provider(
@@ -5398,588 +5308,6 @@ def translate_agent_service_exception(
     return _classify_agent_service_error(exc, session_id=session_id, stage=stage)
 
 
-def _extract_json_block(raw: str) -> str:
-    text = str(raw or "").strip()
-    if not text:
-        raise ValueError("模型未返回内容")
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-    if text.startswith("{") and text.endswith("}"):
-        return text
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        return text[start : end + 1]
-    raise ValueError("模型未返回合法 JSON")
-
-
-def _normalize_model_decision_boolean(value: Any) -> bool | Any:
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "1", "yes", "y"}:
-            return True
-        if lowered in {"false", "0", "no", "n", ""}:
-            return False
-    return value
-
-
-def _normalize_model_decision_payload(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise ValueError("模型返回的 JSON 顶层结构必须是对象")
-
-    normalized = dict(payload)
-    conversation_state = _sanitize_line(str(normalized.get("conversation_state") or ""), max_length=32).lower()
-    normalized["conversation_state"] = _MODEL_DECISION_CONVERSATION_STATE_ALIASES.get(
-        conversation_state,
-        conversation_state or "answer",
-    )
-
-    for field_name in ("read_tool_calls", "ui_actions", "proposed_write_actions", "auto_execute_actions"):
-        field_value = normalized.get(field_name)
-        if field_value == "" or field_value is None:
-            normalized[field_name] = []
-
-    for field_name in ("objective", "clarifying_question", "stop_reason"):
-        if normalized.get(field_name) == "":
-            normalized[field_name] = None
-
-    needs_confirmation = _normalize_model_decision_boolean(normalized.get("needs_confirmation"))
-    normalized["needs_confirmation"] = bool(needs_confirmation) if needs_confirmation is not None else False
-
-    if normalized.get("dialog_state_update") == "" or normalized.get("dialog_state_update") is None:
-        normalized["dialog_state_update"] = None
-    elif isinstance(normalized.get("dialog_state_update"), dict):
-        normalized["dialog_state_update"] = _normalize_dialog_state_payload(normalized.get("dialog_state_update"))
-
-    followup_resolution = normalized.get("followup_resolution")
-    if followup_resolution == "" or followup_resolution is None:
-        normalized["followup_resolution"] = None
-    elif isinstance(followup_resolution, str):
-        summary = sanitize_text(followup_resolution, max_length=240) or None
-        normalized["followup_resolution"] = {"status": "unknown", "summary": summary}
-
-    return normalized
-
-
-def _parse_model_decision(raw: str) -> _AgentModelDecision:
-    try:
-        payload = json.loads(_extract_json_block(raw))
-    except json.JSONDecodeError as exc:
-        raise ValueError("模型返回的 JSON 结构无法解析") from exc
-    payload = _normalize_model_decision_payload(payload)
-    return _AgentModelDecision.model_validate(payload)
-
-
-def _is_model_decision_contract_error(exc: Exception) -> bool:
-    if isinstance(exc, ValidationError):
-        return True
-    if not isinstance(exc, ValueError):
-        return False
-    detail = sanitize_text(str(exc), max_length=240) or ""
-    return detail in {
-        "模型未返回内容",
-        "模型未返回合法 JSON",
-        "模型返回的 JSON 结构无法解析",
-        "模型返回的 JSON 顶层结构必须是对象",
-    }
-
-
-def _compact_page_context(page_context: dict[str, Any]) -> dict[str, Any]:
-    query = page_context.get("query") if isinstance(page_context.get("query"), dict) else {}
-    compact_query = {str(key): sanitize_json_value(value) for key, value in list(query.items())[:12]}
-    return {
-        "pathname": page_context.get("pathname"),
-        "asset_id": page_context.get("asset_id"),
-        "finding_id": page_context.get("finding_id"),
-        "task_id": page_context.get("task_id"),
-        "query": compact_query,
-    }
-
-
-def _compact_browser_context(browser_context: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "pathname": browser_context.get("pathname"),
-        "origin": browser_context.get("origin"),
-        "title": browser_context.get("title"),
-        "asset_id": browser_context.get("asset_id"),
-        "finding_id": browser_context.get("finding_id"),
-        "task_id": browser_context.get("task_id"),
-        "query": sanitize_json_value(browser_context.get("query") if isinstance(browser_context.get("query"), dict) else {}),
-        "selected_entities": sanitize_json_value(
-            browser_context.get("selected_entities") if isinstance(browser_context.get("selected_entities"), list) else []
-        )[:MAX_MODEL_SELECTED_ENTITIES],
-        "open_panels": sanitize_json_value(
-            browser_context.get("open_panels") if isinstance(browser_context.get("open_panels"), list) else []
-        )[:MAX_MODEL_OPEN_PANELS],
-        "forms": sanitize_json_value(browser_context.get("forms") if isinstance(browser_context.get("forms"), list) else [])[
-            :MAX_MODEL_FORMS
-        ],
-        "visible_actions": sanitize_json_value(
-            browser_context.get("visible_actions") if isinstance(browser_context.get("visible_actions"), list) else []
-        )[:MAX_MODEL_VISIBLE_ACTIONS],
-        "semantic_actions": sanitize_json_value(
-            browser_context.get("semantic_actions") if isinstance(browser_context.get("semantic_actions"), list) else []
-        )[:MAX_MODEL_SEMANTIC_ACTIONS],
-        "semantic_forms": sanitize_json_value(
-            browser_context.get("semantic_forms") if isinstance(browser_context.get("semantic_forms"), list) else []
-        )[:MAX_MODEL_SEMANTIC_FORMS],
-        "dom_snapshot": sanitize_json_value(
-            browser_context.get("dom_snapshot") if isinstance(browser_context.get("dom_snapshot"), list) else []
-        )[:MAX_MODEL_DOM_SNAPSHOT_NODES],
-    }
-
-
-def _build_model_context_payload(
-    *,
-    user: User,
-    page_context: dict[str, Any],
-    browser_context: dict[str, Any],
-    browser_runtime: dict[str, Any],
-    working_context: dict[str, Any],
-    dialog_state: dict[str, Any],
-    followup_hint: dict[str, Any],
-    allow_write_plans: bool,
-    allow_auto_execute_actions: bool,
-) -> dict[str, Any]:
-    current_objective = browser_runtime.get("current_objective") if isinstance(browser_runtime, dict) else None
-    objective_kind = browser_runtime.get("objective_kind") if isinstance(browser_runtime, dict) else None
-    primary_target = _working_context_primary_target(working_context)
-    recent_targets = working_context.get("recent_targets") if isinstance(working_context.get("recent_targets"), list) else []
-    semantic_page_context = _compact_semantic_page_context_for_model(_browser_semantic_page_context(browser_context))
-    available_tools = [
-        {
-            "tool_name": "list_assets",
-            "description": "读取资产列表，可按 keyword 搜索，limit 最大 10",
-            "arguments": {"keyword": "可选字符串", "status": "可选 online/offline/collecting/unknown", "limit": "可选整数"},
-        },
-        {
-            "tool_name": "get_asset_detail",
-            "description": "按 asset_id 读取资产详情",
-            "arguments": {"asset_id": "必填字符串"},
-        },
-        {
-            "tool_name": "list_risks",
-            "description": "读取全局风险列表，可按 asset_id、status、severity、keyword 过滤",
-            "arguments": {
-                "asset_id": "可选字符串",
-                "status": "可选 open/fixed/ignored",
-                "severity": "可选 critical/high/medium/low",
-                "keyword": "可选字符串",
-                "limit": "可选整数",
-            },
-        },
-        {
-            "tool_name": "get_risk_detail",
-            "description": "按 finding_id 读取单条风险详情",
-            "arguments": {"finding_id": "必填字符串"},
-        },
-        {
-            "tool_name": "list_asset_risks",
-            "description": "按 asset_id 读取风险列表",
-            "arguments": {"asset_id": "必填字符串", "status": "可选 open/fixed/ignored", "limit": "可选整数"},
-        },
-        {
-            "tool_name": "list_tasks",
-            "description": "读取平台任务列表",
-            "arguments": {"task_type": "可选", "status": "可选", "limit": "可选整数"},
-        },
-        {
-            "tool_name": "get_task_detail",
-            "description": "读取单个任务详情",
-            "arguments": {"task_id": "必填字符串"},
-        },
-        {
-            "tool_name": "get_task_events",
-            "description": "读取单个任务事件日志",
-            "arguments": {"task_id": "必填字符串", "limit": "可选整数"},
-        },
-        {
-            "tool_name": "list_remediation_assets",
-            "description": "读取可自动修复资产概览，包含 Runner 状态、风险数量与活动修复会话",
-            "arguments": {"keyword": "可选字符串", "limit": "可选整数"},
-        },
-        {
-            "tool_name": "get_remediation_asset",
-            "description": "读取资产修复摘要、Runner 状态与修复条件",
-            "arguments": {"asset_id": "必填字符串"},
-        },
-        {
-            "tool_name": "get_risk_remediation_template",
-            "description": "读取单条风险的修复模板/执行计划摘要",
-            "arguments": {"finding_id": "必填字符串"},
-        },
-        {
-            "tool_name": "get_remediation_session",
-            "description": "读取修复会话摘要，可传 session_id 或 asset_id",
-            "arguments": {"session_id": "可选字符串", "asset_id": "可选字符串"},
-        },
-        {
-            "tool_name": "list_vuln_rules",
-            "description": "读取漏洞库规则列表",
-            "arguments": {"keyword": "可选字符串", "service": "可选字符串", "severity": "可选字符串", "limit": "可选整数"},
-        },
-        {
-            "tool_name": "get_vuln_rule",
-            "description": "读取单条漏洞库规则详情",
-            "arguments": {"rule_id": "必填字符串"},
-        },
-    ]
-    write_action_whitelist = [
-        {
-            "action_type": "create_discovery_job",
-            "description": "创建扫描任务",
-            "required_params": {"cidr": "CIDR 字符串", "label": "可选标签"},
-        },
-        {
-            "action_type": "verify_asset_risks",
-            "description": "触发资产风险验证",
-            "required_params": {"asset_id": "资产 ID"},
-        },
-        {
-            "action_type": "install_runner",
-            "description": "安装 Host Runner",
-            "required_params": {"asset_id": "资产 ID"},
-        },
-        {
-            "action_type": "create_or_resume_remediation_session",
-            "description": "创建或恢复主机修复会话",
-            "required_params": {
-                "asset_id": "资产 ID",
-                "note": "可选备注",
-                "submit_if_ready": "可选布尔值；为 true 时在修复条件满足后直接提交自动修复",
-            },
-        },
-        {
-            "action_type": "approve_remediation_session",
-            "description": "批准修复会话并触发 Host Runner 修复任务",
-            "required_params": {"session_id": "修复会话 ID"},
-        },
-        {
-            "action_type": "configure_ssh_credential",
-            "description": "打开 SSH 凭据安全输入引导，不直接在聊天中收集密码或私钥",
-            "required_params": {"asset_id": "单资产 ID，或与 asset_ids 二选一", "asset_ids": "批量资产 ID 列表"},
-        },
-    ]
-    browser_action_whitelist = [
-        {"action_type": "navigate", "description": "站内路由跳转到已知 href 或 pathname"},
-        {"action_type": "click", "description": "点击可见可交互节点"},
-        {"action_type": "input", "description": "向输入框填值"},
-        {"action_type": "select", "description": "选择下拉项"},
-        {"action_type": "toggle", "description": "切换开关、复选框或 Tab"},
-        {"action_type": "expand", "description": "展开详情、折叠面板、行内容"},
-        {"action_type": "scroll_into_view", "description": "滚动定位到目标节点"},
-        {"action_type": "submit", "description": "提交表单或确认当前 UI 操作"},
-        {"action_type": "wait_for", "description": "等待弹窗、详情、列表或其他节点出现"},
-    ]
-    return {
-        "agent_id": AGENT_ID,
-        "user_role": _normalize_role(user.role),
-        "allow_write_plans": allow_write_plans,
-        "allow_auto_execute_actions": allow_auto_execute_actions,
-        "current_objective": sanitize_text(str(current_objective or ""), max_length=240) or None,
-        "objective_kind": _sanitize_line(str(objective_kind or ""), max_length=32) or None,
-        "conversation_focus": sanitize_json_value(primary_target),
-        "recent_targets": sanitize_json_value(recent_targets[:6]),
-        "shared_working_context": sanitize_json_value(working_context),
-        "current_page_context": _compact_page_context(page_context),
-        "semantic_page_context": sanitize_json_value(semantic_page_context),
-        "current_browser_context": _compact_browser_context(browser_context),
-        "browser_runtime": _compact_browser_runtime_for_model(browser_runtime),
-        "pending_dialog_state": sanitize_json_value(dialog_state),
-        "followup_hint": sanitize_json_value(followup_hint),
-        "available_read_tools": available_tools,
-        "allowed_write_actions": write_action_whitelist,
-        "auto_execute_write_actions": [item for item in write_action_whitelist if item["action_type"] in AUTO_EXECUTE_ACTIONS],
-        "allowed_browser_actions": browser_action_whitelist,
-    }
-
-
-def _build_model_response_contract() -> dict[str, Any]:
-    return {
-        "response_rules": [
-            "只返回一个 JSON 对象，不要输出代码块、解释前缀或多余文字",
-            "reply_markdown 必须是自然中文",
-            "如果用户表达的是操作意图，优先推进动作，不要先输出长解释",
-            "inspect 或 navigate 意图优先通过 ui_actions 或 read_tool_calls 推进，而不是只给纯文字答复",
-            "operate_low_risk 意图在目标明确时优先填写 auto_execute_actions",
-            "operate_high_risk 意图先补齐信息，再形成 proposed_write_actions 并等待确认",
-            "如果信息不足以继续分析，请将 conversation_state 设为 clarifying，并把自然语言追问写入 clarifying_question",
-            "如果需要更多上下文，优先填写 read_tool_calls",
-            "如果需要在网站界面中切换、展开、筛选、填写或提交当前页面内容，请使用 ui_actions",
-            "不能编造资产 ID、任务 ID、风险 ID、会话 ID 或规则 ID，必须来自工具结果或当前页面上下文",
-            "当前消息里显式提到的新对象优先级最高，可以在同一会话里切换目标",
-            "如果用户说“这个”“它”“当前页”等指代，可结合 current_page_context 解析；否则优先参考 conversation_focus 和 recent_targets",
-            "conversation_focus 和 recent_targets 是软焦点快照，只用于跟进理解，不构成硬锁定",
-            "如果 pending_dialog_state 存在，必须先把当前用户回复视为对上一轮追问的承接，再决定是否改成新话题",
-            "如果 followup_hint.reply_kind 是 affirm、deny 或 short_value，不能原样重复上一轮问题",
-            "若仍然需要继续追问，clarifying_question 必须比上一轮更具体，并同步填写 dialog_state_update",
-            "semantic_page_context 是页面理解主输入，优先使用 semantic_actions 里的 semantic_action_id，不要依赖脆弱的裸文本匹配",
-            "current_browser_context 会提供当前页面可见 DOM 节点与动作，只有在 semantic_page_context 不足时才回退到 dom_snapshot",
-            "如果当前回合目标还未完成，不要把中间状态误当成最终答复",
-            "auto_execute_actions 仅允许 create_discovery_job、verify_asset_risks、install_runner，且只能用于明确的执行意图",
-            "configure_ssh_credential 只能用于触发安全输入引导，敏感字段绝不能出现在 reply_markdown、dialog_state、ui_actions 或 payload 里",
-            "只有在明确形成计划时才填写 proposed_write_actions",
-            "允许在一条消息里形成跨多个对象的聚合计划，但每个动作都必须带清晰参数",
-            "如果 allow_auto_execute_actions=false，则 auto_execute_actions 必须为空",
-            "如果 allow_write_plans=false，则 proposed_write_actions 必须为空，needs_confirmation 必须为 false",
-            "严禁输出任何自由 shell、SSH、任意 HTTP、平台设置修改或漏洞库写操作",
-        ],
-        "output_schema": {
-            "reply_markdown": "string",
-            "conversation_state": "answer|clarifying|plan",
-            "objective": "string|null",
-            "clarifying_question": "string|null",
-            "read_tool_calls": [{"tool_name": "string", "arguments": {}}],
-            "ui_actions": [{
-                "action_id": "string",
-                "action_type": "string",
-                "semantic_action_id": "string|null",
-                "target_node_id": "string|null",
-                "selector": "string|null",
-                "expected_page_kind": "string|null",
-                "expected_section": "string|null",
-                "retryable": "boolean"
-            }],
-            "proposed_write_actions": [{"action_type": "string", "title": "string", "reason": "string", "params": {}}],
-            "auto_execute_actions": [{"action_type": "string", "title": "string", "reason": "string", "params": {}}],
-            "needs_confirmation": "boolean",
-            "dialog_state_update": {
-                "status": "idle|awaiting_user_input",
-                "intent_kind": "read_followup|analyze|fill_slot|prepare_plan|null",
-                "question_kind": "confirm|slot_fill|disambiguate|followup|null",
-                "intent_summary": "string|null",
-                "last_agent_question": "string|null",
-                "expected_slots": ["string"],
-                "candidate_read_tools": [{"tool_name": "string", "arguments": {}}],
-                "candidate_write_context": {},
-                "targets_snapshot": {},
-            },
-            "followup_resolution": {"status": "resolved|canceled|reframed|needs_more_input|unknown", "summary": "string|null"},
-            "stop_reason": "string|null",
-        },
-    }
-
-
-def _render_history_line(message: AgentMessage | Any, *, max_length: int = 4000) -> str | None:
-    role = "assistant" if str(message.role or "").strip().lower() == "assistant" else "user"
-    content = sanitize_text(message.content, max_length=max_length) or ""
-    if not content:
-        return None
-    message_type = str(message.message_type or "text").strip().lower() or "text"
-    label = role if message_type == "text" else f"{role}/{message_type}"
-    return f"{label}: {content}"
-
-
-def _select_model_history_lines(messages: list[AgentMessage | Any]) -> list[str]:
-    selected: list[str] = []
-    total_chars = 0
-    assistant_types = {"text", "clarifying", "plan", "error"}
-    fallback_line: str | None = None
-
-    for item in reversed(messages):
-        role = str(getattr(item, "role", "") or "").strip().lower()
-        message_type = str(getattr(item, "message_type", "") or "text").strip().lower() or "text"
-        rendered = _render_history_line(item, max_length=280)
-        if rendered and fallback_line is None:
-            fallback_line = rendered
-        if role == "assistant" and message_type not in assistant_types:
-            continue
-        if not rendered:
-            continue
-        next_total = total_chars + len(rendered)
-        if selected and (len(selected) >= MAX_MODEL_HISTORY_MESSAGES or next_total > MAX_MODEL_HISTORY_CHARS):
-            break
-        selected.append(rendered)
-        total_chars = next_total
-        if len(selected) >= MAX_MODEL_HISTORY_MESSAGES or total_chars >= MAX_MODEL_HISTORY_CHARS:
-            break
-
-    if not selected and fallback_line:
-        return [fallback_line]
-    return list(reversed(selected))
-
-
-def _compact_semantic_page_context_for_model(page_context: dict[str, Any] | None) -> dict[str, Any]:
-    normalized = _normalize_semantic_page_context(page_context if isinstance(page_context, dict) else {})
-    return {
-        "page_kind": _sanitize_line(str(normalized.get("page_kind") or "unknown"), max_length=48) or "unknown",
-        "primary_entity": sanitize_json_value(
-            normalized.get("primary_entity") if isinstance(normalized.get("primary_entity"), dict) else {}
-        ),
-        "secondary_entities": sanitize_json_value(
-            normalized.get("secondary_entities") if isinstance(normalized.get("secondary_entities"), list) else []
-        )[:MAX_MODEL_SECONDARY_ENTITIES],
-        "visible_sections": sanitize_json_value(
-            normalized.get("visible_sections") if isinstance(normalized.get("visible_sections"), list) else []
-        )[:MAX_MODEL_VISIBLE_SECTIONS],
-        "semantic_actions": sanitize_json_value(
-            normalized.get("semantic_actions") if isinstance(normalized.get("semantic_actions"), list) else []
-        )[:MAX_MODEL_SEMANTIC_ACTIONS],
-        "semantic_forms": sanitize_json_value(
-            normalized.get("semantic_forms") if isinstance(normalized.get("semantic_forms"), list) else []
-        )[:MAX_MODEL_SEMANTIC_FORMS],
-        "active_dialog": sanitize_json_value(
-            normalized.get("active_dialog") if isinstance(normalized.get("active_dialog"), dict) else {}
-        ),
-        "selected_rows": sanitize_json_value(
-            normalized.get("selected_rows") if isinstance(normalized.get("selected_rows"), list) else []
-        )[:MAX_MODEL_SELECTED_ROWS],
-        "summary": sanitize_text(str(normalized.get("summary") or ""), max_length=240) or None,
-    }
-
-
-def _compact_model_value(value: Any, *, depth: int = 0) -> Any:
-    if depth >= 2:
-        return sanitize_json_value(value)
-    if isinstance(value, list):
-        return [_compact_model_value(item, depth=depth + 1) for item in value[:3]]
-    if not isinstance(value, dict):
-        return sanitize_json_value(value)
-
-    prioritized_keys = (
-        "task_id",
-        "asset_id",
-        "finding_id",
-        "session_id",
-        "rule_id",
-        "status",
-        "task_type",
-        "business_status",
-        "message",
-        "summary",
-        "title",
-        "label",
-        "count",
-        "total",
-        "created_at",
-        "updated_at",
-        "started_at",
-        "finished_at",
-    )
-    compacted: dict[str, Any] = {}
-    for key in prioritized_keys:
-        if key not in value:
-            continue
-        compacted[key] = _compact_model_value(value.get(key), depth=depth + 1)
-
-    for list_key in ("items", "events", "rows", "assets", "findings", "sessions"):
-        list_value = value.get(list_key)
-        if isinstance(list_value, list) and list_value:
-            compacted[f"{list_key}_preview"] = [_compact_model_value(item, depth=depth + 1) for item in list_value[:2]]
-            if "total" not in compacted:
-                compacted["total"] = len(list_value)
-            break
-
-    for nested_key in ("timing", "result", "meta"):
-        nested_value = value.get(nested_key)
-        if isinstance(nested_value, dict) and nested_value:
-            compacted[nested_key] = _compact_model_value(nested_value, depth=depth + 1)
-
-    if not compacted:
-        for key, item in list(value.items())[:6]:
-            compacted[_sanitize_line(str(key), max_length=64) or str(key)] = _compact_model_value(item, depth=depth + 1)
-    return sanitize_json_value(compacted)
-
-
-def _compact_tool_traces_for_model(tool_traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    compacted: list[dict[str, Any]] = []
-    for trace in tool_traces[-MAX_MODEL_TOOL_TRACE_ITEMS:]:
-        if not isinstance(trace, dict):
-            continue
-        item = {
-            "tool_name": _sanitize_line(str(trace.get("tool_name") or ""), max_length=64),
-            "arguments": sanitize_json_value(trace.get("arguments") if isinstance(trace.get("arguments"), dict) else {}),
-            "ok": False if trace.get("ok") is False else True,
-        }
-        if item["ok"]:
-            item["result"] = _compact_model_value(trace.get("result"))
-        else:
-            item["error"] = sanitize_text(str(trace.get("error") or ""), max_length=240) or None
-        compacted.append(item)
-    return compacted
-
-
-def _compact_ui_action_results_for_model(results: Any) -> list[dict[str, Any]]:
-    compacted: list[dict[str, Any]] = []
-    for item in _normalize_ui_action_results(results)[:MAX_MODEL_UI_RESULTS]:
-        compacted_item = {
-            "action_id": _sanitize_line(str(item.get("action_id") or ""), max_length=64) or None,
-            "action_type": _sanitize_line(str(item.get("action_type") or ""), max_length=32) or None,
-            "ok": bool(item.get("ok")),
-            "semantic_action_id": _sanitize_line(str(item.get("semantic_action_id") or ""), max_length=128) or None,
-            "target_node_id": _sanitize_line(str(item.get("target_node_id") or ""), max_length=64) or None,
-            "resolved_node_id": _sanitize_line(str(item.get("resolved_node_id") or ""), max_length=64) or None,
-            "message": sanitize_text(str(item.get("message") or ""), max_length=180) or None,
-            "resolved_target": sanitize_json_value(
-                item.get("resolved_target") if isinstance(item.get("resolved_target"), dict) else {}
-            ),
-            "attempt_count": max(1, min(int(item.get("attempt_count") or 1), 4)),
-        }
-        compacted.append(compacted_item)
-    return compacted
-
-
-def _compact_auto_executed_actions_for_model(actions: Any) -> list[dict[str, Any]]:
-    if not isinstance(actions, list):
-        return []
-    compacted: list[dict[str, Any]] = []
-    for item in actions[:MAX_MODEL_TOOL_TRACE_ITEMS]:
-        if not isinstance(item, dict):
-            continue
-        params = item.get("params") if isinstance(item.get("params"), dict) else {}
-        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-        compacted.append(
-            {
-                "action_type": _sanitize_line(str(item.get("action_type") or ""), max_length=64) or None,
-                "title": sanitize_text(str(item.get("title") or ""), max_length=120) or None,
-                "summary": sanitize_text(str(item.get("summary") or ""), max_length=180) or None,
-                "child_task_id": _sanitize_line(str(item.get("child_task_id") or ""), max_length=64) or None,
-                "status": _sanitize_line(str(item.get("status") or payload.get("status") or ""), max_length=32) or None,
-                "asset_id": _sanitize_line(str(params.get("asset_id") or payload.get("asset_id") or ""), max_length=64) or None,
-                "session_id": _sanitize_line(str(payload.get("session_id") or ""), max_length=64) or None,
-            }
-        )
-    return compacted
-
-
-def _compact_browser_runtime_for_model(browser_runtime: dict[str, Any] | None) -> dict[str, Any]:
-    runtime = _normalize_browser_runtime(browser_runtime if isinstance(browser_runtime, dict) else {})
-    pending_secure_input = (
-        runtime.get("pending_secure_input") if isinstance(runtime.get("pending_secure_input"), dict) else {}
-    )
-    return {
-        "phase": _sanitize_line(str(runtime.get("phase") or ""), max_length=48) or "idle",
-        "step_count": max(0, min(int(runtime.get("step_count") or 0), MAX_AGENT_LOOP_STEPS)),
-        "current_objective": sanitize_text(str(runtime.get("current_objective") or ""), max_length=240) or None,
-        "objective_kind": _sanitize_line(str(runtime.get("objective_kind") or ""), max_length=32) or None,
-        "planned_steps": sanitize_json_value(
-            runtime.get("planned_steps") if isinstance(runtime.get("planned_steps"), list) else []
-        )[:MAX_MODEL_PLANNED_STEPS],
-        "step_cursor": max(0, min(int(runtime.get("step_cursor") or 0), MAX_AGENT_LOOP_STEPS)),
-        "pending_ui_actions": sanitize_json_value(
-            runtime.get("pending_ui_actions") if isinstance(runtime.get("pending_ui_actions"), list) else []
-        )[:MAX_UI_ACTION_BATCH],
-        "completed_ui_actions": _compact_ui_action_results_for_model(runtime.get("completed_ui_actions")),
-        "last_ui_results": _compact_ui_action_results_for_model(runtime.get("last_ui_results")),
-        "pending_secure_input": {
-            "kind": _sanitize_line(str(pending_secure_input.get("kind") or ""), max_length=64) or None,
-            "mode": _sanitize_line(str(pending_secure_input.get("mode") or ""), max_length=32) or None,
-            "asset_ids": sanitize_json_value(
-                pending_secure_input.get("asset_ids") if isinstance(pending_secure_input.get("asset_ids"), list) else []
-            )[:4],
-            "resume_goal_id": _sanitize_line(str(pending_secure_input.get("resume_goal_id") or ""), max_length=64) or None,
-            "blocker_summary": sanitize_text(str(pending_secure_input.get("blocker_summary") or ""), max_length=240) or None,
-        }
-        if pending_secure_input
-        else {},
-        "auto_executed_actions": _compact_auto_executed_actions_for_model(runtime.get("auto_executed_actions")),
-        "last_user_intent": sanitize_text(str(runtime.get("last_user_intent") or ""), max_length=240) or None,
-        "last_error": sanitize_text(str(runtime.get("last_error") or ""), max_length=240) or None,
-    }
-
-
 def _build_model_request(
     *,
     session: AgentSession,
@@ -5993,85 +5321,23 @@ def _build_model_request(
     tool_traces: list[dict[str, Any]],
     allow_write_plans: bool,
     allow_auto_execute_actions: bool,
+    reflection_errors: list[dict[str, Any]] | None = None,
 ) -> LLMRequest:
-    recent_messages = list(session.messages[-12:])
-    latest_user_content = ""
-    if recent_messages:
-        last_message = recent_messages[-1]
-        last_role = str(getattr(last_message, "role", "") or "").strip().lower()
-        if last_role == "user":
-            latest_user_content = sanitize_text(getattr(last_message, "content", ""), max_length=4000) or ""
-            recent_messages = recent_messages[:-1]
-    history_lines = _select_model_history_lines(recent_messages)
-
-    messages: list[LLMMessage] = [
-        LLMMessage.from_text(
-            "system",
-            f"你是 {AGENT_DISPLAY_NAME}，负责在资产态势感知平台内充当站内自治助手。"
-            "同一会话可以连续处理不同资产、风险、任务和修复对象；页面地址只是提示，不是硬性上下文绑定。"
-            "你必须优先推进当前目标，能做动作时不要退化成纯说明，并严格遵守平台白名单工具与动作边界。",
-        ),
-        LLMMessage.from_text(
-            "system",
-            json.dumps(_build_model_response_contract(), ensure_ascii=False, indent=2),
-        ),
-        LLMMessage.from_text(
-            "user",
-            "平台当前上下文如下：\n"
-            + json.dumps(
-                _build_model_context_payload(
-                    user=user,
-                    page_context=page_context,
-                    browser_context=browser_context,
-                    browser_runtime=browser_runtime,
-                    working_context=working_context,
-                    dialog_state=dialog_state,
-                    followup_hint=followup_hint,
-                    allow_write_plans=allow_write_plans,
-                    allow_auto_execute_actions=allow_auto_execute_actions,
-                ),
-                ensure_ascii=False,
-                indent=2,
-            ),
-        ),
-    ]
-    if history_lines:
-        messages.append(
-            LLMMessage.from_text(
-                "user",
-                "最近会话记录如下，请仅将其作为历史参考，不要覆盖当前用户问题：\n" + "\n".join(history_lines),
-            )
-        )
-    if latest_user_content:
-        messages.append(LLMMessage.from_text("user", f"当前用户问题：\n{latest_user_content}"))
-    if dialog_state:
-        messages.append(
-            LLMMessage.from_text(
-                "user",
-                "上一轮仍未完成的对话状态如下，请把当前用户输入优先解释为对该追问的回复：\n"
-                + json.dumps(
-                    {
-                        "pending_dialog_state": dialog_state,
-                        "followup_hint": followup_hint,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-        )
-    if tool_traces:
-        messages.append(
-            LLMMessage.from_text(
-                "user",
-                "已执行的只读工具结果如下，请基于这些结果继续回答当前用户问题：\n"
-                + json.dumps(
-                    sanitize_json_value({"executed_read_tools": _compact_tool_traces_for_model(tool_traces)}),
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-        )
-    return LLMRequest(messages=messages)
+    return build_agent_model_request(
+        agent_display_name=AGENT_DISPLAY_NAME,
+        session=session,
+        user=user,
+        page_context=page_context,
+        browser_context=browser_context,
+        browser_runtime=browser_runtime,
+        working_context=working_context,
+        dialog_state=dialog_state,
+        followup_hint=followup_hint,
+        tool_traces=tool_traces,
+        allow_write_plans=allow_write_plans,
+        allow_auto_execute_actions=allow_auto_execute_actions,
+        reflection_errors=reflection_errors,
+    )
 
 
 def _log_model_decision_contract_issue(
@@ -6152,8 +5418,6 @@ def _run_model_once(
     followup_reply_kind = _sanitize_line(str(followup_hint.get("reply_kind") or ""), max_length=32)
     request_text = request.flattened_text()
     started_at = start_timer()
-    content = provider_result.provider.generate(request)
-    latency_ms = elapsed_ms(started_at)
     provider_name = (
         _sanitize_line(str(getattr(provider_result, "provider_name", "") or _runtime_provider_mode()), max_length=64)
         or _runtime_provider_mode()
@@ -6162,6 +5426,19 @@ def _run_model_once(
         str(read_runtime_env_value("LLM_WIRE_API", str(settings.LLM_WIRE_API or "responses")) or ""),
         max_length=32,
     )
+    try:
+        content = provider_result.provider.generate(request)
+    except Exception as exc:
+        record_agent_error(
+            error_type="model_inference_error",
+            stage="model_generate",
+            session_id=getattr(session, "id", None),
+            model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
+            details={"provider_name": provider_name, "wire_api": wire_api},
+            exc=exc,
+        )
+        raise
+    latency_ms = elapsed_ms(started_at)
     try:
         decision = _parse_model_decision(content)
         record_model_call(
@@ -6199,6 +5476,101 @@ def _run_model_once(
             error_reason=sanitize_text(str(exc), max_length=400) or "unknown_contract_error",
             phase="primary_parse",
         )
+        record_agent_error(
+            error_type="model_contract_error",
+            stage="primary_parse",
+            session_id=getattr(session, "id", None),
+            model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
+            details={
+                "provider_name": provider_name,
+                "wire_api": wire_api,
+                "objective_kind": objective_kind,
+                "followup_reply_kind": followup_reply_kind,
+                "raw_preview": sanitize_text(content, max_length=800) or "",
+            },
+            exc=exc,
+        )
+        reflection_errors = [
+            {
+                "error": sanitize_text(str(exc), max_length=500) or "unknown_contract_error",
+                "raw_response_preview": sanitize_text(content, max_length=800) or "",
+            }
+        ]
+        for reflection_attempt in range(1, 3):
+            reflection_request = _build_model_request(
+                session=session,
+                user=user,
+                page_context=page_context,
+                browser_context=browser_context,
+                browser_runtime=browser_runtime,
+                working_context=working_context,
+                dialog_state=dialog_state,
+                followup_hint=followup_hint,
+                tool_traces=tool_traces,
+                allow_write_plans=allow_write_plans,
+                allow_auto_execute_actions=allow_auto_execute_actions,
+                reflection_errors=reflection_errors,
+            )
+            reflection_request_text = reflection_request.flattened_text()
+            reflection_started_at = start_timer()
+            reflection_content = provider_result.provider.generate(reflection_request)
+            reflection_latency_ms = elapsed_ms(reflection_started_at)
+            try:
+                reflection_decision = _parse_model_decision(reflection_content)
+                record_model_call(
+                    turn_trace,
+                    provider_name=provider_name,
+                    model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
+                    wire_api=wire_api,
+                    latency_ms=reflection_latency_ms,
+                    request_text=reflection_request_text,
+                    response_text=reflection_content,
+                    parsed=True,
+                )
+                return reflection_decision
+            except Exception as reflection_exc:
+                record_model_call(
+                    turn_trace,
+                    provider_name=provider_name,
+                    model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
+                    wire_api=wire_api,
+                    latency_ms=reflection_latency_ms,
+                    request_text=reflection_request_text,
+                    response_text=reflection_content,
+                    parsed=False,
+                    error=sanitize_text(str(reflection_exc), max_length=240),
+                )
+                if not _is_model_decision_contract_error(reflection_exc):
+                    raise
+                _log_model_decision_contract_issue(
+                    provider_name=provider_name,
+                    wire_api=wire_api,
+                    resolved_base_url=_sanitize_line(str(getattr(provider_result, "resolved_base_url", "") or ""), max_length=255),
+                    objective_kind=objective_kind,
+                    followup_reply_kind=followup_reply_kind,
+                    raw_preview=sanitize_text(reflection_content, max_length=800) or "",
+                    error_reason=sanitize_text(str(reflection_exc), max_length=400) or "unknown_contract_error",
+                    phase=f"reflection_retry_{reflection_attempt}",
+                )
+                record_agent_error(
+                    error_type="model_contract_error",
+                    stage=f"reflection_retry_{reflection_attempt}",
+                    session_id=getattr(session, "id", None),
+                    model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
+                    details={
+                        "provider_name": provider_name,
+                        "wire_api": wire_api,
+                        "objective_kind": objective_kind,
+                        "raw_preview": sanitize_text(reflection_content, max_length=800) or "",
+                    },
+                    exc=reflection_exc,
+                )
+                reflection_errors.append(
+                    {
+                        "error": sanitize_text(str(reflection_exc), max_length=500) or "unknown_contract_error",
+                        "raw_response_preview": sanitize_text(reflection_content, max_length=800) or "",
+                    }
+                )
         if _sanitize_line(str(getattr(provider_result, "provider_name", "") or _runtime_provider_mode()), max_length=64) != "custom_proxy":
             raise
         retry_provider_result = _build_runtime_provider(
@@ -6811,6 +6183,18 @@ def _run_agent_loop(
                 _emit_agent_state(stream_emitter, session, turn_id=turn_id)
             except Exception as exc:
                 read_latency_ms = elapsed_ms(read_started_at) if "read_started_at" in locals() else None
+                record_agent_error(
+                    error_type="read_tool_error",
+                    stage="read_tool",
+                    session_id=getattr(session, "id", None),
+                    task_id=session_last_task_id,
+                    details={
+                        "tool_name": call.tool_name,
+                        "arguments": sanitize_json_value(call.arguments),
+                        "latency_ms": read_latency_ms,
+                    },
+                    exc=exc,
+                )
                 trace = {
                     "tool_name": call.tool_name,
                     "arguments": sanitize_json_value(call.arguments),
@@ -7598,6 +6982,26 @@ def _apply_agent_decision(
         decision.auto_execute_actions,
         allowed_types=AUTO_EXECUTE_ACTIONS,
     )
+    decision_validation = validate_agent_write_decisions(
+        auto_actions=auto_execute_actions,
+        proposed_actions=proposed_actions,
+        working_context=final_working_context,
+        page_context=page_context,
+        browser_context=browser_context,
+        user_role=_normalize_role(user.role),
+    )
+    auto_execute_actions = decision_validation.auto_actions
+    proposed_actions = decision_validation.proposed_actions
+    if decision_validation.downgraded:
+        issue_summary = "；".join(
+            item.message
+            for item in decision_validation.issues[:3]
+            if sanitize_text(item.message, max_length=160, single_line=True)
+        )
+        decision.reply_markdown = (
+            f"{decision.reply_markdown}\n\n安全校验已将部分自动写动作降级为待确认计划"
+            f"{f'：{issue_summary}' if issue_summary else '。'}"
+        ).strip()
     auto_execute_results: list[dict[str, Any]] = []
     secure_input_action = _extract_secure_input_action(proposed_actions)
     allow_auto_execute = _user_can_auto_execute(user) and _message_allows_auto_execution(
@@ -7605,7 +7009,7 @@ def _apply_agent_decision(
         dialog_state=dialog_state,
         followup_hint=followup_hint,
     )
-    needs_confirmation = bool(decision.needs_confirmation and proposed_actions and not secure_input_action)
+    needs_confirmation = bool((decision.needs_confirmation or proposed_actions) and proposed_actions and not secure_input_action)
 
     if auto_execute_actions:
         if allow_auto_execute:
@@ -7676,6 +7080,10 @@ def _apply_agent_decision(
         "proposed_write_actions": proposed_actions,
         "auto_execute_actions": auto_execute_actions,
         "auto_executed_actions": auto_execute_results,
+        "decision_validation": {
+            "downgraded": decision_validation.downgraded,
+            "issues": [item.to_payload() for item in decision_validation.issues],
+        },
         "mock_mode": _runtime_provider_mode() == "mock",
         "needs_confirmation": needs_confirmation,
         "page_context": page_context,
@@ -7737,6 +7145,7 @@ def _apply_agent_decision(
             },
             watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
         )
+        save_agent_session_checkpoint(session, stage="awaiting_secure_input")
         assistant_payload = {
             **base_assistant_payload,
             "dialog_state": sanitize_json_value(session.dialog_state_json),
@@ -7828,6 +7237,7 @@ def _apply_agent_decision(
             },
             watch={"primary_task_id": session_last_task_id, "watching": bool(session_last_task_id)},
         )
+        save_agent_session_checkpoint(session, stage="awaiting_ui_feedback")
         assistant_payload = {
             **base_assistant_payload,
             "pending_secure_input": pending_secure_input,
@@ -8071,6 +7481,7 @@ def _apply_agent_decision(
             },
             watch={"primary_task_id": _session_last_task_id(session), "watching": bool(_session_last_task_id(session))},
         )
+        save_agent_session_checkpoint(session, stage="waiting_approval")
         assistant_payload = {
             **base_assistant_payload,
             **_build_message_state_metadata(
@@ -8148,6 +7559,10 @@ def _apply_agent_decision(
             "watching": bool(child_task_ids),
         },
     )
+    if child_task_ids:
+        save_agent_session_checkpoint(session, stage="watching_task")
+    else:
+        delete_agent_session_checkpoint(session.id)
     assistant_payload = {
         **base_assistant_payload,
         **_build_message_state_metadata(

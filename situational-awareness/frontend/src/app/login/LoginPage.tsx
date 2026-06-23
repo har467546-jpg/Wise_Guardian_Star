@@ -7,7 +7,7 @@ import { UserOutlined, LockOutlined, MailOutlined, SafetyCertificateOutlined, Re
 
 import DesktopMetricCard from "@/components/DesktopMetricCard";
 import { bootstrapAdmin, getBootstrapStatus, login } from "@/services/api";
-import { setStoredToken } from "@/lib/auth";
+import { setStoredAuthTokens } from "@/lib/auth";
 import type { BootstrapStatusResponse } from "@/types/auth";
 
 export default function LoginPage() {
@@ -41,7 +41,7 @@ export default function LoginPage() {
     try {
       setLoginLoading(true);
       const response = await login(values);
-      setStoredToken(response.access_token);
+      setStoredAuthTokens(response);
       router.replace("/");
     } catch (err) {
       setActionError((err as Error).message);
@@ -58,7 +58,7 @@ export default function LoginPage() {
         email: values.email,
         password: values.password,
       });
-      setStoredToken(response.access_token);
+      setStoredAuthTokens(response);
       router.replace("/");
     } catch (err) {
       setActionError((err as Error).message);

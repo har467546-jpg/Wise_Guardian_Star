@@ -49,6 +49,7 @@ from app.services.haor_agent_service import (
     translate_agent_service_exception,
 )
 from app.services.runner_service import resolve_runner_public_url
+from app.services.user_state_cache_service import resolve_active_user_from_token_payload
 from app.tasks.agent_tasks import run_agent_orchestrate_task
 
 router = APIRouter()
@@ -354,13 +355,7 @@ def _resolve_websocket_user(db: Session, token: str) -> User | None:
         payload = decode_access_token(token)
     except SecurityError:
         return None
-    user_id = payload.get("sub")
-    if not user_id:
-        return None
-    user = db.get(User, user_id)
-    if user is None or not user.is_active:
-        return None
-    return user
+    return resolve_active_user_from_token_payload(db, payload)
 
 
 def _map_agent_exception(exc: Exception, *, stage: str, user: User | None) -> tuple[int, str]:

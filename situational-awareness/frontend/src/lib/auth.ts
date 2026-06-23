@@ -1,4 +1,5 @@
 const TOKEN_KEY = "sa_access_token";
+const REFRESH_TOKEN_KEY = "sa_refresh_token";
 const ROLE_KEY = "sa_user_role";
 export type StoredUserRole = "admin" | "analyst" | "";
 
@@ -16,11 +17,37 @@ export function setStoredToken(token: string): void {
   window.localStorage.setItem(TOKEN_KEY, token);
 }
 
+export function getStoredRefreshToken(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  return window.localStorage.getItem(REFRESH_TOKEN_KEY) || "";
+}
+
+export function setStoredRefreshToken(token: string): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (!token) {
+    window.localStorage.removeItem(REFRESH_TOKEN_KEY);
+    return;
+  }
+  window.localStorage.setItem(REFRESH_TOKEN_KEY, token);
+}
+
+export function setStoredAuthTokens(tokens: { access_token: string; refresh_token?: string | null }): void {
+  setStoredToken(tokens.access_token);
+  if (tokens.refresh_token) {
+    setStoredRefreshToken(tokens.refresh_token);
+  }
+}
+
 export function clearStoredToken(): void {
   if (typeof window === "undefined") {
     return;
   }
   window.localStorage.removeItem(TOKEN_KEY);
+  window.localStorage.removeItem(REFRESH_TOKEN_KEY);
   window.localStorage.removeItem(ROLE_KEY);
 }
 

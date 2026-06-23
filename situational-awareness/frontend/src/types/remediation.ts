@@ -381,6 +381,12 @@ export type HostRunnerInstallResponse = {
   stream_url: string;
 };
 
+export type TerminalTicket = {
+  ticket: string;
+  expires_in_seconds: number;
+  websocket_url: string;
+};
+
 export type RemediationStreamEnvelope =
   | { type: "task"; task: { task_id: string; status: string; progress: number; message: string | null } }
   | { type: "event"; event: Record<string, unknown> }

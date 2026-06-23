@@ -11,6 +11,7 @@ from starlette.requests import Request
 
 from app.core.config import settings
 from app.core.security import SecurityError, decode_access_token
+from app.services.client_ip_service import resolve_client_ip
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,16 +121,8 @@ def _extract_bearer_token(value: str) -> str:
 
 
 def _resolve_client_ip(request: Request) -> str:
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        first = forwarded_for.split(",", 1)[0].strip()
-        if first:
-            return first
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
     client = request.client
-    return client.host if client is not None else "unknown"
+    return resolve_client_ip(request.headers, client.host if client is not None else None) or "unknown"
 
 
 def _build_key(identifier: str, window_id: int) -> str:
@@ -154,4 +147,3 @@ def _increment_local_window(key: str, window_id: int) -> int:
         current += 1
         _local_windows[key] = (current, window_id)
         return current
-

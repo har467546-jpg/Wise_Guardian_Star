@@ -1,4 +1,5 @@
 import os
+import secrets
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -35,12 +36,14 @@ def _default_private_network_cors_origins() -> str:
 
 
 DEFAULT_PRIVATE_NETWORK_CORS_ORIGINS = _default_private_network_cors_origins()
+WEAK_RUNTIME_SECRET_KEYS = {"", "change-me", "change-this-secret"}
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeEnvBootstrapState:
     runtime_env_path: Path
     generated_encryption_key: bool = False
+    generated_secret_key: bool = False
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -62,10 +65,16 @@ def _ensure_runtime_env_file() -> Path:
     return RUNTIME_ENV_PATH
 
 
-def _write_bootstrap_marker() -> None:
+def _write_bootstrap_marker(*, generated_encryption_key: bool, generated_secret_key: bool) -> None:
     _atomic_write_text(
         RUNTIME_ENV_BOOTSTRAP_MARKER_PATH,
-        "generated_encryption_key=true\n",
+        "\n".join(
+            [
+                f"generated_encryption_key={str(generated_encryption_key).lower()}",
+                f"generated_secret_key={str(generated_secret_key).lower()}",
+            ]
+        )
+        + "\n",
     )
 
 
@@ -125,23 +134,57 @@ def _drop_env_line(lines: list[str], key: str) -> list[str]:
 
 
 def ensure_runtime_encryption_key() -> RuntimeEnvBootstrapState:
+    if RUNTIME_ENV_PATH == BACKEND_ROOT / ".env.runtime":
+        if _process_env_has_runtime_secrets():
+            return RuntimeEnvBootstrapState(runtime_env_path=RUNTIME_ENV_PATH)
+        if _process_env_is_production() and not RUNTIME_ENV_PATH.exists():
+            return RuntimeEnvBootstrapState(runtime_env_path=RUNTIME_ENV_PATH)
+
     RUNTIME_ENV_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with RUNTIME_ENV_LOCK_PATH.open("a+", encoding="utf-8") as lock_handle:
         if fcntl is not None:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         runtime_env = _ensure_runtime_env_file()
         lines = runtime_env.read_text(encoding="utf-8").splitlines()
-        if _extract_env_value(lines, "ENCRYPTION_KEY"):
-            return RuntimeEnvBootstrapState(runtime_env_path=runtime_env, generated_encryption_key=False)
+        generated_secret_key = False
+        generated_encryption_key = False
+        updated_lines = list(lines)
 
-        generated_key = Fernet.generate_key().decode()
-        updated_lines = _upsert_env_line(lines, "ENCRYPTION_KEY", generated_key)
-        _atomic_write_text(runtime_env, "\n".join(updated_lines).rstrip("\n") + "\n")
-        _write_bootstrap_marker()
-        return RuntimeEnvBootstrapState(runtime_env_path=runtime_env, generated_encryption_key=True)
+        if _extract_env_value(updated_lines, "SECRET_KEY") in WEAK_RUNTIME_SECRET_KEYS:
+            updated_lines = _upsert_env_line(updated_lines, "SECRET_KEY", secrets.token_urlsafe(48))
+            generated_secret_key = True
+
+        if not _extract_env_value(updated_lines, "ENCRYPTION_KEY"):
+            generated_key = Fernet.generate_key().decode()
+            updated_lines = _upsert_env_line(updated_lines, "ENCRYPTION_KEY", generated_key)
+            generated_encryption_key = True
+
+        if generated_secret_key or generated_encryption_key:
+            _atomic_write_text(runtime_env, "\n".join(updated_lines).rstrip("\n") + "\n")
+            _write_bootstrap_marker(
+                generated_encryption_key=generated_encryption_key,
+                generated_secret_key=generated_secret_key,
+            )
+        return RuntimeEnvBootstrapState(
+            runtime_env_path=runtime_env,
+            generated_encryption_key=generated_encryption_key,
+            generated_secret_key=generated_secret_key,
+        )
+
+
+def _process_env_has_runtime_secrets() -> bool:
+    secret_key = str(os.getenv("SECRET_KEY") or "").strip()
+    encryption_key = str(os.getenv("ENCRYPTION_KEY") or "").strip()
+    return bool(secret_key and secret_key not in WEAK_RUNTIME_SECRET_KEYS and encryption_key)
+
+
+def _process_env_is_production() -> bool:
+    return str(os.getenv("ENV") or "").strip().lower() in {"prod", "production"}
 
 
 def migrate_legacy_llm_api_key_storage() -> bool:
+    if _process_env_is_production() and not RUNTIME_ENV_PATH.exists():
+        return False
     runtime_env = _ensure_runtime_env_file()
     lines = runtime_env.read_text(encoding="utf-8").splitlines()
     has_legacy_key = _has_env_key(lines, "LLM_API_KEY_ENCRYPTED")
@@ -221,6 +264,7 @@ class Settings(BaseSettings):
     ENV: str = "dev"
     SECRET_KEY: str = Field(default="change-me", min_length=8)
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 8
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 14
     JWT_ALGORITHM: str = "HS256"
 
     DATABASE_URL: str = "postgresql+pg8000://asset:asset@postgres:5432/assetdb"
@@ -237,6 +281,19 @@ class Settings(BaseSettings):
     CORS_ALLOW_ORIGINS: str = DEFAULT_PRIVATE_NETWORK_CORS_ORIGINS
     LOCAL_ASSET_IPS: str = "127.0.0.1,::1"
     SECURITY_ADMIN_CIDRS: str = ""
+    SECURITY_TRUSTED_PROXY_CIDRS: str = "127.0.0.1/32,::1/128,172.16.0.0/12"
+    SECURITY_WS_TICKET_TTL_SECONDS: int = 10
+    SECURITY_TOKEN_DENYLIST_ENABLED: bool = True
+    SECURITY_TOKEN_DENYLIST_REDIS_PREFIX: str = "sa:token_denylist"
+    SECURITY_REFRESH_TOKEN_REDIS_PREFIX: str = "sa:refresh_token"
+    SECURITY_REFRESH_TOKEN_GRACE_SECONDS: int = 10
+    SECURITY_USER_STATE_CACHE_PREFIX: str = "sa:user_state"
+    SECURITY_USER_STATE_CACHE_TTL_SECONDS: int = 60
+    SECURITY_USER_REVOKED_AFTER_PREFIX: str = "sa:user_revoked_after"
+    SECURITY_WS_TICKET_REDIS_PREFIX: str = "sa:ws_ticket"
+    AGENT_CHECKPOINT_REDIS_PREFIX: str = "sa:agent_checkpoint"
+    AGENT_CHECKPOINT_TTL_SECONDS: int = 86400
+    SECURITY_TERMINAL_INPUT_FILTER_ENABLED: bool = True
     AUTO_CREATE_SCHEMA: bool = False
     STRICT_SCHEMA_REVISION_CHECK: bool = False
 
@@ -316,7 +373,7 @@ class Settings(BaseSettings):
     HAOR_REPLY_REWRITE_ENABLED: bool = False
 
     model_config = SettingsConfigDict(
-        env_file=(str(RUNTIME_ENV_PATH), str(EXAMPLE_ENV_PATH), str(LEGACY_ENV_PATH)),
+        env_file=(str(LEGACY_ENV_PATH), str(EXAMPLE_ENV_PATH), str(RUNTIME_ENV_PATH)),
         env_file_encoding="utf-8",
         case_sensitive=False,
     )

@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.security import SecurityError, decode_access_token
 from app.db.models.audit_log_entry import AuditLogEntry
 from app.db.session import SessionLocal, engine
+from app.services.client_ip_service import resolve_client_ip as resolve_trusted_client_ip
 from app.services.platform_log_service import redact_sensitive_json_value, redact_sensitive_text
 
 
@@ -28,6 +29,10 @@ class AuditResource:
     resource_id: str | None
 
 
+class StrictAuditError(RuntimeError):
+    pass
+
+
 def ensure_audit_log_storage() -> None:
     try:
         AuditLogEntry.__table__.create(bind=engine, checkfirst=True)
@@ -42,6 +47,39 @@ def should_audit_request(request: Request) -> bool:
     if path in {"/docs", "/redoc", "/openapi.json"}:
         return False
     return path.startswith(settings.API_V1_PREFIX)
+
+
+def should_strict_audit_request(request: Request) -> bool:
+    if not should_audit_request(request):
+        return False
+    method = str(request.method or "").upper()
+    path = str(request.url.path or "").rstrip("/")
+    prefix = settings.API_V1_PREFIX.rstrip("/")
+
+    if method == "GET" and path.startswith(f"{prefix}/data-exchange/export/"):
+        return True
+    if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    if path in {
+        f"{prefix}/agent/xuanwu/session/approve",
+        f"{prefix}/agent/haor/session/approve",
+        f"{prefix}/data-exchange/servers/import",
+        f"{prefix}/settings/security/secret-cipher-migration",
+    }:
+        return True
+    if path.startswith(f"{prefix}/auth/users/") and path.endswith("/sessions/revoke"):
+        return True
+    if path.startswith(f"{prefix}/remediation/findings/") and path.endswith("/execute"):
+        return True
+    if path.startswith(f"{prefix}/remediation/assets/") and path.endswith("/runner/install"):
+        return True
+    if path.startswith(f"{prefix}/remediation/assets/") and path.endswith("/terminal/tickets"):
+        return True
+    if path.startswith(f"{prefix}/collection/") and _path_has_any_segment(path, {"credential", "credentials"}):
+        return True
+    if path.startswith(f"{prefix}/campus/data-sources"):
+        return True
+    return False
 
 
 def new_request_id(request: Request) -> str:
@@ -66,15 +104,9 @@ def resolve_audit_actor(request: Request) -> AuditActor:
 
 
 def resolve_client_ip(request: Request) -> str | None:
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        first = forwarded_for.split(",", 1)[0].strip()
-        if first:
-            return first[:64]
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()[:64]
-    return request.client.host[:64] if request.client is not None else None
+    client_host = request.client.host if request.client is not None else None
+    resolved = resolve_trusted_client_ip(request.headers, client_host)
+    return resolved[:64] if resolved else None
 
 
 def resolve_audit_resource(method: str, path: str) -> AuditResource:
@@ -131,6 +163,7 @@ def write_audit_log(
     rate_limited: bool = False,
     error_message: str | None = None,
     payload_json: dict[str, Any] | None = None,
+    strict: bool = False,
 ) -> None:
     if not should_audit_request(request):
         return
@@ -163,6 +196,28 @@ def write_audit_log(
             db.commit()
         except Exception:
             db.rollback()
+            if strict:
+                raise StrictAuditError("审计日志写入失败，已阻断高危操作")
+
+
+def write_strict_audit_log(
+    *,
+    request: Request,
+    request_id: str,
+    status_code: int,
+    duration_ms: int,
+    error_message: str | None = None,
+    payload_json: dict[str, Any] | None = None,
+) -> None:
+    write_audit_log(
+        request=request,
+        request_id=request_id,
+        status_code=status_code,
+        duration_ms=duration_ms,
+        error_message=error_message,
+        payload_json=payload_json,
+        strict=True,
+    )
 
 
 def serialize_audit_log_entry(entry: AuditLogEntry) -> dict[str, Any]:
@@ -205,3 +260,6 @@ def _resolve_resource_id(segments: list[str]) -> str | None:
         return item
     return None
 
+
+def _path_has_any_segment(path: str, candidates: set[str]) -> bool:
+    return any(part in candidates for part in path.split("/") if part)

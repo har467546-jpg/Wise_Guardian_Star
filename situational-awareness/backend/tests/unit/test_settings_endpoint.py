@@ -59,6 +59,62 @@ class _FakeHelperResponse:
         return self._payload
 
 
+def _settings_payload(**overrides) -> dict[str, object]:  # type: ignore[no-untyped-def]
+    payload: dict[str, object] = {
+        "runner_poll_interval_seconds": 12,
+        "runner_offline_grace_seconds": 60,
+        "remediation_auto_reverify_enabled": True,
+        "remediation_stop_on_failure": True,
+        "remediation_prepare_backups_enabled": True,
+        "discovery_liveness_ports": "22,80,443",
+        "discovery_liveness_mode": "nmap_icmp",
+        "discovery_enable_arp_discovery": True,
+        "discovery_enable_fping": True,
+        "discovery_nmap_host_discovery_profile": "balanced",
+        "discovery_service_ports": "22,80,443,3306",
+        "discovery_high_backdoor_ports": "",
+        "discovery_portset_mode": "full",
+        "discovery_top_ports_limit": 1000,
+        "discovery_nmap_mode": "enrich",
+        "discovery_nmap_min_rate": 100000,
+        "discovery_nmap_timeout_seconds": 8,
+        "discovery_nmap_liveness_timeout_seconds": 90,
+        "discovery_nmap_full_scan_timeout_seconds": 90,
+        "discovery_nmap_version_intensity": 7,
+        "discovery_low_confidence_threshold": 70,
+        "discovery_full_scan_host_concurrency": 8,
+        "discovery_full_scan_port_concurrency": 256,
+        "discovery_service_probe_host_concurrency": 32,
+        "discovery_nse_mode": "whitelist",
+        "discovery_nse_timeout_seconds": 8,
+        "discovery_nse_host_concurrency": 8,
+        "discovery_nse_enable_vuln_scripts": True,
+        "campus_default_portset_mode": "top1000_plus_custom",
+        "campus_allow_full_scan_default": False,
+        "campus_zone_host_concurrency_limit": 8,
+        "campus_zone_nmap_min_rate": 5000,
+        "campus_dhcp_default_interval_seconds": 1800,
+        "campus_snmp_default_interval_seconds": 1800,
+        "risk_active_verify_connect_timeout_seconds": 3,
+        "risk_active_verify_read_timeout_seconds": 3,
+        "risk_active_verify_max_concurrency": 4,
+        "llm_provider": "mock",
+        "llm_model": "gpt-4o-mini",
+        "llm_base_url": "",
+        "llm_wire_api": "responses",
+        "llm_timeout_seconds": 60,
+        "llm_api_key": "",
+        "clear_llm_api_key": False,
+        "cors_allow_all": True,
+        "cors_allow_origins": "http://localhost:3000",
+        "local_asset_ips": "127.0.0.1,::1",
+        "security_admin_cidrs": "",
+        "access_token_expire_minutes": 480,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _install_test_database() -> None:
     global SessionLocal, engine
 
@@ -142,6 +198,8 @@ def _build_client(monkeypatch, tmp_path, role: UserRole = UserRole.ADMIN) -> Tes
     monkeypatch.setattr(platform_settings_service.settings, "LLM_BASE_URL", "")
     monkeypatch.setattr(platform_settings_service.settings, "LLM_WIRE_API", "responses")
     monkeypatch.setattr(platform_settings_service.settings, "LLM_TIMEOUT_SECONDS", 60)
+    monkeypatch.setenv("SECRET_KEY", "runtime-secret-key")
+    monkeypatch.setenv("ENCRYPTION_KEY", "runtime-encryption-key")
 
     app = create_app()
     app.dependency_overrides[get_current_user] = _override_user(role)
@@ -289,46 +347,13 @@ def test_put_settings_dispatches_helper_with_plaintext_api_key(monkeypatch, tmp_
 
     response = client.put(
         "/api/v1/settings",
-        json={
-            "runner_poll_interval_seconds": 12,
-            "runner_offline_grace_seconds": 60,
-            "remediation_auto_reverify_enabled": True,
-            "remediation_stop_on_failure": True,
-            "remediation_prepare_backups_enabled": True,
-            "discovery_liveness_ports": "22,80,443",
-            "discovery_liveness_mode": "nmap_icmp",
-            "discovery_service_ports": "22,80,443,3306",
-            "discovery_high_backdoor_ports": "",
-            "discovery_portset_mode": "full",
-            "discovery_top_ports_limit": 1000,
-            "discovery_nmap_mode": "enrich",
-            "discovery_nmap_min_rate": 100000,
-            "discovery_nmap_timeout_seconds": 8,
-            "discovery_nmap_liveness_timeout_seconds": 90,
-            "discovery_nmap_full_scan_timeout_seconds": 90,
-            "discovery_nmap_version_intensity": 7,
-            "discovery_low_confidence_threshold": 70,
-            "discovery_full_scan_host_concurrency": 8,
-            "discovery_full_scan_port_concurrency": 256,
-            "discovery_service_probe_host_concurrency": 32,
-            "discovery_nse_mode": "whitelist",
-            "discovery_nse_timeout_seconds": 8,
-            "discovery_nse_host_concurrency": 8,
-            "discovery_nse_enable_vuln_scripts": True,
-            "risk_active_verify_connect_timeout_seconds": 3,
-            "risk_active_verify_read_timeout_seconds": 3,
-            "risk_active_verify_max_concurrency": 4,
-            "llm_provider": "openai",
-            "llm_model": "gpt-4o-mini",
-            "llm_base_url": "https://api.openai.com/v1",
-            "llm_timeout_seconds": 45,
-            "llm_api_key": "sk-test-secret",
-            "clear_llm_api_key": False,
-            "cors_allow_all": True,
-            "cors_allow_origins": "http://localhost:3000",
-            "local_asset_ips": "127.0.0.1,::1",
-            "access_token_expire_minutes": 480,
-        },
+        json=_settings_payload(
+            llm_provider="openai",
+            llm_model="gpt-4o-mini",
+            llm_base_url="https://api.openai.com/v1",
+            llm_timeout_seconds=45,
+            llm_api_key="sk-test-secret",
+        ),
     )
 
     assert response.status_code == 202
@@ -342,6 +367,8 @@ def test_put_settings_dispatches_helper_with_plaintext_api_key(monkeypatch, tmp_
     assert "LLM_BASE_URL=https://api.openai.com/v1" in env_content
     assert "LLM_WIRE_API=responses" in env_content
     assert "LLM_TIMEOUT_SECONDS=45" in env_content
+    assert "SECRET_KEY=runtime-secret-key" in env_content
+    assert "ENCRYPTION_KEY=runtime-encryption-key" in env_content
     with SessionLocal() as db:
         task = db.get(TaskRun, response.json()["task_id"])
         assert task is not None
@@ -361,47 +388,14 @@ def test_put_settings_normalizes_custom_proxy_base_url(monkeypatch, tmp_path) ->
 
     response = client.put(
         "/api/v1/settings",
-        json={
-            "runner_poll_interval_seconds": 12,
-            "runner_offline_grace_seconds": 60,
-            "remediation_auto_reverify_enabled": True,
-            "remediation_stop_on_failure": True,
-            "remediation_prepare_backups_enabled": True,
-            "discovery_liveness_ports": "22,80,443",
-            "discovery_liveness_mode": "nmap_icmp",
-            "discovery_service_ports": "22,80,443,3306",
-            "discovery_high_backdoor_ports": "",
-            "discovery_portset_mode": "full",
-            "discovery_top_ports_limit": 1000,
-            "discovery_nmap_mode": "enrich",
-            "discovery_nmap_min_rate": 100000,
-            "discovery_nmap_timeout_seconds": 8,
-            "discovery_nmap_liveness_timeout_seconds": 90,
-            "discovery_nmap_full_scan_timeout_seconds": 90,
-            "discovery_nmap_version_intensity": 7,
-            "discovery_low_confidence_threshold": 70,
-            "discovery_full_scan_host_concurrency": 8,
-            "discovery_full_scan_port_concurrency": 256,
-            "discovery_service_probe_host_concurrency": 32,
-            "discovery_nse_mode": "whitelist",
-            "discovery_nse_timeout_seconds": 8,
-            "discovery_nse_host_concurrency": 8,
-            "discovery_nse_enable_vuln_scripts": True,
-            "risk_active_verify_connect_timeout_seconds": 3,
-            "risk_active_verify_read_timeout_seconds": 3,
-            "risk_active_verify_max_concurrency": 4,
-            "llm_provider": "custom_proxy",
-            "llm_model": "gpt-5.4",
-            "llm_base_url": "relay.example.com/models",
-            "llm_wire_api": "auto",
-            "llm_timeout_seconds": 45,
-            "llm_api_key": "relay-secret",
-            "clear_llm_api_key": False,
-            "cors_allow_all": True,
-            "cors_allow_origins": "http://localhost:3000",
-            "local_asset_ips": "127.0.0.1,::1",
-            "access_token_expire_minutes": 480,
-        },
+        json=_settings_payload(
+            llm_provider="custom_proxy",
+            llm_model="gpt-5.4",
+            llm_base_url="relay.example.com/models",
+            llm_wire_api="auto",
+            llm_timeout_seconds=45,
+            llm_api_key="relay-secret",
+        ),
     )
 
     assert response.status_code == 202
@@ -425,47 +419,14 @@ def test_put_settings_preserves_corrected_custom_proxy_root_base_url(monkeypatch
 
     response = client.put(
         "/api/v1/settings",
-        json={
-            "runner_poll_interval_seconds": 12,
-            "runner_offline_grace_seconds": 60,
-            "remediation_auto_reverify_enabled": True,
-            "remediation_stop_on_failure": True,
-            "remediation_prepare_backups_enabled": True,
-            "discovery_liveness_ports": "22,80,443",
-            "discovery_liveness_mode": "nmap_icmp",
-            "discovery_service_ports": "22,80,443,3306",
-            "discovery_high_backdoor_ports": "",
-            "discovery_portset_mode": "full",
-            "discovery_top_ports_limit": 1000,
-            "discovery_nmap_mode": "enrich",
-            "discovery_nmap_min_rate": 100000,
-            "discovery_nmap_timeout_seconds": 8,
-            "discovery_nmap_liveness_timeout_seconds": 90,
-            "discovery_nmap_full_scan_timeout_seconds": 90,
-            "discovery_nmap_version_intensity": 7,
-            "discovery_low_confidence_threshold": 70,
-            "discovery_full_scan_host_concurrency": 8,
-            "discovery_full_scan_port_concurrency": 256,
-            "discovery_service_probe_host_concurrency": 32,
-            "discovery_nse_mode": "whitelist",
-            "discovery_nse_timeout_seconds": 8,
-            "discovery_nse_host_concurrency": 8,
-            "discovery_nse_enable_vuln_scripts": True,
-            "risk_active_verify_connect_timeout_seconds": 3,
-            "risk_active_verify_read_timeout_seconds": 3,
-            "risk_active_verify_max_concurrency": 4,
-            "llm_provider": "custom_proxy",
-            "llm_model": "gpt-5.4",
-            "llm_base_url": "https://relay.example.com",
-            "llm_wire_api": "auto",
-            "llm_timeout_seconds": 45,
-            "llm_api_key": "relay-secret",
-            "clear_llm_api_key": False,
-            "cors_allow_all": True,
-            "cors_allow_origins": "http://localhost:3000",
-            "local_asset_ips": "127.0.0.1,::1",
-            "access_token_expire_minutes": 480,
-        },
+        json=_settings_payload(
+            llm_provider="custom_proxy",
+            llm_model="gpt-5.4",
+            llm_base_url="https://relay.example.com",
+            llm_wire_api="auto",
+            llm_timeout_seconds=45,
+            llm_api_key="relay-secret",
+        ),
     )
 
     assert response.status_code == 202
@@ -485,49 +446,18 @@ def test_put_settings_applies_minimax_defaults_when_wire_api_omitted(monkeypatch
         return _FakeHelperResponse()
 
     monkeypatch.setattr(platform_settings_service.httpx, "post", _fake_post)
+    payload = _settings_payload(
+        llm_provider="minimax",
+        llm_model="MiniMax-M2.5",
+        llm_base_url="",
+        llm_timeout_seconds=45,
+        llm_api_key="mini-secret",
+    )
+    payload.pop("llm_wire_api", None)
 
     response = client.put(
         "/api/v1/settings",
-        json={
-            "runner_poll_interval_seconds": 12,
-            "runner_offline_grace_seconds": 60,
-            "remediation_auto_reverify_enabled": True,
-            "remediation_stop_on_failure": True,
-            "remediation_prepare_backups_enabled": True,
-            "discovery_liveness_ports": "22,80,443",
-            "discovery_liveness_mode": "nmap_icmp",
-            "discovery_service_ports": "22,80,443,3306",
-            "discovery_high_backdoor_ports": "",
-            "discovery_portset_mode": "full",
-            "discovery_top_ports_limit": 1000,
-            "discovery_nmap_mode": "enrich",
-            "discovery_nmap_min_rate": 100000,
-            "discovery_nmap_timeout_seconds": 8,
-            "discovery_nmap_liveness_timeout_seconds": 90,
-            "discovery_nmap_full_scan_timeout_seconds": 90,
-            "discovery_nmap_version_intensity": 7,
-            "discovery_low_confidence_threshold": 70,
-            "discovery_full_scan_host_concurrency": 8,
-            "discovery_full_scan_port_concurrency": 256,
-            "discovery_service_probe_host_concurrency": 32,
-            "discovery_nse_mode": "whitelist",
-            "discovery_nse_timeout_seconds": 8,
-            "discovery_nse_host_concurrency": 8,
-            "discovery_nse_enable_vuln_scripts": True,
-            "risk_active_verify_connect_timeout_seconds": 3,
-            "risk_active_verify_read_timeout_seconds": 3,
-            "risk_active_verify_max_concurrency": 4,
-            "llm_provider": "minimax",
-            "llm_model": "MiniMax-M2.5",
-            "llm_base_url": "",
-            "llm_timeout_seconds": 45,
-            "llm_api_key": "mini-secret",
-            "clear_llm_api_key": False,
-            "cors_allow_all": True,
-            "cors_allow_origins": "http://localhost:3000",
-            "local_asset_ips": "127.0.0.1,::1",
-            "access_token_expire_minutes": 480,
-        },
+        json=payload,
     )
 
     assert response.status_code == 202
@@ -545,46 +475,10 @@ def test_internal_complete_marks_task_success(monkeypatch, tmp_path) -> None:  #
     monkeypatch.setattr(platform_settings_service.httpx, "post", lambda *args, **kwargs: _FakeHelperResponse())  # type: ignore[no-untyped-def]
     create_response = client.put(
         "/api/v1/settings",
-        json={
-            "runner_poll_interval_seconds": 10,
-            "runner_offline_grace_seconds": 45,
-            "remediation_auto_reverify_enabled": True,
-            "remediation_stop_on_failure": True,
-            "remediation_prepare_backups_enabled": True,
-            "discovery_liveness_ports": "22,80,443",
-            "discovery_liveness_mode": "nmap_icmp",
-            "discovery_service_ports": "22,80,443,3306",
-            "discovery_high_backdoor_ports": "",
-            "discovery_portset_mode": "full",
-            "discovery_top_ports_limit": 1000,
-            "discovery_nmap_mode": "enrich",
-            "discovery_nmap_min_rate": 100000,
-            "discovery_nmap_timeout_seconds": 8,
-            "discovery_nmap_liveness_timeout_seconds": 90,
-            "discovery_nmap_full_scan_timeout_seconds": 90,
-            "discovery_nmap_version_intensity": 7,
-            "discovery_low_confidence_threshold": 70,
-            "discovery_full_scan_host_concurrency": 8,
-            "discovery_full_scan_port_concurrency": 256,
-            "discovery_service_probe_host_concurrency": 32,
-            "discovery_nse_mode": "whitelist",
-            "discovery_nse_timeout_seconds": 8,
-            "discovery_nse_host_concurrency": 8,
-            "discovery_nse_enable_vuln_scripts": True,
-            "risk_active_verify_connect_timeout_seconds": 3,
-            "risk_active_verify_read_timeout_seconds": 3,
-            "risk_active_verify_max_concurrency": 4,
-            "llm_provider": "mock",
-            "llm_model": "gpt-4o-mini",
-            "llm_base_url": "",
-            "llm_timeout_seconds": 60,
-            "llm_api_key": "",
-            "clear_llm_api_key": False,
-            "cors_allow_all": True,
-            "cors_allow_origins": "http://localhost:3000",
-            "local_asset_ips": "127.0.0.1,::1",
-            "access_token_expire_minutes": 480,
-        },
+        json=_settings_payload(
+            runner_poll_interval_seconds=10,
+            runner_offline_grace_seconds=45,
+        ),
     )
     task_id = create_response.json()["task_id"]
 

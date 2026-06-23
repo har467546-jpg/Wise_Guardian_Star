@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_admin_user, get_db_session
@@ -14,6 +15,7 @@ from app.core.security import SecurityError, decode_access_token
 from app.db.models.asset import Asset
 from app.db.models.audit_log_entry import AuditLogEntry
 from app.db.models.enums import TaskExecutionStatus, TaskType, UserRole
+from app.db.models.remediation_message import RemediationMessage
 from app.db.models.remediation_session import RemediationSession
 from app.db.models.user import User
 from app.db.session import SessionLocal
@@ -35,7 +37,10 @@ from app.schemas.remediation import (
     RemediationTaskRead,
     RemediationTaskEvidenceRead,
     RemediationWorkspaceRead,
+    TerminalTicketRead,
 )
+from app.services.client_ip_service import resolve_client_ip as resolve_trusted_client_ip
+from app.services.audit_log_service import StrictAuditError
 from app.services.remediation_business_service import EXECUTION_STATUS_PENDING
 from app.services.remediation_executor import build_remediation_preview_result
 from app.services.remediation_service import (
@@ -69,6 +74,9 @@ from app.services.ssh_terminal_service import (
     run_ssh_terminal,
 )
 from app.services.task_observability_service import serialize_task_event
+from app.services.terminal_input_filter import TerminalInputFilter, TerminalInputViolation
+from app.services.user_state_cache_service import get_user_auth_state, resolve_active_user_from_token_payload
+from app.services.ws_ticket_service import consume_websocket_ticket, issue_websocket_ticket, websocket_ticket_ttl_seconds
 from app.tasks.remediation_tasks import run_remediation_execute_task
 from app.tasks.runner_tasks import run_runner_install_task
 
@@ -415,12 +423,36 @@ def get_remediation_task_evidence(
     )
 
 
+@router.post("/assets/{asset_id}/terminal/tickets", response_model=TerminalTicketRead)
+def issue_asset_terminal_ticket(
+    asset_id: str,
+    db: Session = Depends(get_db_session),
+    user: User = Depends(get_admin_user),
+) -> TerminalTicketRead:
+    try:
+        build_ssh_terminal_profile(db, asset_id)
+    except SSHTerminalError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    role = user.role.value if hasattr(user.role, "value") else str(user.role)
+    claims = issue_websocket_ticket(
+        user_id=user.id,
+        role=role,
+        resource_type="ssh_terminal_asset",
+        resource_id=asset_id,
+    )
+    return TerminalTicketRead(
+        ticket=claims.ticket,
+        expires_in_seconds=websocket_ticket_ttl_seconds(),
+        websocket_url=f"/api/v1/remediation/assets/{asset_id}/terminal?ticket={claims.ticket}",
+    )
+
+
 @router.websocket("/assets/{asset_id}/terminal")
 async def stream_asset_terminal(asset_id: str, websocket: WebSocket) -> None:
     request_id = f"ws-{uuid4().hex}"
     started_at = time.perf_counter()
-    token = websocket.query_params.get("token") or ""
-    if not token:
+    ticket = websocket.query_params.get("ticket") or ""
+    if not ticket:
         _write_terminal_audit(
             websocket=websocket,
             user=None,
@@ -429,12 +461,32 @@ async def stream_asset_terminal(asset_id: str, websocket: WebSocket) -> None:
             started_at=started_at,
             status_code=status.HTTP_401_UNAUTHORIZED,
             outcome="failure",
-            error_message="missing token",
+            error_message="missing ticket",
         )
-        await websocket.close(code=1008, reason="missing token")
+        await websocket.close(code=1008, reason="missing ticket")
+        return
+    claims = consume_websocket_ticket(ticket=ticket, resource_type="ssh_terminal_asset", resource_id=asset_id)
+    if claims is None:
+        _write_terminal_audit(
+            websocket=websocket,
+            user=None,
+            asset_id=asset_id,
+            request_id=request_id,
+            started_at=started_at,
+            status_code=status.HTTP_403_FORBIDDEN,
+            outcome="failure",
+            error_message="invalid ticket",
+        )
+        await websocket.close(code=1008, reason="invalid ticket")
         return
     with SessionLocal() as db:
-        user = _resolve_websocket_admin(db, token)
+        state = get_user_auth_state(db, claims.user_id)
+        if state is None or not state.is_active or state.role != UserRole.ADMIN.value:
+            user = None
+        else:
+            user = db.get(User, claims.user_id)
+        if user is None or not user.is_active or user.role != UserRole.ADMIN:
+            user = None
         if user is None:
             _write_terminal_audit(
                 websocket=websocket,
@@ -465,10 +517,44 @@ async def stream_asset_terminal(asset_id: str, websocket: WebSocket) -> None:
             return
     cols = clamp_terminal_cols(websocket.query_params.get("cols"))
     rows = clamp_terminal_rows(websocket.query_params.get("rows"))
+    try:
+        _write_terminal_audit(
+            websocket=websocket,
+            user=user,
+            asset_id=asset_id,
+            request_id=request_id,
+            started_at=started_at,
+            status_code=100,
+            outcome="preflight",
+            payload_json={"event": "terminal_session_preflight", "cols": cols, "rows": rows},
+            strict=True,
+        )
+    except StrictAuditError:
+        await websocket.close(code=1011, reason="audit unavailable")
+        return
     await websocket.accept()
     session_started = False
+    security_violation: TerminalInputViolation | None = None
+
+    async def _on_terminal_security_violation(violation: TerminalInputViolation) -> None:
+        nonlocal security_violation
+        security_violation = violation
+        await asyncio.to_thread(
+            _freeze_terminal_remediation_session,
+            asset_id=asset_id,
+            user=user,
+            violation=violation,
+        )
+
     try:
-        session_started = await run_ssh_terminal(websocket, terminal_profile, cols=cols, rows=rows)
+        session_started = await run_ssh_terminal(
+            websocket,
+            terminal_profile,
+            cols=cols,
+            rows=rows,
+            input_filter=TerminalInputFilter(),
+            on_security_violation=_on_terminal_security_violation,
+        )
     finally:
         _write_terminal_audit(
             websocket=websocket,
@@ -477,12 +563,16 @@ async def stream_asset_terminal(asset_id: str, websocket: WebSocket) -> None:
             request_id=request_id,
             started_at=started_at,
             status_code=status.HTTP_101_SWITCHING_PROTOCOLS if session_started else status.HTTP_502_BAD_GATEWAY,
-            outcome="success" if session_started else "failure",
+            outcome="security_blocked" if security_violation else ("success" if session_started else "failure"),
             payload_json={
-                "event": "terminal_session_closed" if session_started else "terminal_session_failed",
+                "event": "terminal_session_security_blocked"
+                if security_violation
+                else ("terminal_session_closed" if session_started else "terminal_session_failed"),
                 "cols": cols,
                 "rows": rows,
+                "security_violation": _terminal_violation_payload(security_violation) if security_violation else None,
             },
+            strict=True,
         )
         try:
             await websocket.close()
@@ -631,13 +721,60 @@ def _resolve_websocket_admin(db: Session, token: str) -> User | None:
         payload = decode_access_token(token)
     except SecurityError:
         return None
-    user_id = payload.get("sub")
-    if not user_id:
-        return None
-    user = db.get(User, user_id)
+    user = resolve_active_user_from_token_payload(db, payload)
     if user is None or not user.is_active or user.role != UserRole.ADMIN:
         return None
     return user
+
+
+def _freeze_terminal_remediation_session(
+    *,
+    asset_id: str,
+    user: User,
+    violation: TerminalInputViolation,
+) -> None:
+    with SessionLocal() as db:
+        session = db.scalar(
+            select(RemediationSession)
+            .where(RemediationSession.asset_id == asset_id)
+            .order_by(RemediationSession.updated_at.desc(), RemediationSession.created_at.desc())
+        )
+        if session is None:
+            return
+        summary_json = session.summary_json if isinstance(session.summary_json, dict) else {}
+        summary_json["security_freeze"] = {
+            "source": "ssh_terminal_input_filter",
+            "code": violation.code,
+            "message": violation.message,
+            "severity": violation.severity,
+            "command_preview": violation.command_preview,
+            "actor_user_id": user.id,
+            "frozen_at": datetime.now(timezone.utc).isoformat(),
+        }
+        session.summary_json = summary_json
+        session.status = "security_blocked"
+        session.updated_at = datetime.now(timezone.utc)
+        message = RemediationMessage(
+            session_id=session.id,
+            role="system",
+            message_type="security",
+            content="检测到高危 SSH 交互命令，系统已实时断开终端并冻结当前修复会话。",
+            payload_json=summary_json["security_freeze"],
+        )
+        db.add(session)
+        db.add(message)
+        db.commit()
+
+
+def _terminal_violation_payload(violation: TerminalInputViolation | None) -> dict[str, str] | None:
+    if violation is None:
+        return None
+    return {
+        "code": violation.code,
+        "message": violation.message,
+        "severity": violation.severity,
+        "command_preview": violation.command_preview,
+    }
 
 
 def _resolve_platform_url(request: Request) -> str:
@@ -662,6 +799,7 @@ def _write_terminal_audit(
     outcome: str,
     error_message: str | None = None,
     payload_json: dict[str, object] | None = None,
+    strict: bool = False,
 ) -> None:
     try:
         with SessionLocal() as db:
@@ -690,15 +828,12 @@ def _write_terminal_audit(
                 )
             )
             db.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        if strict:
+            raise StrictAuditError("审计日志写入失败，已阻断高危操作") from exc
 
 
 def _resolve_websocket_client_ip(websocket: WebSocket) -> str | None:
-    forwarded_for = str(websocket.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
-    if forwarded_for:
-        return forwarded_for[:64]
-    real_ip = str(websocket.headers.get("x-real-ip") or "").strip()
-    if real_ip:
-        return real_ip[:64]
-    return websocket.client.host[:64] if websocket.client else None
+    client_host = websocket.client.host if websocket.client else None
+    resolved = resolve_trusted_client_ip(websocket.headers, client_host)
+    return resolved[:64] if resolved else None

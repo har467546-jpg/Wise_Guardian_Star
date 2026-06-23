@@ -54,6 +54,7 @@ class TaskType(str, Enum):
     AGENT_ORCHESTRATE = "agent_orchestrate"
     SETTINGS_APPLY = "settings_apply"
     VULN_INTEL_SYNC = "vuln_intel_sync"
+    SECRET_CIPHER_MIGRATION = "secret_cipher_migration"
 
 
 class TaskExecutionStatus(str, Enum):

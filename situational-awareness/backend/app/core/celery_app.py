@@ -24,6 +24,7 @@ celery_app.conf.update(
         "app.tasks.agent_tasks",
         "app.tasks.verify_tasks",
         "app.tasks.vuln_intel_tasks",
+        "app.tasks.secret_migration_tasks",
     ],
 )
 
@@ -39,11 +40,16 @@ celery_app.conf.task_routes = {
     "app.tasks.agent_tasks.*": {"queue": "collection"},
     "app.tasks.verify_tasks.*": {"queue": "risk"},
     "app.tasks.vuln_intel_tasks.*": {"queue": "risk"},
+    "app.tasks.secret_migration_tasks.*": {"queue": "maintenance"},
 }
 
 celery_app.conf.beat_schedule = {
     "hourly-vuln-intel-sync": {
         "task": "app.tasks.vuln_intel_tasks.sync_vuln_intel",
         "schedule": crontab(minute=0),
-    }
+    },
+    "daily-secret-cipher-migration": {
+        "task": "app.tasks.secret_migration_tasks.migrate_legacy_secret_ciphertexts",
+        "schedule": crontab(hour=3, minute=30),
+    },
 }

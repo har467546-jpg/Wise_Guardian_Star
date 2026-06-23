@@ -1,6 +1,13 @@
 export type TokenResponse = {
   access_token: string;
+  refresh_token?: string | null;
   token_type: string;
+  expires_in?: number | null;
+  refresh_expires_in?: number | null;
+};
+
+export type LogoutResponse = {
+  revoked: boolean;
 };
 
 export type BootstrapStatusResponse = {

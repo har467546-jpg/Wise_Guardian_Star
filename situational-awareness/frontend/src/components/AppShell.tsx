@@ -10,7 +10,7 @@ import { Button, ConfigProvider, Spin, Tooltip } from "antd";
 import GlobalSettingsModal from "@/components/GlobalSettingsModal";
 import HaorAgentLauncher from "@/components/HaorAgentLauncher";
 import { clearStoredToken, getStoredToken, getStoredUserRole, setStoredUserRole } from "@/lib/auth";
-import { getCurrentUser } from "@/services/api";
+import { getCurrentUser, logoutCurrentSession } from "@/services/api";
 
 // --- 类型定义与配置 ---
 type RouteMeta = {
@@ -119,6 +119,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
   const currentMeta = useMemo(() => resolveRouteMeta(currentPathname), [currentPathname]);
   const isLoginPage = currentPathname === "/login";
   const handleLogout = () => {
+    void logoutCurrentSession().catch(() => undefined);
     clearStoredToken();
     router.replace("/login");
   };

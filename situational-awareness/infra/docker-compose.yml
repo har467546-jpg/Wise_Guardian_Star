@@ -60,7 +60,7 @@ services:
     environment:
       DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
       REDIS_URL: redis://redis:6379/0
-    command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report", "--loglevel=info"]
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report,maintenance", "--loglevel=info"]
 
   beat:
     build:
@@ -139,6 +139,7 @@ services:
       - "8001:8000"
     volumes:
       - ../backend:/app
+      - ../infra:/infra:ro
 
   worker-dev:
     profiles: ["dev"]
@@ -159,7 +160,7 @@ services:
       ENV: dev
       DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
       REDIS_URL: redis://redis:6379/0
-    command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report", "--loglevel=info"]
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report,maintenance", "--loglevel=info"]
     volumes:
       - ../backend:/app
 

@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Awaitable
 
 from fastapi import WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
@@ -21,6 +21,7 @@ from app.db.models.asset import Asset
 from app.db.models.credential import SSHCredential
 from app.db.models.enums import CredentialAuthType
 from app.services.remediation_service import get_manual_credential
+from app.services.terminal_input_filter import TerminalInputFilter, TerminalInputViolation
 
 DEFAULT_TERMINAL_COLS = 100
 DEFAULT_TERMINAL_ROWS = 28
@@ -71,6 +72,8 @@ async def run_ssh_terminal(
     *,
     cols: int = DEFAULT_TERMINAL_COLS,
     rows: int = DEFAULT_TERMINAL_ROWS,
+    input_filter: TerminalInputFilter | None = None,
+    on_security_violation: Callable[[TerminalInputViolation], Awaitable[None] | None] | None = None,
 ) -> bool:
     terminal_cols = clamp_terminal_cols(cols)
     terminal_rows = clamp_terminal_rows(rows)
@@ -102,7 +105,14 @@ async def run_ssh_terminal(
                 }
             )
             output_task = asyncio.create_task(_relay_process_output(websocket, process))
-            input_task = asyncio.create_task(_relay_websocket_input(websocket, process))
+            input_task = asyncio.create_task(
+                _relay_websocket_input(
+                    websocket,
+                    process,
+                    input_filter=input_filter,
+                    on_security_violation=on_security_violation,
+                )
+            )
             pending: set[asyncio.Task[None]] = set()
             try:
                 done, pending = await asyncio.wait(
@@ -149,7 +159,13 @@ async def _relay_process_output(websocket: WebSocket, process: Any) -> None:
         return
 
 
-async def _relay_websocket_input(websocket: WebSocket, process: Any) -> None:
+async def _relay_websocket_input(
+    websocket: WebSocket,
+    process: Any,
+    *,
+    input_filter: TerminalInputFilter | None = None,
+    on_security_violation: Callable[[TerminalInputViolation], Awaitable[None] | None] | None = None,
+) -> None:
     while True:
         raw_message = await websocket.receive_text()
         try:
@@ -163,6 +179,20 @@ async def _relay_websocket_input(websocket: WebSocket, process: Any) -> None:
         if message_type == "input":
             data = message.get("data")
             if isinstance(data, str) and data:
+                violation = input_filter.inspect(data) if input_filter is not None else None
+                if violation is not None:
+                    await websocket.send_json(
+                        {
+                            "type": "security_violation",
+                            "code": violation.code,
+                            "message": violation.message,
+                            "severity": violation.severity,
+                            "command_preview": violation.command_preview,
+                        }
+                    )
+                    if on_security_violation is not None:
+                        await _maybe_await(on_security_violation(violation))
+                    break
                 process.stdin.write(data)
                 drain = getattr(process.stdin, "drain", None)
                 if callable(drain):

@@ -7,7 +7,7 @@ import type { FitAddon as XTermFitAddon } from "@xterm/addon-fit";
 import type { Terminal as XTermTerminal } from "@xterm/xterm";
 import type { IDisposable } from "@xterm/xterm";
 
-import { getStoredToken } from "@/lib/auth";
+import { issueTerminalTicket } from "@/services/api";
 
 type TerminalStatus = "idle" | "connecting" | "connected" | "closed" | "error";
 
@@ -18,10 +18,10 @@ type RemoteSshTerminalProps = {
   blockedReasons: string[];
 };
 
-function buildTerminalWebSocketUrl(assetId: string, token: string, cols: number, rows: number): string {
+function buildTerminalWebSocketUrl(assetId: string, ticket: string, cols: number, rows: number): string {
   const streamPath = `/remediation/assets/${assetId}/terminal`;
   const apiBase = (process.env.NEXT_PUBLIC_API_BASE || "/api/v1").replace(/\/$/, "");
-  const query = `token=${encodeURIComponent(token)}&cols=${cols}&rows=${rows}`;
+  const query = `ticket=${encodeURIComponent(ticket)}&cols=${cols}&rows=${rows}`;
   if (apiBase.startsWith("http://") || apiBase.startsWith("https://")) {
     const parsed = new URL(apiBase);
     const protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
@@ -110,13 +110,6 @@ export default function RemoteSshTerminal({ assetId, assetLabel, enabled, blocke
     if (!container) {
       return;
     }
-    const token = getStoredToken();
-    if (!token) {
-      setLastError("登录态已失效，请重新登录");
-      setStatus("error");
-      return;
-    }
-
     const attemptId = connectAttemptRef.current + 1;
     connectAttemptRef.current = attemptId;
     setStatus("connecting");
@@ -172,14 +165,30 @@ export default function RemoteSshTerminal({ assetId, assetLabel, enabled, blocke
     terminal.open(container);
     fitAddon.fit();
     terminal.focus();
-    terminal.writeln(`\x1b[36mConnecting to ${assetLabel}...\x1b[0m`);
+    terminal.writeln(`\x1b[36mRequesting one-time terminal ticket...\x1b[0m`);
 
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
     const initialSize = { cols: terminal.cols, rows: terminal.rows };
     setTerminalSize(initialSize);
 
-    const socket = new WebSocket(buildTerminalWebSocketUrl(assetId, token, initialSize.cols, initialSize.rows));
+    let ticket = "";
+    try {
+      const ticketResponse = await issueTerminalTicket(assetId);
+      ticket = ticketResponse.ticket;
+      terminal.writeln(`\x1b[36mConnecting to ${assetLabel}...\x1b[0m`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "终端票据申请失败";
+      setLastError(message);
+      setStatus("error");
+      terminal.writeln(`\r\n\x1b[31m${message}\x1b[0m`);
+      return;
+    }
+    if (connectAttemptRef.current !== attemptId) {
+      return;
+    }
+
+    const socket = new WebSocket(buildTerminalWebSocketUrl(assetId, ticket, initialSize.cols, initialSize.rows));
     socketRef.current = socket;
     dataSubscriptionRef.current = terminal.onData((data) => {
       const activeSocket = socketRef.current;
@@ -211,6 +220,17 @@ export default function RemoteSshTerminal({ assetId, assetLabel, enabled, blocke
           setLastError(message);
           setStatus("error");
           terminal.writeln(`\r\n\x1b[31m${message}\x1b[0m`);
+          return;
+        }
+        if (payload.type === "security_violation") {
+          const message = String(payload.message || "检测到高危终端命令，SSH 会话已被阻断");
+          const commandPreview = String(payload.command_preview || "");
+          setLastError(message);
+          setStatus("error");
+          terminal.writeln(`\r\n\x1b[31m${message}\x1b[0m`);
+          if (commandPreview) {
+            terminal.writeln(`\x1b[33mBlocked: ${commandPreview}\x1b[0m`);
+          }
           return;
         }
         if (payload.type === "exit") {

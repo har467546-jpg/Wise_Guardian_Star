@@ -236,6 +236,12 @@ class HostRunnerInstallRead(BaseModel):
     stream_url: str
 
 
+class TerminalTicketRead(BaseModel):
+    ticket: str
+    expires_in_seconds: int
+    websocket_url: str
+
+
 class RemediationSessionMessageActionRead(BaseModel):
     action_id: str
     label: str

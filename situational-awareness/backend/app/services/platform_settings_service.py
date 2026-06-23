@@ -485,6 +485,8 @@ def _build_updated_env_map(payload: PlatformSettingsUpdate) -> tuple[dict[str, s
         if env_map.get(env_key) != value:
             changed_keys.append(env_key)
         env_map[env_key] = value
+    _preserve_runtime_security_secret(env_map, "SECRET_KEY", changed_keys)
+    _preserve_runtime_security_secret(env_map, "ENCRYPTION_KEY", changed_keys)
 
     incoming_api_key = updated.get("llm_api_key")
     clear_api_key = bool(updated.get("clear_llm_api_key"))
@@ -511,6 +513,15 @@ def _build_updated_env_map(payload: PlatformSettingsUpdate) -> tuple[dict[str, s
         seen.add(item)
         deduped_changed.append(item)
     return env_map, deduped_changed
+
+
+def _preserve_runtime_security_secret(env_map: dict[str, str], key: str, changed_keys: list[str]) -> None:
+    value = str(os.getenv(key) or "").strip()
+    if not value:
+        return
+    if env_map.get(key) != value:
+        changed_keys.append(key)
+    env_map[key] = value
 
 
 def _append_stage_event(

@@ -29,6 +29,7 @@ def test_ensure_runtime_encryption_key_generates_missing_value(monkeypatch, tmp_
     state = config.ensure_runtime_encryption_key()
 
     assert state.generated_encryption_key is True
+    assert state.generated_secret_key is False
     assert runtime_env.exists() is True
     content = runtime_env.read_text(encoding="utf-8")
     assert "SECRET_KEY=test-secret" in content
@@ -37,6 +38,7 @@ def test_ensure_runtime_encryption_key_generates_missing_value(monkeypatch, tmp_
     assert encryption_key
     Fernet(encryption_key.encode())
     assert marker_path.exists() is True
+    assert "generated_encryption_key=true" in marker_path.read_text(encoding="utf-8")
     assert config.consume_runtime_bootstrap_marker() is True
     assert config.consume_runtime_bootstrap_marker() is False
 
@@ -61,11 +63,40 @@ def test_ensure_runtime_encryption_key_keeps_existing_value(monkeypatch, tmp_pat
     state = config.ensure_runtime_encryption_key()
 
     assert state.generated_encryption_key is False
+    assert state.generated_secret_key is False
     assert runtime_env.read_text(encoding="utf-8").splitlines() == [
         "SECRET_KEY=test-secret",
         f"ENCRYPTION_KEY={existing_key}",
     ]
     assert marker_path.exists() is False
+
+
+def test_ensure_runtime_encryption_key_replaces_default_secret_key(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    runtime_env = tmp_path / ".env.runtime"
+    example_env = tmp_path / ".env.example"
+    lock_path = tmp_path / ".env.runtime.lock"
+    marker_path = tmp_path / ".env.runtime.bootstrap"
+    existing_key = Fernet.generate_key().decode()
+    runtime_env.write_text(
+        f"SECRET_KEY=change-this-secret\nENCRYPTION_KEY={existing_key}\n",
+        encoding="utf-8",
+    )
+    example_env.write_text("SECRET_KEY=change-this-secret\n", encoding="utf-8")
+
+    monkeypatch.setattr(config, "RUNTIME_ENV_PATH", runtime_env)
+    monkeypatch.setattr(config, "EXAMPLE_ENV_PATH", example_env)
+    monkeypatch.setattr(config, "RUNTIME_ENV_LOCK_PATH", lock_path)
+    monkeypatch.setattr(config, "RUNTIME_ENV_BOOTSTRAP_MARKER_PATH", marker_path)
+
+    state = config.ensure_runtime_encryption_key()
+
+    content = runtime_env.read_text(encoding="utf-8")
+    secret_line = next(line for line in content.splitlines() if line.startswith("SECRET_KEY="))
+    assert state.generated_secret_key is True
+    assert state.generated_encryption_key is False
+    assert secret_line != "SECRET_KEY=change-this-secret"
+    assert f"ENCRYPTION_KEY={existing_key}" in content
+    assert "generated_secret_key=true" in marker_path.read_text(encoding="utf-8")
 
 
 def test_migrate_legacy_llm_api_key_storage_promotes_plaintext(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -127,3 +158,10 @@ def test_read_runtime_env_value_prefers_process_env_over_runtime_file(monkeypatc
     assert snapshot["LLM_MODEL"] == "gpt-5.4"
     assert snapshot["LLM_BASE_URL"] == "https://gmncode.cn/v1"
     assert config.read_runtime_env_value("LLM_PROVIDER", "mock") == "custom_proxy"
+
+
+def test_settings_env_file_precedence_keeps_runtime_last() -> None:
+    env_files = tuple(str(item) for item in config.Settings.model_config["env_file"])
+
+    assert env_files[-1].endswith(".env.runtime")
+    assert env_files.index(str(config.EXAMPLE_ENV_PATH)) < env_files.index(str(config.RUNTIME_ENV_PATH))

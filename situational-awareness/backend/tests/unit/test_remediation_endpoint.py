@@ -565,7 +565,45 @@ def test_asset_runner_endpoint_corrects_stale_installing_state(tmp_path) -> None
     with SessionLocal() as db:
         task = db.get(TaskRun, task_id)
         assert task is not None
-        assert task.status == TaskExecutionStatus.FAILURE
+    assert task.status == TaskExecutionStatus.FAILURE
+
+
+def test_terminal_ticket_endpoint_issues_resource_bound_ticket(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    client = _build_client(tmp_path)
+    asset_id, _ = _create_asset_context()
+    captured: dict[str, str] = {}
+
+    def _fake_build_profile(db, requested_asset_id):  # type: ignore[no-untyped-def]
+        captured["profile_asset_id"] = requested_asset_id
+        return SimpleNamespace(asset_id=requested_asset_id)
+
+    def _fake_issue_ticket(*, user_id: str, role: str, resource_type: str, resource_id: str):  # type: ignore[no-untyped-def]
+        captured.update(
+            user_id=user_id,
+            role=role,
+            resource_type=resource_type,
+            resource_id=resource_id,
+        )
+        return SimpleNamespace(ticket="ticket-123")
+
+    monkeypatch.setattr(remediation_endpoint, "build_ssh_terminal_profile", _fake_build_profile)
+    monkeypatch.setattr(remediation_endpoint, "issue_websocket_ticket", _fake_issue_ticket)
+    monkeypatch.setattr(remediation_endpoint, "websocket_ticket_ttl_seconds", lambda: 10)
+
+    response = client.post(f"/api/v1/remediation/assets/{asset_id}/terminal/tickets")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ticket"] == "ticket-123"
+    assert body["expires_in_seconds"] == 10
+    assert body["websocket_url"] == f"/api/v1/remediation/assets/{asset_id}/terminal?ticket=ticket-123"
+    assert captured == {
+        "profile_asset_id": asset_id,
+        "user_id": "user-1",
+        "role": "admin",
+        "resource_type": "ssh_terminal_asset",
+        "resource_id": asset_id,
+    }
 
 
 def test_remediation_session_endpoint_builds_host_plan(tmp_path) -> None:

@@ -13,15 +13,24 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.v1.router import api_router
-from app.core.config import consume_runtime_bootstrap_marker, settings
+from app.core.config import RUNTIME_ENV_PATH, consume_runtime_bootstrap_marker, settings
+from app.core.crypto import validate_production_crypto_settings
 from app.core.logging import configure_logging
+from app.core.security import validate_jwt_algorithm_settings
 from app.db.base import Base
 from app.db import models as db_models  # noqa: F401
 from app.db.session import SessionLocal, engine
 from app.services.device_alert_service import device_alert_hub
 from app.services.campus_bootstrap_service import ensure_campus_auto_bootstrap
 from app.services.local_asset_service import purge_local_assets
-from app.services.audit_log_service import ensure_audit_log_storage, monotonic_ms, new_request_id, write_audit_log
+from app.services.audit_log_service import (
+    StrictAuditError,
+    ensure_audit_log_storage,
+    monotonic_ms,
+    new_request_id,
+    should_strict_audit_request,
+    write_audit_log,
+)
 from app.services.platform_log_service import disable_platform_log_capture, enable_platform_log_capture, install_platform_log_capture
 from app.services.rate_limit_service import (
     build_rate_limit_headers,
@@ -103,12 +112,14 @@ def _read_current_db_revision() -> str | None:
 
 def create_app() -> FastAPI:
     configure_logging()
+    validate_jwt_algorithm_settings()
+    validate_production_crypto_settings()
     install_platform_log_capture(service_name="backend")
     logger = logging.getLogger(__name__)
     if consume_runtime_bootstrap_marker():
         logger.info(
-            "Auto-initialized runtime ENCRYPTION_KEY at %s",
-            settings.model_config.get("env_file", ("backend/.env.runtime",))[0],
+            "Auto-initialized runtime security secrets at %s",
+            RUNTIME_ENV_PATH,
         )
 
     @asynccontextmanager
@@ -189,37 +200,63 @@ def create_app() -> FastAPI:
         rate_decision = None
         rate_limited = False
         error_message = None
+        strict_audit = should_strict_audit_request(request)
+
+        def apply_boundary_headers() -> None:
+            if response is None:
+                return
+            response.headers["X-Request-ID"] = request_id
+            if rate_decision is not None:
+                response.headers.update(build_rate_limit_headers(rate_decision))
+
         try:
+            if strict_audit:
+                write_audit_log(
+                    request=request,
+                    request_id=request_id,
+                    status_code=100,
+                    duration_ms=0,
+                    payload_json={"event": "strict_audit_preflight"},
+                    strict=True,
+                )
+
             if not should_skip_rate_limit(request):
                 rate_decision = await check_rate_limit(request)
                 if not rate_decision.allowed:
                     rate_limited = True
                     response = JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后重试"})
-                    return response
 
-            response = await call_next(request)
-            return response
+            if response is None:
+                response = await call_next(request)
+        except StrictAuditError as exc:
+            error_message = str(exc)
+            response = JSONResponse(status_code=500, content={"detail": str(exc)})
         except Exception as exc:
             error_message = str(exc)
             raise
         finally:
             status_code = response.status_code if response is not None else 500
-            if response is not None:
-                response.headers["X-Request-ID"] = request_id
-                if rate_decision is not None:
-                    response.headers.update(build_rate_limit_headers(rate_decision))
-            write_audit_log(
-                request=request,
-                request_id=request_id,
-                status_code=status_code,
-                duration_ms=monotonic_ms(started_at),
-                rate_limited=rate_limited,
-                error_message=error_message,
-                payload_json={
-                    "rate_limited": rate_limited,
-                    "rate_limit_remaining": rate_decision.remaining if rate_decision is not None else None,
-                },
-            )
+            apply_boundary_headers()
+            try:
+                write_audit_log(
+                    request=request,
+                    request_id=request_id,
+                    status_code=status_code,
+                    duration_ms=monotonic_ms(started_at),
+                    rate_limited=rate_limited,
+                    error_message=error_message,
+                    payload_json={
+                        "rate_limited": rate_limited,
+                        "rate_limit_remaining": rate_decision.remaining if rate_decision is not None else None,
+                        "strict_audit": strict_audit,
+                    },
+                    strict=strict_audit,
+                )
+            except StrictAuditError as exc:
+                error_message = str(exc)
+                response = JSONResponse(status_code=500, content={"detail": str(exc)})
+                apply_boundary_headers()
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def log_request_validation_error(request: Request, exc: RequestValidationError):

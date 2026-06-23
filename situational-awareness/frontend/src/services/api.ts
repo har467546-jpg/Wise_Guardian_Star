@@ -21,13 +21,13 @@ import {
   ProbePreset,
 } from "@/types/collection";
 import { DiscoveryJobCreateResponse, DiscoveryJobListResponse, DiscoverySchedulingOption } from "@/types/discovery";
-import { clearStoredToken, getStoredToken } from "@/lib/auth";
+import { clearStoredToken, getStoredRefreshToken, getStoredToken, setStoredAuthTokens } from "@/lib/auth";
 import { DashboardOverview } from "@/types/dashboard";
 import { ExportDataType, ExportFileFormat, ServerImportResponse } from "@/types/data-exchange";
 import { PlatformLogListResponse, PlatformLogLevel, PlatformLogServiceName, PlatformLogSourceKind } from "@/types/logs";
 import { MobileOverview } from "@/types/mobile";
 import { PlatformLiveMetrics } from "@/types/monitoring";
-import { BootstrapStatusResponse, TokenResponse, UserRead } from "@/types/auth";
+import { BootstrapStatusResponse, LogoutResponse, TokenResponse, UserRead } from "@/types/auth";
 import {
   FindingGovernance,
   FindingWaiver,
@@ -54,6 +54,7 @@ import {
   RemediationTask,
   RemediationTaskEvidence,
   RemediationWorkspace,
+  TerminalTicket,
 } from "@/types/remediation";
 import {
   TaskEventListResponse,
@@ -108,6 +109,7 @@ class ApiRequestError extends Error {}
 
 type ApiFetchOptions = {
   preferBackendDetail?: boolean;
+  skipAuthRefresh?: boolean;
 };
 
 function buildPlatformHeaders(): Record<string, string> {
@@ -380,20 +382,84 @@ function mapErrorMessage(status: number, detail: string): string {
   return "请求失败，请稍后重试";
 }
 
-export async function apiFetch<T>(path: string, init?: RequestInit, options?: ApiFetchOptions): Promise<T> {
-  const token = getStoredToken() || process.env.NEXT_PUBLIC_TOKEN || "";
-  try {
-    const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
-    const response = await fetch(`${API_BASE}${path}`, {
-      ...init,
-      headers: {
-        ...(isFormData ? {} : { "Content-Type": "application/json" }),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...buildPlatformHeaders(),
-        ...(init?.headers || {}),
-      },
-      cache: "no-store",
+let refreshPromise: Promise<string> | null = null;
+
+function shouldAttemptAuthRefresh(path: string, options?: ApiFetchOptions): boolean {
+  if (options?.skipAuthRefresh || !getStoredRefreshToken()) {
+    return false;
+  }
+  return !(
+    path.startsWith("/auth/login") ||
+    path.startsWith("/auth/bootstrap-admin") ||
+    path.startsWith("/auth/bootstrap-status") ||
+    path.startsWith("/auth/refresh") ||
+    path.startsWith("/auth/logout")
+  );
+}
+
+async function performApiFetch(path: string, init: RequestInit | undefined, token: string, withJsonContentType: boolean): Promise<Response> {
+  const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
+  return fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      ...(withJsonContentType && !isFormData ? { "Content-Type": "application/json" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...buildPlatformHeaders(),
+      ...(init?.headers || {}),
+    },
+    cache: "no-store",
+  });
+}
+
+async function refreshAccessToken(): Promise<string> {
+  const refreshToken = getStoredRefreshToken();
+  if (!refreshToken) {
+    throw new ApiRequestError("认证失败，请重新登录");
+  }
+  if (!refreshPromise) {
+    refreshPromise = (async () => {
+      const response = await performApiFetch(
+        "/auth/refresh",
+        {
+          method: "POST",
+          body: JSON.stringify({ refresh_token: refreshToken }),
+        },
+        "",
+        true,
+      );
+      if (!response.ok) {
+        const raw = await response.text();
+        const detail = extractErrorDetail(raw);
+        clearStoredToken();
+        throw new ApiRequestError(mapErrorMessage(response.status, detail));
+      }
+      const payload = (await response.json()) as TokenResponse;
+      setStoredAuthTokens(payload);
+      return payload.access_token;
+    })().finally(() => {
+      refreshPromise = null;
     });
+  }
+  return refreshPromise;
+}
+
+export async function apiFetch<T>(path: string, init?: RequestInit, options?: ApiFetchOptions): Promise<T> {
+  try {
+    const token = getStoredToken() || process.env.NEXT_PUBLIC_TOKEN || "";
+    let response = await performApiFetch(path, init, token, true);
+
+    if (response.status === 401 && shouldAttemptAuthRefresh(path, options)) {
+      try {
+        const refreshedToken = await refreshAccessToken();
+        response = await performApiFetch(path, init, refreshedToken, true);
+      } catch (error) {
+        if (error instanceof ApiRequestError) {
+          throw error;
+        }
+        clearStoredToken();
+        throw new ApiRequestError("认证失败，请重新登录");
+      }
+    }
 
     if (!response.ok) {
       const raw = await response.text();
@@ -426,17 +492,21 @@ export async function apiFetch<T>(path: string, init?: RequestInit, options?: Ap
 }
 
 async function apiFetchBlob(path: string, init?: RequestInit): Promise<{ blob: Blob; filename: string | null }> {
-  const token = getStoredToken() || process.env.NEXT_PUBLIC_TOKEN || "";
   try {
-    const response = await fetch(`${API_BASE}${path}`, {
-      ...init,
-      headers: {
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...buildPlatformHeaders(),
-        ...(init?.headers || {}),
-      },
-      cache: "no-store",
-    });
+    const token = getStoredToken() || process.env.NEXT_PUBLIC_TOKEN || "";
+    let response = await performApiFetch(path, init, token, false);
+    if (response.status === 401 && shouldAttemptAuthRefresh(path)) {
+      try {
+        const refreshedToken = await refreshAccessToken();
+        response = await performApiFetch(path, init, refreshedToken, false);
+      } catch (error) {
+        if (error instanceof ApiRequestError) {
+          throw error;
+        }
+        clearStoredToken();
+        throw new ApiRequestError("认证失败，请重新登录");
+      }
+    }
     if (!response.ok) {
       const raw = await response.text();
       const detail = extractErrorDetail(raw);
@@ -460,7 +530,7 @@ export function login(payload: { username: string; password: string }) {
   return apiFetch<TokenResponse>("/auth/login", {
     method: "POST",
     body: JSON.stringify(payload),
-  });
+  }, { skipAuthRefresh: true });
 }
 
 export function getBootstrapStatus() {
@@ -471,11 +541,18 @@ export function bootstrapAdmin(payload: { username: string; email: string; passw
   return apiFetch<TokenResponse>("/auth/bootstrap-admin", {
     method: "POST",
     body: JSON.stringify(payload),
-  });
+  }, { skipAuthRefresh: true });
 }
 
 export function getCurrentUser() {
   return apiFetch<UserRead>("/auth/me");
+}
+
+export function logoutCurrentSession() {
+  return apiFetch<LogoutResponse>("/auth/logout", {
+    method: "POST",
+    body: JSON.stringify({ refresh_token: getStoredRefreshToken() || null }),
+  }, { skipAuthRefresh: true });
 }
 
 export function listAssets(params?: {
@@ -1061,6 +1138,13 @@ export function getAssetRunner(assetId: string) {
 
 export function installAssetRunner(assetId: string) {
   return apiFetch<HostRunnerInstallResponse>(`/remediation/assets/${assetId}/runner/install`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export function issueTerminalTicket(assetId: string) {
+  return apiFetch<TerminalTicket>(`/remediation/assets/${assetId}/terminal/tickets`, {
     method: "POST",
     body: JSON.stringify({}),
   });

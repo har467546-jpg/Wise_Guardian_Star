@@ -8,6 +8,7 @@ from app.core.security import SecurityError, decode_access_token
 from app.db.models.enums import UserRole
 from app.db.models.user import User
 from app.db.session import get_db
+from app.services.user_state_cache_service import resolve_active_user_from_token_payload
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
@@ -26,8 +27,8 @@ def get_current_user(db: Session = Depends(get_db_session), token: str = Depends
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录状态已失效，请重新登录")
 
-    user = db.get(User, user_id)
-    if not user or not user.is_active:
+    user = resolve_active_user_from_token_payload(db, payload)
+    if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="当前账号不存在或已停用")
     return user
 

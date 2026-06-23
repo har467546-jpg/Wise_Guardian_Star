@@ -5,6 +5,9 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_admin_user, get_db_session
 from app.db.models.user import User
+from app.repositories.task_repo import create_task_run, update_task_run
+from app.db.models.enums import TaskType
+from app.schemas.task import TaskRunResponse
 from app.schemas.settings import (
     PlatformAIModelsRequest,
     PlatformAIModelsResponse,
@@ -15,6 +18,7 @@ from app.schemas.settings import (
     PlatformSettingsRead,
     PlatformSettingsUpdate,
 )
+from app.tasks.secret_migration_tasks import migrate_legacy_secret_ciphertexts_task
 from app.services.platform_settings_service import (
     complete_platform_settings_apply,
     get_platform_settings_read,
@@ -63,6 +67,23 @@ def list_platform_ai_model_options(
     _: User = Depends(get_admin_user),
 ) -> PlatformAIModelsResponse:
     return list_platform_ai_models(payload)
+
+
+@router.post("/security/secret-cipher-migration", response_model=TaskRunResponse, status_code=status.HTTP_202_ACCEPTED)
+def queue_secret_cipher_migration(
+    db: Session = Depends(get_db_session),
+    _: User = Depends(get_admin_user),
+) -> TaskRunResponse:
+    task_run = create_task_run(
+        db,
+        task_type=TaskType.SECRET_CIPHER_MIGRATION,
+        scope_type="system",
+        scope_id="secrets",
+        message="历史密文迁移任务已入队",
+    )
+    celery_task = migrate_legacy_secret_ciphertexts_task.delay(task_run.id)
+    update_task_run(db, task_run, celery_task_id=celery_task.id)
+    return TaskRunResponse(task_id=task_run.id, status=task_run.status)
 
 
 @router.post("/internal/tasks/{task_id}/complete")
