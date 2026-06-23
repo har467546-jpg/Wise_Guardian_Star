@@ -227,6 +227,9 @@ export type VulnIntelStatus = {
   last_synced_at: string | null;
   sources: string[];
   updated_cves: number;
+  sync_status: "fresh" | "stale" | "queued" | "schema_not_ready" | "unknown" | string;
+  sync_task_id: string | null;
+  auto_sync_queued: boolean;
 };
 
 export type VulnRuleCatalogView = "default" | "all" | "legacy";

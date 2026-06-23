@@ -9,7 +9,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
+from app.db.models.vuln_cve_intel import VulnCveIntel
 from app.db.models.vuln_rule_index import VulnRuleIndex
+from app.services import vuln_intel_service
 from app.rules.rule_store import RuleStore
 from app.services.vuln_library_service import (
     VulnLibrarySchemaNotReadyError,
@@ -203,6 +205,175 @@ def test_vuln_library_service_sync_intel_fails_fast_when_schema_not_ready(tmp_pa
 
     with pytest.raises(VulnLibrarySchemaNotReadyError, match="alembic upgrade head"):
         service.sync_intel()
+
+
+def test_vuln_library_service_sync_intel_uses_free_cve_project_sources(tmp_path, monkeypatch) -> None:
+    _reset_index_table()
+    service = _build_service(
+        tmp_path,
+        """rules:
+  - id: bash.shellshock.cve_2014_6271
+    name: Bash Shellshock
+    enabled: true
+    service: bash
+    severity: critical
+    description: Shellshock exposure
+    match:
+      version: <4.3
+    cve_ids:
+      - CVE-2014-6271
+""",
+    )
+    called_sources: list[str] = []
+
+    def _fake_cve_project(_client, cve_id):
+        called_sources.append("cve_project")
+        assert cve_id == "CVE-2014-6271"
+        return {
+            "source": "cve_project",
+            "summary": "GNU Bash trailing command execution",
+            "cvss_v3": 9.8,
+            "references": ["https://example.test/cve"],
+            "published_at": "2014-09-24T00:00:00Z",
+            "modified_at": "2014-09-25T00:00:00Z",
+        }
+
+    def _unexpected_osv(*_args, **_kwargs):
+        raise AssertionError("CVE Project 成功时不应再请求 OSV")
+
+    monkeypatch.setattr(vuln_intel_service, "_fetch_kev_catalog", lambda _client: {"CVE-2014-6271": {}})
+    monkeypatch.setattr(vuln_intel_service, "_fetch_epss_scores", lambda _client, _ids: {"CVE-2014-6271": 0.95})
+    monkeypatch.setattr(vuln_intel_service, "_fetch_cve_project_payload", _fake_cve_project)
+    monkeypatch.setattr(vuln_intel_service, "_fetch_osv_payload", _unexpected_osv)
+
+    result = service.sync_intel()
+
+    assert result.sources == ["cve_project", "osv", "kev", "epss"]
+    assert result.synced_cves == 1
+    assert result.updated_cves == 1
+    assert called_sources == ["cve_project"]
+    with SessionLocal() as db:
+        record = db.get(VulnCveIntel, "CVE-2014-6271")
+        assert record is not None
+        assert record.source == "cve_project,kev,epss"
+        assert record.cvss_v3 == 9.8
+        assert record.kev_flag is True
+        assert record.epss_score == 0.95
+        assert record.exploit_maturity == "known_exploited"
+
+
+def test_vuln_library_service_sync_intel_falls_back_to_osv_when_cve_project_fails(tmp_path, monkeypatch) -> None:
+    _reset_index_table()
+    service = _build_service(
+        tmp_path,
+        """rules:
+  - id: openssl.test.cve
+    name: OpenSSL test CVE
+    enabled: true
+    service: openssl
+    severity: high
+    description: OpenSSL exposure
+    match:
+      version: <1.0
+    cve_ids:
+      - CVE-2099-0001
+""",
+    )
+
+    def _raise_cve_project(*_args, **_kwargs):
+        raise RuntimeError("cve project unavailable")
+
+    def _fake_osv(_client, cve_id):
+        assert cve_id == "CVE-2099-0001"
+        return {
+            "source": "osv",
+            "summary": "OSV fallback payload",
+            "cvss_v3": vuln_intel_service._score_from_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            "references": ["https://example.test/osv"],
+            "published_at": "2099-01-01T00:00:00Z",
+            "modified_at": "2099-01-02T00:00:00Z",
+        }
+
+    monkeypatch.setattr(vuln_intel_service, "_fetch_kev_catalog", lambda _client: {})
+    monkeypatch.setattr(vuln_intel_service, "_fetch_epss_scores", lambda _client, _ids: {})
+    monkeypatch.setattr(vuln_intel_service, "_fetch_cve_project_payload", _raise_cve_project)
+    monkeypatch.setattr(vuln_intel_service, "_fetch_cve_list_payload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(vuln_intel_service, "_fetch_osv_payload", _fake_osv)
+
+    result = service.sync_intel()
+
+    assert result.synced_cves == 1
+    assert result.updated_cves == 1
+    assert result.stale is False
+    with SessionLocal() as db:
+        record = db.get(VulnCveIntel, "CVE-2099-0001")
+        assert record is not None
+        assert record.source == "osv"
+        assert record.cvss_v3 == 9.8
+        assert record.kev_flag is False
+        assert record.epss_score is None
+
+
+def test_vuln_library_service_sync_intel_uses_cve_list_fallback_before_osv(tmp_path, monkeypatch) -> None:
+    _reset_index_table()
+    service = _build_service(
+        tmp_path,
+        """rules:
+  - id: apache.struts.test.cve
+    name: Apache Struts test CVE
+    enabled: true
+    service: struts
+    severity: critical
+    description: Struts exposure
+    match:
+      version: <2.5
+    cve_ids:
+      - CVE-2017-5638
+""",
+    )
+
+    def _raise_cve_project(*_args, **_kwargs):
+        raise RuntimeError("cve project unavailable")
+
+    def _fake_cve_list(_client, cve_id):
+        assert cve_id == "CVE-2017-5638"
+        return {
+            "source": "cvelist",
+            "summary": "CVE list fallback payload",
+            "cvss_v3": 10.0,
+            "references": ["https://example.test/cvelist"],
+            "published_at": "2017-03-10T00:00:00Z",
+            "modified_at": "2017-03-11T00:00:00Z",
+        }
+
+    def _unexpected_osv(*_args, **_kwargs):
+        raise AssertionError("CVE list 命中时不应再请求 OSV")
+
+    monkeypatch.setattr(vuln_intel_service, "_fetch_kev_catalog", lambda _client: {})
+    monkeypatch.setattr(vuln_intel_service, "_fetch_epss_scores", lambda _client, _ids: {})
+    monkeypatch.setattr(vuln_intel_service, "_fetch_cve_project_payload", _raise_cve_project)
+    monkeypatch.setattr(vuln_intel_service, "_fetch_cve_list_payload", _fake_cve_list)
+    monkeypatch.setattr(vuln_intel_service, "_fetch_osv_payload", _unexpected_osv)
+
+    result = service.sync_intel()
+
+    assert result.synced_cves == 1
+    assert result.updated_cves == 1
+    assert result.stale is False
+    with SessionLocal() as db:
+        record = db.get(VulnCveIntel, "CVE-2017-5638")
+        assert record is not None
+        assert record.source == "cvelist"
+        assert record.cvss_v3 == 10.0
+        assert record.kev_flag is False
+        assert record.epss_score is None
+
+
+def test_cve_list_bucket_path_matches_cvelist_layout() -> None:
+    assert vuln_intel_service._cve_bucket("CVE-2017-0144") == "0xxx"
+    assert vuln_intel_service._cve_bucket("CVE-2014-6271") == "6xxx"
+    assert vuln_intel_service._cve_bucket("CVE-2021-41773") == "41xxx"
+    assert vuln_intel_service._cve_bucket("invalid") is None
 
 
 def test_vuln_library_service_indexes_active_check_metadata(tmp_path) -> None:

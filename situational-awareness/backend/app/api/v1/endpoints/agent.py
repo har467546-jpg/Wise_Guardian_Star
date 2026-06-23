@@ -28,6 +28,7 @@ from app.schemas.agent import (
     AgentTaskUpdateEvent,
     AgentUIStepRequest,
 )
+from app.services.agent.identity import AGENT_DISPLAY_NAME
 from app.services.haor_agent_service import (
     AgentServiceError,
     approve_agent_session,
@@ -54,7 +55,8 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-@router.get("/haor/summary", response_model=AgentSessionSummaryRead)
+@router.get("/xuanwu/summary", response_model=AgentSessionSummaryRead)
+@router.get("/haor/summary", response_model=AgentSessionSummaryRead, include_in_schema=False)
 def get_haor_session_summary(
     db: Session = Depends(get_db_session),
     user: User = Depends(get_current_user),
@@ -65,7 +67,8 @@ def get_haor_session_summary(
         _raise_agent_http_exception(exc, stage="get_summary", user=user)
 
 
-@router.get("/haor/session", response_model=AgentSessionRead)
+@router.get("/xuanwu/session", response_model=AgentSessionRead)
+@router.get("/haor/session", response_model=AgentSessionRead, include_in_schema=False)
 def get_haor_session(
     db: Session = Depends(get_db_session),
     user: User = Depends(get_current_user),
@@ -76,7 +79,8 @@ def get_haor_session(
         _raise_agent_http_exception(exc, stage="get_session", user=user)
 
 
-@router.get("/haor/goals", response_model=list[AgentGoalRead])
+@router.get("/xuanwu/goals", response_model=list[AgentGoalRead])
+@router.get("/haor/goals", response_model=list[AgentGoalRead], include_in_schema=False)
 def list_haor_goals(
     limit: int = 12,
     db: Session = Depends(get_db_session),
@@ -88,7 +92,8 @@ def list_haor_goals(
         _raise_agent_http_exception(exc, stage="list_goals", user=user)
 
 
-@router.get("/haor/goals/{goal_id}", response_model=AgentGoalRead)
+@router.get("/xuanwu/goals/{goal_id}", response_model=AgentGoalRead)
+@router.get("/haor/goals/{goal_id}", response_model=AgentGoalRead, include_in_schema=False)
 def get_haor_goal(
     goal_id: str,
     db: Session = Depends(get_db_session),
@@ -100,7 +105,8 @@ def get_haor_goal(
         _raise_agent_http_exception(exc, stage="get_goal", user=user)
 
 
-@router.post("/haor/goals/{goal_id}/resume", response_model=AgentSessionRead)
+@router.post("/xuanwu/goals/{goal_id}/resume", response_model=AgentSessionRead)
+@router.post("/haor/goals/{goal_id}/resume", response_model=AgentSessionRead, include_in_schema=False)
 def resume_haor_goal(
     goal_id: str,
     db: Session = Depends(get_db_session),
@@ -112,7 +118,8 @@ def resume_haor_goal(
         _raise_agent_http_exception(exc, stage="resume_goal", user=user)
 
 
-@router.post("/haor/goals/{goal_id}/cancel", response_model=AgentGoalRead)
+@router.post("/xuanwu/goals/{goal_id}/cancel", response_model=AgentGoalRead)
+@router.post("/haor/goals/{goal_id}/cancel", response_model=AgentGoalRead, include_in_schema=False)
 def cancel_haor_goal(
     goal_id: str,
     db: Session = Depends(get_db_session),
@@ -124,7 +131,8 @@ def cancel_haor_goal(
         _raise_agent_http_exception(exc, stage="cancel_goal", user=user)
 
 
-@router.post("/haor/session/reset", response_model=AgentSessionRead)
+@router.post("/xuanwu/session/reset", response_model=AgentSessionRead)
+@router.post("/haor/session/reset", response_model=AgentSessionRead, include_in_schema=False)
 def reset_haor_session(
     db: Session = Depends(get_db_session),
     user: User = Depends(get_current_user),
@@ -135,7 +143,8 @@ def reset_haor_session(
         _raise_agent_http_exception(exc, stage="reset_session", user=user)
 
 
-@router.post("/haor/session/recover", response_model=AgentSessionRead)
+@router.post("/xuanwu/session/recover", response_model=AgentSessionRead)
+@router.post("/haor/session/recover", response_model=AgentSessionRead, include_in_schema=False)
 def recover_haor_session(
     db: Session = Depends(get_db_session),
     user: User = Depends(get_current_user),
@@ -146,7 +155,8 @@ def recover_haor_session(
         _raise_agent_http_exception(exc, stage="recover_session", user=user)
 
 
-@router.post("/haor/session/messages", response_model=AgentSessionRead)
+@router.post("/xuanwu/session/messages", response_model=AgentSessionRead)
+@router.post("/haor/session/messages", response_model=AgentSessionRead, include_in_schema=False)
 def send_haor_message(
     payload: AgentMessageCreateRequest,
     request: Request,
@@ -159,7 +169,8 @@ def send_haor_message(
         _raise_agent_http_exception(exc, stage="post_message", user=user)
 
 
-@router.post("/haor/session/steps", response_model=AgentSessionRead)
+@router.post("/xuanwu/session/steps", response_model=AgentSessionRead)
+@router.post("/haor/session/steps", response_model=AgentSessionRead, include_in_schema=False)
 def step_haor_session(
     payload: AgentUIStepRequest,
     request: Request,
@@ -172,7 +183,8 @@ def step_haor_session(
         _raise_agent_http_exception(exc, stage="post_step", user=user)
 
 
-@router.post("/haor/session/approve", response_model=AgentApprovalResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/xuanwu/session/approve", response_model=AgentApprovalResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/haor/session/approve", response_model=AgentApprovalResponse, status_code=status.HTTP_202_ACCEPTED, include_in_schema=False)
 def approve_haor_session(
     payload: AgentApprovalRequest,
     request: Request,
@@ -196,7 +208,8 @@ def approve_haor_session(
     return response
 
 
-@router.post("/haor/session/interrupt", response_model=AgentSessionRead)
+@router.post("/xuanwu/session/interrupt", response_model=AgentSessionRead)
+@router.post("/haor/session/interrupt", response_model=AgentSessionRead, include_in_schema=False)
 def interrupt_haor_session(
     db: Session = Depends(get_db_session),
     user: User = Depends(get_current_user),
@@ -207,6 +220,7 @@ def interrupt_haor_session(
         _raise_agent_http_exception(exc, stage="interrupt_session", user=user)
 
 
+@router.websocket("/xuanwu/session/stream")
 @router.websocket("/haor/session/stream")
 async def stream_haor_session(websocket: WebSocket) -> None:
     with SessionLocal() as db:
@@ -462,7 +476,7 @@ async def _run_stream_turn(websocket: WebSocket, *, user_id: str, stage: str, ha
             if user is None or not user.is_active:
                 emit(
                     AgentErrorEvent(
-                        detail="当前 haor 会话用户不可用",
+                        detail=f"当前 {AGENT_DISPLAY_NAME} 会话用户不可用",
                         status_code=status.HTTP_404_NOT_FOUND,
                     ).model_dump(mode="json")
                 )

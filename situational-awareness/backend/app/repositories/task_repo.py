@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import Select, and_, delete, func, select, text
 from sqlalchemy.orm import Session
@@ -137,6 +137,62 @@ def list_task_runs(
     return items, total
 
 
+def mark_stale_active_task_runs(
+    db: Session,
+    *,
+    stale_after_hours: int,
+    message: str = "任务执行状态已过期，已自动标记失败",
+) -> int:
+    stale_hours = max(1, int(stale_after_hours or 1))
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=stale_hours)
+    stmt = (
+        select(TaskRun)
+        .where(
+            TaskRun.status.in_(list(ACTIVE_TASK_STATUSES)),
+            TaskRun.updated_at < cutoff,
+        )
+        .order_by(TaskRun.updated_at.asc(), TaskRun.created_at.asc())
+    )
+    tasks = db.scalars(stmt).all()
+    if not tasks:
+        return 0
+
+    for task in tasks:
+        original_status = getattr(task.status, "value", task.status)
+        original_updated_at = task.updated_at
+        update_task_run(
+            db,
+            task,
+            status=TaskExecutionStatus.FAILURE,
+            message=message,
+            error_json={
+                "reason": "stale_active_task",
+                "stale_after_hours": stale_hours,
+                "previous_status": str(original_status),
+                "stale_cutoff": cutoff.isoformat(),
+            },
+            commit=False,
+            refresh=False,
+        )
+        create_task_event(
+            db,
+            task_run_id=task.id,
+            event_type="failure",
+            level="error",
+            message=message,
+            progress=task.progress,
+            payload_json={
+                "reason": "stale_active_task",
+                "stale_after_hours": stale_hours,
+                "previous_status": str(original_status),
+                "last_updated_at": original_updated_at.isoformat() if original_updated_at else None,
+            },
+        )
+    db.commit()
+    return len(tasks)
+
+
 def clear_task_runs(
     db: Session,
     *,
@@ -204,6 +260,9 @@ def update_task_run(
     message: str | None = None,
     retry_count: int | None = None,
     celery_task_id: str | None = None,
+    execution_boundary: str | None = None,
+    runner_asset_id: str | None = None,
+    scanner_zone_id: str | None = None,
     result_json: dict | None = None,
     error_json: dict | None = None,
     commit: bool = True,
@@ -228,6 +287,12 @@ def update_task_run(
         task.retry_count = retry_count
     if celery_task_id is not None:
         task.celery_task_id = celery_task_id
+    if execution_boundary is not None:
+        task.execution_boundary = sanitize_text(execution_boundary, max_length=32, single_line=True)
+    if runner_asset_id is not None:
+        task.runner_asset_id = sanitize_text(runner_asset_id, max_length=36, single_line=True)
+    if scanner_zone_id is not None:
+        task.scanner_zone_id = sanitize_text(scanner_zone_id, max_length=36, single_line=True)
     if result_json is not None:
         task.result_json = sanitize_json_value(result_json)
     if error_json is not None:

@@ -20,13 +20,14 @@ import {
   AssetProbeResponse,
   ProbePreset,
 } from "@/types/collection";
-import { DiscoveryJobCreateResponse, DiscoveryJobListResponse } from "@/types/discovery";
-import { getStoredToken } from "@/lib/auth";
+import { DiscoveryJobCreateResponse, DiscoveryJobListResponse, DiscoverySchedulingOption } from "@/types/discovery";
+import { clearStoredToken, getStoredToken } from "@/lib/auth";
 import { DashboardOverview } from "@/types/dashboard";
+import { ExportDataType, ExportFileFormat, ServerImportResponse } from "@/types/data-exchange";
 import { PlatformLogListResponse, PlatformLogLevel, PlatformLogServiceName, PlatformLogSourceKind } from "@/types/logs";
 import { MobileOverview } from "@/types/mobile";
 import { PlatformLiveMetrics } from "@/types/monitoring";
-import { BootstrapStatusResponse, TokenResponse } from "@/types/auth";
+import { BootstrapStatusResponse, TokenResponse, UserRead } from "@/types/auth";
 import {
   FindingGovernance,
   FindingWaiver,
@@ -401,6 +402,9 @@ export async function apiFetch<T>(path: string, init?: RequestInit, options?: Ap
         options?.preferBackendDetail && shouldPreferBackendDetail(response.status, detail)
           ? detail
           : mapErrorMessage(response.status, detail);
+      if (response.status === 401) {
+        clearStoredToken();
+      }
       throw new ApiRequestError(errorMessage);
     }
 
@@ -468,6 +472,10 @@ export function bootstrapAdmin(payload: { username: string; email: string; passw
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export function getCurrentUser() {
+  return apiFetch<UserRead>("/auth/me");
 }
 
 export function listAssets(params?: {
@@ -613,6 +621,33 @@ export function createDiscoveryJob(payload: { cidr: string; label?: string; runn
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export function getDiscoverySchedulingOptions(cidr?: string) {
+  const query = new URLSearchParams();
+  if (cidr?.trim()) {
+    query.set("cidr", cidr.trim());
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return apiFetch<DiscoverySchedulingOption>(`/discovery/options${suffix}`);
+}
+
+export function importServersCsv(file: File) {
+  const formData = new FormData();
+  formData.append("file", file);
+  return apiFetch<ServerImportResponse>("/data-exchange/servers/import", {
+    method: "POST",
+    body: formData,
+  }, { preferBackendDetail: true });
+}
+
+export function downloadServerImportTemplate() {
+  return apiFetchBlob("/data-exchange/servers/template");
+}
+
+export function exportDataSet(dataType: ExportDataType, format: ExportFileFormat) {
+  const query = new URLSearchParams({ format });
+  return apiFetchBlob(`/data-exchange/export/${dataType}?${query.toString()}`);
 }
 
 export function listScannerZones(params?: { page?: number; pageSize?: number }) {
@@ -889,31 +924,33 @@ export function getPlatformSettings() {
   return apiFetch<PlatformSettings>("/settings");
 }
 
+const AGENT_API_PREFIX = "/agent/xuanwu";
+
 export function getHaorSession() {
-  return apiFetch<AgentSession>("/agent/haor/session", undefined, { preferBackendDetail: true });
+  return apiFetch<AgentSession>(`${AGENT_API_PREFIX}/session`, undefined, { preferBackendDetail: true });
 }
 
 export function getHaorSessionSummary() {
-  return apiFetch<AgentSessionSummary>("/agent/haor/summary", undefined, { preferBackendDetail: true });
+  return apiFetch<AgentSessionSummary>(`${AGENT_API_PREFIX}/summary`, undefined, { preferBackendDetail: true });
 }
 
 export function getHaorGoals(limit = 12) {
-  return apiFetch<AgentGoal[]>(`/agent/haor/goals?limit=${encodeURIComponent(String(limit))}`, undefined, { preferBackendDetail: true });
+  return apiFetch<AgentGoal[]>(`${AGENT_API_PREFIX}/goals?limit=${encodeURIComponent(String(limit))}`, undefined, { preferBackendDetail: true });
 }
 
 export function getHaorGoal(goalId: string) {
-  return apiFetch<AgentGoal>(`/agent/haor/goals/${encodeURIComponent(goalId)}`, undefined, { preferBackendDetail: true });
+  return apiFetch<AgentGoal>(`${AGENT_API_PREFIX}/goals/${encodeURIComponent(goalId)}`, undefined, { preferBackendDetail: true });
 }
 
 export function resumeHaorGoal(goalId: string) {
-  return apiFetch<AgentSession>(`/agent/haor/goals/${encodeURIComponent(goalId)}/resume`, {
+  return apiFetch<AgentSession>(`${AGENT_API_PREFIX}/goals/${encodeURIComponent(goalId)}/resume`, {
     method: "POST",
     body: JSON.stringify({}),
   }, { preferBackendDetail: true });
 }
 
 export function cancelHaorGoal(goalId: string) {
-  return apiFetch<AgentGoal>(`/agent/haor/goals/${encodeURIComponent(goalId)}/cancel`, {
+  return apiFetch<AgentGoal>(`${AGENT_API_PREFIX}/goals/${encodeURIComponent(goalId)}/cancel`, {
     method: "POST",
     body: JSON.stringify({}),
   }, { preferBackendDetail: true });
@@ -923,52 +960,52 @@ export function buildHaorSessionStreamUrl(token: string) {
   if (API_BASE.startsWith("http://") || API_BASE.startsWith("https://")) {
     const parsed = new URL(API_BASE);
     const protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
-    const streamPath = `${parsed.pathname.replace(/\/$/, "")}/agent/haor/session/stream`;
+    const streamPath = `${parsed.pathname.replace(/\/$/, "")}${AGENT_API_PREFIX}/session/stream`;
     return `${protocol}//${parsed.host}${streamPath}?token=${encodeURIComponent(token)}`;
   }
-  const streamPath = `${API_BASE}/agent/haor/session/stream`;
+  const streamPath = `${API_BASE}${AGENT_API_PREFIX}/session/stream`;
   const protocol = typeof window !== "undefined" && window.location.protocol === "https:" ? "wss" : "ws";
   const host = typeof window !== "undefined" ? window.location.host : "localhost";
   return `${protocol}://${host}${streamPath}?token=${encodeURIComponent(token)}`;
 }
 
 export function resetHaorSession() {
-  return apiFetch<AgentSession>("/agent/haor/session/reset", {
+  return apiFetch<AgentSession>(`${AGENT_API_PREFIX}/session/reset`, {
     method: "POST",
     body: JSON.stringify({}),
   }, { preferBackendDetail: true });
 }
 
 export function recoverHaorSession() {
-  return apiFetch<AgentSession>("/agent/haor/session/recover", {
+  return apiFetch<AgentSession>(`${AGENT_API_PREFIX}/session/recover`, {
     method: "POST",
     body: JSON.stringify({}),
   }, { preferBackendDetail: true });
 }
 
 export function postHaorMessage(payload: AgentMessageCreateRequest) {
-  return apiFetch<AgentSession>("/agent/haor/session/messages", {
+  return apiFetch<AgentSession>(`${AGENT_API_PREFIX}/session/messages`, {
     method: "POST",
     body: JSON.stringify(payload),
   }, { preferBackendDetail: true });
 }
 
 export function postHaorStep(payload: AgentUIStepRequest) {
-  return apiFetch<AgentSession>("/agent/haor/session/steps", {
+  return apiFetch<AgentSession>(`${AGENT_API_PREFIX}/session/steps`, {
     method: "POST",
     body: JSON.stringify(payload),
   }, { preferBackendDetail: true });
 }
 
 export function approveHaorSession(payload: AgentApprovalRequest = {}) {
-  return apiFetch<AgentApprovalResponse>("/agent/haor/session/approve", {
+  return apiFetch<AgentApprovalResponse>(`${AGENT_API_PREFIX}/session/approve`, {
     method: "POST",
     body: JSON.stringify(payload),
   }, { preferBackendDetail: true });
 }
 
 export function interruptHaorSession() {
-  return apiFetch<AgentSession>("/agent/haor/session/interrupt", {
+  return apiFetch<AgentSession>(`${AGENT_API_PREFIX}/session/interrupt`, {
     method: "POST",
     body: JSON.stringify({}),
   }, { preferBackendDetail: true });

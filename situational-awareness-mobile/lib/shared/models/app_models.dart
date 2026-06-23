@@ -1509,7 +1509,7 @@ extension TaskTypeModelX on TaskTypeModel {
         TaskTypeModel.credentialVerify => '凭据验证',
         TaskTypeModel.runnerInstall => 'Runner 安装',
         TaskTypeModel.remediationExecute => '修复执行',
-        TaskTypeModel.agentOrchestrate => 'HAOR 执行',
+        TaskTypeModel.agentOrchestrate => '玄武执行',
         TaskTypeModel.settingsApply => '设置下发',
         TaskTypeModel.unknown => '未知任务',
       };

@@ -258,6 +258,26 @@ def test_to_fingerprint_json_includes_backdoor_fields() -> None:
     assert payload["nmap_skip_reason"] == "backdoor_candidate_policy"
 
 
+def test_to_fingerprint_json_includes_web_exposure_metadata() -> None:
+    payload = to_fingerprint_json(
+        {
+            "port": 80,
+            "service": "http",
+            "confidence": 80,
+            "web": {
+                "scheme": "http",
+                "url": "http://app.lab/",
+                "status_code": 200,
+                "title": "App",
+                "cdn": {"detected": True, "provider_hint": "cloudflare"},
+            },
+        }
+    )
+
+    assert payload["web"]["title"] == "App"
+    assert payload["web"]["cdn"]["provider_hint"] == "cloudflare"
+
+
 def test_to_fingerprint_json_preserves_nse_results_and_summary() -> None:
     payload = to_fingerprint_json(
         {

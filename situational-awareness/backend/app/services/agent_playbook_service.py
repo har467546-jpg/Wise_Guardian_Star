@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.agent.identity import AGENT_DISPLAY_NAME
 from app.utils.sanitize import sanitize_json_value, sanitize_text
 
 CIDR_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b")
@@ -569,21 +570,21 @@ def _playbook_quick_smalltalk(content: str) -> AgentPlaybookDecision | None:
 
     if compact in _QUICK_SMALLTALK_EXACT:
         objective = "快速寒暄"
-        reply = "你好，我是 haor。你可以直接告诉我要查看、分析或处理的资产、风险、任务或网段。"
+        reply = f"你好，我是 {AGENT_DISPLAY_NAME}。你可以直接告诉我要查看、分析或处理的资产、风险、任务或网段。"
     elif compact in _QUICK_THANKS_EXACT:
         objective = "回应致谢"
         reply = "不客气。你可以继续告诉我要分析或处理的目标。"
     elif any(marker in compact for marker in _QUICK_IDENTITY_MARKERS):
-        objective = "介绍 haor"
-        reply = "我是 haor，负责在当前平台里帮助你查看态势、分析资产风险，并在确认后推进扫描、验证、Runner 安装和修复流程。"
+        objective = f"介绍 {AGENT_DISPLAY_NAME}"
+        reply = f"我是 {AGENT_DISPLAY_NAME}，负责在当前平台里帮助你查看态势、分析资产风险，并在确认后推进扫描、验证、Runner 安装和修复流程。"
     elif any(marker in compact for marker in _QUICK_CAPABILITY_MARKERS):
-        objective = "说明 haor 能力"
+        objective = f"说明 {AGENT_DISPLAY_NAME} 能力"
         reply = "我可以帮你查看态势、分析资产风险、扫描网段、验证风险、安装 Runner，并在满足条件时准备修复流程。"
     elif compact.startswith(("你好", "您好", "hi", "hello")) and any(
         marker in compact for marker in (*_QUICK_IDENTITY_MARKERS, *_QUICK_CAPABILITY_MARKERS)
     ):
-        objective = "介绍 haor"
-        reply = "你好，我是 haor。你可以让我查看态势、分析资产风险、扫描网段、验证风险、安装 Runner，或准备修复流程。"
+        objective = f"介绍 {AGENT_DISPLAY_NAME}"
+        reply = f"你好，我是 {AGENT_DISPLAY_NAME}。你可以让我查看态势、分析资产风险、扫描网段、验证风险、安装 Runner，或准备修复流程。"
     else:
         return None
 

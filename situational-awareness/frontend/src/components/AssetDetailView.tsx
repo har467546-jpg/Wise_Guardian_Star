@@ -233,6 +233,33 @@ function buildNseMetaLine(payload: Record<string, unknown>): string {
   return "";
 }
 
+function buildWebExposureView(payload: Record<string, unknown>): {
+  title: string;
+  status: string;
+  cdn: string;
+  url: string;
+  server: string;
+  lines: string[];
+} {
+  const web = toRecord(payload.web);
+  const cdn = toRecord(web.cdn);
+  const status = typeof web.status_code === "number" ? String(web.status_code) : "";
+  const title = normalizeDisplayText(web.title);
+  const provider = normalizeDisplayText(cdn.provider_hint);
+  const cdnDetected = Boolean(cdn.detected);
+  const cdnLabel = cdnDetected ? provider || "已检测" : "";
+  const url = normalizeDisplayText(web.url);
+  const server = normalizeDisplayText(web.server);
+  const lines = [
+    url ? `URL：${url}` : "",
+    status ? `状态码：${status}` : "",
+    title ? `标题：${title}` : "",
+    server ? `Server：${server}` : "",
+    cdnDetected ? `CDN：${cdnLabel}` : "",
+  ].filter(Boolean);
+  return { title, status, cdn: cdnLabel, url, server, lines };
+}
+
 function getActiveDetectorLabel(detector: unknown): string {
   const key = typeof detector === "string" ? detector.trim() : "";
   if (!key) {
@@ -434,6 +461,29 @@ export default function AssetDetailView({ assetId }: { assetId: string }) {
                 <OverflowText value={serviceVersion} block secondary />
               ) : null}
             </div>
+          );
+        },
+      },
+      {
+        title: "Web 暴露面",
+        key: "web_exposure",
+        width: isCompactLayout ? 150 : 180,
+        render: (_: unknown, record: Asset["ports"][number]) => {
+          const payload = toRecord(record.fingerprint_json);
+          const web = buildWebExposureView(payload);
+          if (!web.lines.length) {
+            return <OverflowText value="无" block secondary tooltip={false} />;
+          }
+          return (
+            <Tooltip title={web.lines.join("\n")}>
+              <div className="ui-cell-stack">
+                <div className="ui-chip-row">
+                  {web.status ? <Tag color="green">{web.status}</Tag> : null}
+                  {web.cdn ? <Tag color="purple">CDN</Tag> : null}
+                </div>
+                <OverflowText value={web.title || web.url || web.server || "Web 服务"} block secondary />
+              </div>
+            </Tooltip>
           );
         },
       },

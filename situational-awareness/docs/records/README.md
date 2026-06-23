@@ -5,6 +5,8 @@
 - 这些文档保留过程证据和上下文，不作为标准研发文档主入口。
 
 ## 当前记录
+- [update-log.md](update-log.md)
+  - 项目每次功能、修复、验证相关更新的持续记录。
 - [frontend-migration.md](frontend-migration.md)
   - 前端迁移策略、差异与已迁移内容记录。
 - [frontend-smoke-validation.md](frontend-smoke-validation.md)

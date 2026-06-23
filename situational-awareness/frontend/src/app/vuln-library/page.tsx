@@ -395,6 +395,9 @@ function getIntelState(
   if (!intelStatus) {
     return { label: "未知", tone: "neutral" };
   }
+  if (intelStatus.sync_status === "queued") {
+    return { label: "自动同步中", tone: "neutral" };
+  }
   if (!intelStatus.last_synced_at) {
     return { label: "未同步", tone: "warning" };
   }
@@ -538,6 +541,35 @@ export default function VulnLibraryPage() {
       cancelled = true;
     };
   }, [page, pageSize, deferredKeyword, serviceFilter, severityFilter, enabledFilter, catalogView, reloadToken]);
+
+  useEffect(() => {
+    if (intelStatus?.sync_status !== "queued") {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      getVulnIntelStatus()
+        .then((response) => {
+          if (cancelled) {
+            return;
+          }
+          setIntelStatus(response);
+          setIntelStatusError(null);
+          if (response.sync_status !== "queued" && !response.stale) {
+            setReloadToken((current) => current + 1);
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            setIntelStatusError((err as Error).message);
+          }
+        });
+    }, 8000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [intelStatus?.sync_status]);
 
   const serviceOptions = useMemo(
     () =>
@@ -814,12 +846,16 @@ export default function VulnLibraryPage() {
       const response = await syncVulnIntel();
       setIntelStatus(response);
       setIntelStatusError(null);
-      message.success(
-        response.updated_cves
-          ? `情报同步完成，本轮更新 ${response.updated_cves} 个 CVE`
-          : "情报同步完成，本轮无新增更新",
-      );
-      refreshPage();
+      if (response.sync_status === "queued") {
+        message.success("情报同步已转入后台，完成后页面会自动刷新");
+      } else {
+        message.success(
+          response.updated_cves
+            ? `情报同步完成，本轮更新 ${response.updated_cves} 个 CVE`
+            : "情报同步完成，本轮无新增更新",
+        );
+        refreshPage();
+      }
     } catch (err) {
       const errorMessage = (err as Error).message;
       setIntelSyncError(errorMessage);
@@ -942,10 +978,12 @@ export default function VulnLibraryPage() {
       ) : null}
       {status?.schema_ready && intelStatus ? (
         <Alert
-          type={!intelStatus.last_synced_at || intelStatus.stale_count > 0 ? "warning" : "info"}
+          type={intelStatus.sync_status === "queued" ? "info" : !intelStatus.last_synced_at || intelStatus.stale_count > 0 ? "warning" : "info"}
           showIcon
           message={
-            !intelStatus.last_synced_at
+            intelStatus.sync_status === "queued"
+              ? `漏洞情报正在后台同步，当前跟踪 ${intelStatus.tracked_rule_cves} 个规则 CVE`
+              : !intelStatus.last_synced_at
               ? `漏洞情报尚未同步，当前跟踪 ${intelStatus.tracked_rule_cves} 个规则 CVE`
               : intelStatus.stale_count > 0
                 ? `漏洞情报已同步，但仍有 ${intelStatus.stale_count} 条缺失或过期关联`
@@ -1033,7 +1071,7 @@ export default function VulnLibraryPage() {
               ) : null}
               {isAdmin ? (
                 <Button disabled={status ? !status.schema_ready : true} loading={intelSyncLoading} onClick={() => void handleSyncIntel()}>
-                  同步情报
+                  立即刷新情报
                 </Button>
               ) : null}
               {isAdmin ? (

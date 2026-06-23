@@ -390,10 +390,44 @@ def test_probe_open_services_uses_only_open_ports_for_followup(monkeypatch) -> N
             captured["nse_targets"] = targets
             return SimpleNamespace(by_host={}, error_count=0)
 
+    class _FakeWebExposureScanner:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def enrich_hosts(self, hosts):
+            captured["web_hosts"] = hosts
+            return {
+                "192.168.10.88": {
+                    80: {
+                        "port": 80,
+                        "scheme": "http",
+                        "url": "http://target-host/",
+                        "status_code": 200,
+                        "title": "Target Portal",
+                        "server": "nginx/1.24.0",
+                        "hostname_hint": "target-host",
+                        "dns": {
+                            "hostname": "target-host",
+                            "cnames": ["target-host.cdn.cloudflare.net"],
+                            "addresses": ["192.168.10.88"],
+                            "address_count": 1,
+                        },
+                        "cdn": {
+                            "detected": True,
+                            "provider_hint": "cloudflare",
+                            "matched_keyword": "cloudflare",
+                            "reason": "cname_keyword",
+                        },
+                        "evidence": ["web_probe", "http_status=200", "cdn=cloudflare"],
+                    }
+                }
+            }
+
     monkeypatch.setattr(discovery_tasks, "SessionLocal", _FakeSessionLocal(db))
     monkeypatch.setattr(discovery_tasks, "AsyncNetworkDiscovery", _FakeScanner)
     monkeypatch.setattr(discovery_tasks, "AsyncNmapServiceEnricher", _FakeNmapEnricher)
     monkeypatch.setattr(discovery_tasks, "AsyncNmapScriptEnricher", _FakeNseEnricher)
+    monkeypatch.setattr(discovery_tasks, "AsyncWebExposureScanner", _FakeWebExposureScanner)
     monkeypatch.setattr(
         discovery_tasks,
         "select_nse_scripts_for_record",
@@ -407,7 +441,16 @@ def test_probe_open_services_uses_only_open_ports_for_followup(monkeypatch) -> N
     assert captured["probe_hosts"] == [{"ip": "192.168.10.88", "hostname": "target-host", "ports": [22, 80], "services": []}]
     assert captured["nmap_targets"] == [{"ip": "192.168.10.88", "ports": [80]}]
     assert captured["nse_targets"] == [{"ip": "192.168.10.88", "ports": [22, 80], "scripts": ["http-title", "ssh2-enum-algos"], "port_scripts": {22: ["ssh2-enum-algos"], 80: ["http-title"]}}]
+    assert captured["web_hosts"][0]["services"]
     assert job.summary_json["hosts"][0]["services"]
+    http_service = next(item for item in job.summary_json["hosts"][0]["services"] if item["port"] == 80)
+    assert http_service["web"]["title"] == "Target Portal"
+    assert http_service["web"]["cdn"]["provider_hint"] == "cloudflare"
+    http_asset_port = next(item for item in asset.ports if item.port == 80)
+    assert http_asset_port.fingerprint_json["web"]["title"] == "Target Portal"
+    assert http_asset_port.fingerprint_json["web"]["cdn"]["detected"] is True
+    assert job.summary_json["service_enrichment_stats"]["web_exposure_enriched_count"] == 1
+    assert job.summary_json["service_enrichment_stats"]["web_exposure_cdn_count"] == 1
     assert job.summary_json["service_enrichment_stats"]["network_initial_snapshot_count"] == 1
 
 
@@ -466,10 +509,18 @@ def test_probe_open_services_labels_gateway_dns_assets_as_network_infrastructure
         async def enrich_hosts(self, targets):
             return SimpleNamespace(by_host={}, error_count=0)
 
+    class _FakeWebExposureScanner:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def enrich_hosts(self, hosts):
+            return {}
+
     monkeypatch.setattr(discovery_tasks, "SessionLocal", _FakeSessionLocal(db))
     monkeypatch.setattr(discovery_tasks, "AsyncNetworkDiscovery", _FakeScanner)
     monkeypatch.setattr(discovery_tasks, "AsyncNmapServiceEnricher", _FakeNmapEnricher)
     monkeypatch.setattr(discovery_tasks, "AsyncNmapScriptEnricher", _FakeNseEnricher)
+    monkeypatch.setattr(discovery_tasks, "AsyncWebExposureScanner", _FakeWebExposureScanner)
     monkeypatch.setattr(discovery_tasks, "select_nse_scripts_for_record", lambda record, include_vuln=True: [])
 
     result = discovery_tasks.probe_open_services("job-probe-gateway-1")
@@ -503,6 +554,26 @@ def test_infer_discovery_asset_labels_does_not_mark_mixed_workload_host_as_infra
     assert labels["device_role"] is None
     assert labels["is_infrastructure_device"] is False
     assert labels["device_assessment_json"]["asset_category"] == "general_endpoint"
+
+
+def test_refresh_hostnames_from_web_exposure_metadata() -> None:
+    hosts = [
+        {
+            "ip": "192.168.10.88",
+            "hostname": None,
+            "services": [
+                {
+                    "port": 443,
+                    "service": "https",
+                    "web": {"hostname_hint": "app.lab.local"},
+                }
+            ],
+        }
+    ]
+
+    discovery_tasks._refresh_hostnames_from_services(hosts)
+
+    assert hosts[0]["hostname"] == "app.lab.local"
 
 
 def test_apply_network_initial_asset_status_marks_partial_snapshot_online() -> None:

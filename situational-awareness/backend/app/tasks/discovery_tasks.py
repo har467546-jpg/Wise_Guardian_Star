@@ -31,6 +31,11 @@ from app.scanner.service_enrichment import (
     to_fingerprint_json,
 )
 from app.scanner.service_fingerprint import DEFAULT_SERVICE_BY_PORT, infer_service_aliases
+from app.scanner.web_exposure import (
+    AsyncWebExposureScanner,
+    WebExposureConfig,
+    merge_web_exposure_into_services,
+)
 from app.services.device_assessment_service import (
     apply_device_assessment_to_asset,
     build_discovery_host_device_assessment,
@@ -390,6 +395,8 @@ def probe_open_services(job_id: str) -> str:
             nse_timeout_count = 0
 
         nse_hit_count = _apply_nse_results(merged_hosts, nse_enrichment_map, requested_nse_scripts)
+        web_exposure_enriched_count, web_exposure_cdn_count, web_exposure_error_count = _enrich_web_exposure(merged_hosts)
+        _refresh_hostnames_from_services(merged_hosts)
 
         summary = dict(job.summary_json or {})
         summary["host_count"] = len(merged_hosts)
@@ -427,6 +434,9 @@ def probe_open_services(job_id: str) -> str:
             "nse_skipped_count": nse_skipped_count,
             "nse_error_count": nse_error_count,
             "network_initial_snapshot_count": 0,
+            "web_exposure_enriched_count": web_exposure_enriched_count,
+            "web_exposure_cdn_count": web_exposure_cdn_count,
+            "web_exposure_error_count": web_exposure_error_count,
         }
         job.summary_json = sanitize_json_value(summary)
 
@@ -964,8 +974,56 @@ def _apply_nse_results(
     return nse_hit_count
 
 
+def _enrich_web_exposure(hosts: list[dict[str, Any]]) -> tuple[int, int, int]:
+    try:
+        scanner = AsyncWebExposureScanner(
+            WebExposureConfig(
+                connect_timeout=max(0.1, float(getattr(settings, "DISCOVERY_WEB_PROBE_CONNECT_TIMEOUT_SECONDS", 1.5))),
+                read_timeout=max(0.1, float(getattr(settings, "DISCOVERY_WEB_PROBE_READ_TIMEOUT_SECONDS", 2.0))),
+                host_concurrency=max(1, int(getattr(settings, "DISCOVERY_WEB_PROBE_HOST_CONCURRENCY", 16))),
+            )
+        )
+        exposure_map = asyncio.run(scanner.enrich_hosts(hosts))
+    except Exception as exc:  # pragma: no cover - runtime dependent
+        logger.warning("web exposure enrichment failed: %s", exc)
+        return 0, 0, 1
+
+    enriched_count = merge_web_exposure_into_services(hosts, exposure_map)
+    cdn_count = 0
+    error_count = 0
+    for by_port in exposure_map.values():
+        for web in by_port.values():
+            if not isinstance(web, dict):
+                continue
+            cdn = web.get("cdn")
+            if isinstance(cdn, dict) and cdn.get("detected") is True:
+                cdn_count += 1
+            if web.get("error"):
+                error_count += 1
+    return enriched_count, cdn_count, error_count
+
+
+def _refresh_hostnames_from_services(hosts: list[dict[str, Any]]) -> None:
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        if _normalize_hostname(host.get("hostname")):
+            continue
+        services = host.get("services")
+        if not isinstance(services, list):
+            continue
+        hostname = _pick_hostname_from_services([item for item in services if isinstance(item, dict)])
+        if hostname:
+            host["hostname"] = hostname
+
+
 def _pick_hostname_from_services(services: list[dict[str, Any]]) -> str | None:
     for item in services:
+        web = item.get("web")
+        if isinstance(web, dict):
+            hint = web.get("hostname_hint")
+            if isinstance(hint, str) and hint.strip():
+                return hint.strip()
         hint = item.get("hostname_hint")
         if isinstance(hint, str) and hint.strip():
             return hint.strip()

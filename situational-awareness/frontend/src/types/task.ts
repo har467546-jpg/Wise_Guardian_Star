@@ -3,10 +3,12 @@ export type TaskType =
   | "info_collect"
   | "risk_verify"
   | "report_generate"
+  | "credential_verify"
   | "runner_install"
   | "remediation_execute"
   | "agent_orchestrate"
-  | "settings_apply";
+  | "settings_apply"
+  | "vuln_intel_sync";
 export type TaskStatus = "pending" | "running" | "retry" | "success" | "failure" | "canceled";
 export type TaskLogLevel = "info" | "warning" | "error";
 

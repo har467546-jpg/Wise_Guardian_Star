@@ -155,6 +155,7 @@ const UI_STEP_ACK_TIMEOUT_MS = 8_000;
 const STREAM_FRAME_CONNECT_TIMEOUT_MS = 1_200;
 const UI_STEP_FAIL_OPEN_TEXT = "上次页面动作未收到继续结果，已结束等待。你可以继续提问、重试，或新开会话。";
 const HAOR_SUMMARY_POLL_INTERVAL_MS = 15_000;
+const AGENT_DISPLAY_NAME = "玄武";
 const SIDEBAR_IDLE_STAGE_TEXT = "空闲";
 const SIDEBAR_NO_BLOCKER_TEXT = "当前无阻塞";
 const EMPTY_HAOR_SUMMARY: AgentSessionSummary = {
@@ -228,7 +229,7 @@ function ChatBubble({ actions, badge, content, metaNote, role, sender, stateTone
 
   return (
     <article className={`haor-chat-row haor-chat-row-${role}`}>
-      <div className={`haor-chat-avatar haor-chat-avatar-${role}`}>{role === "user" ? "你" : "H"}</div>
+      <div className={`haor-chat-avatar haor-chat-avatar-${role}`}>{role === "user" ? "你" : AGENT_DISPLAY_NAME.slice(0, 1)}</div>
       <div className="haor-chat-stack">
         <div className="haor-chat-sender">{sender}</div>
         <div className={bubbleClasses.join(" ")}>
@@ -785,7 +786,7 @@ function buildSecureStepBrowserContext(context: AgentPageContext): AgentBrowserC
     visible_actions: [],
     semantic_page_context: {
       page_kind: "secure_input",
-      summary: "haor ssh secure input",
+      summary: `${AGENT_DISPLAY_NAME} SSH 安全输入`,
       primary_entity: context.asset_id ? { kind: "asset", id: context.asset_id } : {},
       selected_rows: [],
     },
@@ -797,7 +798,7 @@ function buildSecureStepBrowserContext(context: AgentPageContext): AgentBrowserC
       selected_rows: [],
       active_dialog: {},
       has_modal_or_drawer: false,
-      summary: "haor ssh secure input",
+      summary: `${AGENT_DISPLAY_NAME} SSH 安全输入`,
     },
     dom_snapshot: [],
   };
@@ -1497,25 +1498,25 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     }
     if (connectionState === "connecting") {
       return {
-        text: "haor 正在连接流式会话通道，恢复后会继续接收动作和回复。",
+        text: `${AGENT_DISPLAY_NAME} 正在连接流式会话通道，恢复后会继续接收动作和回复。`,
         tone: "muted" as const,
       };
     }
     if (snapshotUiInProgress || stepping) {
       return {
-        text: "haor 正在执行当前页面动作，并会继续把结果沉淀到聊天记录里。",
+        text: `${AGENT_DISPLAY_NAME} 正在执行当前页面动作，并会继续把结果沉淀到聊天记录里。`,
         tone: "muted" as const,
       };
     }
     if (sessionPhase === "awaiting_secure_input") {
       return {
-        text: "当前正在等待通过安全弹层填写 SSH 敏感信息。保存并验证 SSH 后，Haor 会自动续接原目标；若仍缺 Runner 或其他条件，也会继续明确提示。",
+        text: `当前正在等待通过安全弹层填写 SSH 敏感信息。保存并验证 SSH 后，${AGENT_DISPLAY_NAME} 会自动续接原目标；若仍缺 Runner 或其他条件，也会继续明确提示。`,
         tone: "warning" as const,
       };
     }
     if (snapshotAwaitingMessage || sending) {
       return {
-        text: "haor 正在处理上一轮消息，刷新后也会按当前会话快照继续恢复输入状态。",
+        text: `${AGENT_DISPLAY_NAME} 正在处理上一轮消息，刷新后也会按当前会话快照继续恢复输入状态。`,
         tone: "muted" as const,
       };
     }
@@ -1574,9 +1575,9 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
   const composerHint = runtimeInputLocked
     ? (
         snapshotAwaitingMessage || sending
-          ? "haor 正在生成回复…"
+          ? `${AGENT_DISPLAY_NAME} 正在生成回复…`
           : snapshotUiInProgress || stepping
-            ? "haor 正在继续处理当前请求…"
+            ? `${AGENT_DISPLAY_NAME} 正在继续处理当前请求…`
             : sessionPhase === "awaiting_secure_input"
               ? "请先在安全弹层中填写 SSH 敏感信息"
             : sessionPhase === "waiting_approval"
@@ -1779,7 +1780,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     item: Omit<StreamFeedItem, "time" | "sender" | "role"> & { time?: string; sender?: string; role?: "assistant" },
   ) => {
     const nextItem: StreamFeedItem = {
-      sender: item.sender || "haor",
+      sender: item.sender || AGENT_DISPLAY_NAME,
       role: "assistant",
       time: item.time || new Date().toISOString(),
       ...item,
@@ -2173,7 +2174,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       setSessionInitialized(true);
     } catch (error) {
       if (!silent) {
-        setErrorText(error instanceof Error ? error.message : "无法恢复 haor 会话");
+        setErrorText(error instanceof Error ? error.message : `无法恢复 ${AGENT_DISPLAY_NAME} 会话`);
       }
     } finally {
       if (!silent) {
@@ -2294,11 +2295,11 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
           const payload = JSON.parse(rawEvent.data) as AgentStreamServerEnvelope;
           handleStreamEvent(payload);
         } catch {
-          setStreamError("haor 流式数据解析失败");
+          setStreamError(`${AGENT_DISPLAY_NAME} 流式数据解析失败`);
         }
       };
       socket.onerror = () => {
-        setStreamError("haor 流式连接异常，正在尝试恢复");
+        setStreamError(`${AGENT_DISPLAY_NAME} 流式连接异常，正在尝试恢复`);
       };
       socket.onclose = () => {
         const hasPendingMessageTurn = Boolean(pendingMessageTurnRef.current);
@@ -2331,7 +2332,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
           setConnectionState("disconnected");
           return;
         }
-        setStreamError("haor 流式连接已断开，正在尝试恢复");
+        setStreamError(`${AGENT_DISPLAY_NAME} 流式连接已断开，正在尝试恢复`);
         setConnectionState("connecting");
         const nextAttempt = reconnectAttemptsRef.current + 1;
         reconnectAttemptsRef.current = nextAttempt;
@@ -2688,7 +2689,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       resetPendingMessageTurnState();
       return true;
     } catch (error) {
-      const text = error instanceof Error ? error.message : "haor 消息发送失败";
+      const text = error instanceof Error ? error.message : `${AGENT_DISPLAY_NAME} 消息发送失败`;
       resetPendingMessageTurnState();
       setPendingUserMessages((current) =>
         current.map((item) => (item.clientMessageId === clientMessageId ? { ...item, status: "failed" } : item)),
@@ -2854,13 +2855,13 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       usedStream = await sendStreamFrameWithWarmup({ type: "approve_plan" });
       if (!usedStream) {
         const result = await approveHaorSession({});
-        message.success(`haor 编排任务已提交：${result.task_id}`);
+        message.success(`${AGENT_DISPLAY_NAME} 编排任务已提交：${result.task_id}`);
         await loadSession(true);
         await loadTask(result.task_id, true);
       }
       setErrorText(null);
     } catch (error) {
-      const text = error instanceof Error ? error.message : "haor 计划提交失败";
+      const text = error instanceof Error ? error.message : `${AGENT_DISPLAY_NAME} 计划提交失败`;
       setErrorText(text);
       message.error(text);
     } finally {
@@ -2894,7 +2895,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       setSummary(deriveSessionSummary(result));
       message.success("会话状态已恢复");
     } catch (error) {
-      const text = error instanceof Error ? error.message : "haor 会话恢复失败";
+      const text = error instanceof Error ? error.message : `${AGENT_DISPLAY_NAME} 会话恢复失败`;
       setErrorText(text);
       message.error(text);
     } finally {
@@ -2919,7 +2920,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
       setErrorText(null);
       message.success("任务已中断");
     } catch (error) {
-      const text = error instanceof Error ? error.message : "haor 编排中断失败";
+      const text = error instanceof Error ? error.message : `${AGENT_DISPLAY_NAME} 编排中断失败`;
       setErrorText(text);
       message.error(text);
     } finally {
@@ -3240,18 +3241,18 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
     <>
       <div className={`haor-fab-shell ${open ? "haor-fab-shell-open" : ""} ${hasAttention ? "haor-fab-shell-attention" : ""}`}>
         <Badge dot={hasAttention} color="#dc2626" offset={[-8, 8]}>
-          <button type="button" className="haor-fab-button" onClick={() => setOpen(true)} aria-label="打开 haor 智能体">
+          <button type="button" className="haor-fab-button" onClick={() => setOpen(true)} aria-label={`打开 ${AGENT_DISPLAY_NAME} 智能体`}>
             <span className="haor-fab-ball">
               <span className="haor-fab-core" />
             </span>
-            <span className="haor-fab-label">haor</span>
+            <span className="haor-fab-label">{AGENT_DISPLAY_NAME}</span>
           </button>
         </Badge>
       </div>
 
       {open ? (
-        <div className="haor-chat-shell" role="dialog" aria-modal="true" aria-label="haor 聊天助手">
-          <button type="button" className="haor-chat-backdrop" onClick={() => setOpen(false)} aria-label="关闭 haor 聊天窗口" />
+        <div className="haor-chat-shell" role="dialog" aria-modal="true" aria-label={`${AGENT_DISPLAY_NAME} 聊天助手`}>
+          <button type="button" className="haor-chat-backdrop" onClick={() => setOpen(false)} aria-label={`关闭 ${AGENT_DISPLAY_NAME} 聊天窗口`} />
 
           <Modal
             open={open && maintenanceWindowModalOpen && Boolean(latestMaintenanceWindowPrompt)}
@@ -3276,7 +3277,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                 type="info"
                 showIcon
                 message="当前自动修复需要维护窗口"
-                description="当前阶段包含高风险步骤。填写 maintenance_window_id 后，Haor 会继续推进当前自动修复；如果仍有 Runner 或渲染类阻塞，会继续明确提示。"
+                description={`当前阶段包含高风险步骤。填写 maintenance_window_id 后，${AGENT_DISPLAY_NAME} 会继续推进当前自动修复；如果仍有 Runner 或渲染类阻塞，会继续明确提示。`}
               />
               {maintenanceWindowBlocked ? (
                 <Alert
@@ -3353,8 +3354,8 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                   message={secureAssetCount > 1 ? `目标资产：共 ${secureAssetCount} 台` : `目标资产：${secureCurrentAssetLabel || "当前资产"}`}
                   description={
                     secureAssetCount > 1
-                      ? "聊天中只保留非敏感信息；密码、私钥与 sudo 密码只会在这个安全弹层中输入。保存并验证 SSH 后，Haor 会自动续接原目标；若仍缺 Runner 或其他条件，会继续明确提示。"
-                      : "聊天中只保留认证方式、用户名与验证结果；密码、私钥与 sudo 密码不会写入会话记录。保存并验证 SSH 后，Haor 会自动续接修复；若仍缺 Runner 或其他条件，会继续明确提示。"
+                      ? `聊天中只保留非敏感信息；密码、私钥与 sudo 密码只会在这个安全弹层中输入。保存并验证 SSH 后，${AGENT_DISPLAY_NAME} 会自动续接原目标；若仍缺 Runner 或其他条件，会继续明确提示。`
+                      : `聊天中只保留认证方式、用户名与验证结果；密码、私钥与 sudo 密码不会写入会话记录。保存并验证 SSH 后，${AGENT_DISPLAY_NAME} 会自动续接修复；若仍缺 Runner 或其他条件，会继续明确提示。`
                   }
                 />
                 {pendingSecureInput.blocker_summary ? (
@@ -3435,12 +3436,12 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
 
           <section className="haor-chat-window" data-haor-agent-root="true">
             <div className="haor-chat-body">
-              <aside className="haor-chat-sidebar" aria-label="haor 会话侧栏">
+              <aside className="haor-chat-sidebar" aria-label={`${AGENT_DISPLAY_NAME} 会话侧栏`}>
                 <div className="haor-chat-sidebar-top">
                   <div className="haor-chat-header-copy">
                     <span className="haor-chat-kicker">Chat Assistant</span>
                     <div className="haor-chat-title-row">
-                      <h2 className="haor-chat-title">haor</h2>
+                      <h2 className="haor-chat-title">{AGENT_DISPLAY_NAME}</h2>
                       <span className={`haor-chat-status haor-chat-status-${normalizeStatus(session?.status) || "active"}`}>
                         {statusLabel(session?.status)}
                       </span>
@@ -3450,7 +3451,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                 </div>
 
                 <div className="haor-chat-sidebar-scroll">
-                  <section className="haor-chat-sidebar-section haor-chat-state-panel" aria-label="haor 关键信息">
+                  <section className="haor-chat-sidebar-section haor-chat-state-panel" aria-label={`${AGENT_DISPLAY_NAME} 关键信息`}>
                     <div className="haor-chat-sidebar-heading">
                       <span className="haor-chat-sidebar-kicker">Overview</span>
                       <strong className="haor-chat-sidebar-title">关键信息</strong>
@@ -3482,7 +3483,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                 </div>
               </aside>
 
-              <section className="haor-chat-main" aria-label="haor 聊天主区">
+              <section className="haor-chat-main" aria-label={`${AGENT_DISPLAY_NAME} 聊天主区`}>
                 <header className="haor-chat-main-header">
                   <div className="haor-chat-main-header-copy">
                     <span className="haor-chat-main-kicker">Conversation</span>
@@ -3528,14 +3529,14 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                   {loading && !session?.messages?.length ? (
                     <div className="haor-chat-empty">
                       <strong>正在恢复会话</strong>
-                      <span>haor 正在同步最近的聊天记录和任务状态。</span>
+                      <span>{AGENT_DISPLAY_NAME} 正在同步最近的聊天记录和任务状态。</span>
                     </div>
                   ) : null}
 
                   {!loading && !session?.messages?.length && !proposedActions.length && !task ? (
                     <div className="haor-chat-empty">
                       <strong>开始聊天</strong>
-                      <span>直接像聊天一样提问，或告诉 haor 你想在站内执行什么操作。</span>
+                      <span>直接像聊天一样提问，或告诉 {AGENT_DISPLAY_NAME} 你想在站内执行什么操作。</span>
                     </div>
                   ) : null}
 
@@ -3595,7 +3596,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                         badge={messageBadgeText(item)}
                         content={content}
                         role={item.role === "user" ? "user" : "assistant"}
-                        sender={item.role === "user" ? "你" : "haor"}
+                        sender={item.role === "user" ? "你" : AGENT_DISPLAY_NAME}
                         time={formatChatTime(item.created_at)}
                         tone={messageTone(item)}
                       />
@@ -3631,7 +3632,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                       badge={assistantPlaceholder.badge}
                       content={assistantPlaceholder.content}
                       role="assistant"
-                      sender="haor"
+                      sender={AGENT_DISPLAY_NAME}
                       time={formatChatTime(new Date().toISOString())}
                       tone={assistantPlaceholder.tone}
                     />
@@ -3642,7 +3643,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                       badge={draftAssistantMessage.messageType === "clarifying" ? "追问" : null}
                       content={draftAssistantMessage.content}
                       role="assistant"
-                      sender="haor"
+                      sender={AGENT_DISPLAY_NAME}
                       time={formatChatTime(new Date().toISOString())}
                       tone={draftAssistantMessage.messageType === "clarifying" ? undefined : undefined}
                     />
@@ -3667,7 +3668,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                         pendingPlanDetails,
                       ])}
                       role="assistant"
-                      sender="haor"
+                      sender={AGENT_DISPLAY_NAME}
                       time={formatChatTime(session?.updated_at)}
                       tone="plan"
                     />
@@ -3682,7 +3683,7 @@ export default function HaorAgentDrawer({ userRole, initialOpen = false }: HaorA
                       rootClassName="haor-chat-composer-input"
                       classNames={{ textarea: "haor-chat-composer-textarea" }}
                       value={inputValue}
-                      placeholder="发送消息给 haor，像聊天一样提问、追问或描述你想执行的操作。"
+                      placeholder={`发送消息给 ${AGENT_DISPLAY_NAME}，像聊天一样提问、追问或描述你想执行的操作。`}
                       onChange={(event) => setInputValue(event.target.value)}
                       onPressEnter={(event) => {
                         if (event.shiftKey) {

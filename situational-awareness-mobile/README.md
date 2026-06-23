@@ -53,7 +53,7 @@
 
 - 已生成标准 Flutter 原生工程，包含 `android/`、`ios/`、`test/`
 - 依赖已完成解析并生成 `pubspec.lock`
-- 已完成与 `/root/Desktop/Project/situational-awareness` 后端的真实联调，已验证登录、总览、风险、任务、修复、HAOR 相关接口
+- 已完成与 `/root/Desktop/Project/situational-awareness` 后端的真实联调，已验证登录、总览、风险、任务、修复、玄武相关接口
 - 已覆盖风险详情独立加载、登录页、响应式布局等页面级测试
 - 已完成依赖解析验证：`flutter pub get`
 - 当前 `flutter analyze` 已通过且无告警

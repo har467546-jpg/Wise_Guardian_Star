@@ -1,9 +1,42 @@
 import base64
 import hashlib
+import os
 
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from app.core.config import settings
+
+AES_GCM_PREFIX = "v2:aes-256-gcm:"
+AES_GCM_NONCE_BYTES = 12
+AES_GCM_AAD = b"asset-situational-awareness:v2:aes-256-gcm"
+
+
+def _urlsafe_b64decode_padded(value: str) -> bytes:
+    normalized = value.strip().encode()
+    return base64.urlsafe_b64decode(normalized + b"=" * (-len(normalized) % 4))
+
+
+def _build_key_bytes() -> bytes:
+    key = settings.ENCRYPTION_KEY.strip()
+    if key:
+        try:
+            decoded = _urlsafe_b64decode_padded(key)
+            if len(decoded) == 32:
+                return decoded
+        except Exception:
+            pass
+        try:
+            decoded = bytes.fromhex(key)
+            if len(decoded) == 32:
+                return decoded
+        except ValueError:
+            pass
+        raw = key.encode()
+        if len(raw) == 32:
+            return raw
+        return hashlib.sha256(raw).digest()
+    return hashlib.sha256(settings.SECRET_KEY.encode()).digest()
 
 
 def _build_fernet() -> Fernet:
@@ -16,12 +49,21 @@ def _build_fernet() -> Fernet:
     return Fernet(derived)
 
 
-fernet = _build_fernet()
+def _build_aesgcm() -> AESGCM:
+    return AESGCM(_build_key_bytes())
 
 
 def encrypt_text(raw: str) -> str:
-    return fernet.encrypt(raw.encode()).decode()
+    nonce = os.urandom(AES_GCM_NONCE_BYTES)
+    ciphertext = _build_aesgcm().encrypt(nonce, raw.encode(), AES_GCM_AAD)
+    payload = base64.urlsafe_b64encode(nonce + ciphertext).decode().rstrip("=")
+    return f"{AES_GCM_PREFIX}{payload}"
 
 
 def decrypt_text(ciphertext: str) -> str:
-    return fernet.decrypt(ciphertext.encode()).decode()
+    if ciphertext.startswith(AES_GCM_PREFIX):
+        payload = _urlsafe_b64decode_padded(ciphertext.removeprefix(AES_GCM_PREFIX))
+        nonce = payload[:AES_GCM_NONCE_BYTES]
+        encrypted = payload[AES_GCM_NONCE_BYTES:]
+        return _build_aesgcm().decrypt(nonce, encrypted, AES_GCM_AAD).decode()
+    return _build_fernet().decrypt(ciphertext.encode()).decode()

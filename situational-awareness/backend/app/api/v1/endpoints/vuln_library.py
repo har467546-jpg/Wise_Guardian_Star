@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from sqlalchemy.orm import Session
 
-from app.api.deps import get_admin_user, get_current_user
+from app.api.deps import get_admin_user, get_current_user, get_db_session
+from app.db.models.enums import TaskType
+from app.db.models.task_run import TaskRun
 from app.db.models.user import User
+from app.db.session import SessionLocal
+from app.repositories.task_repo import ACTIVE_TASK_STATUSES, create_task_run, get_latest_task_run_for_scope, update_task_run
 from app.rules import RuleConflictError, RuleDefinition, RuleNotFoundError, RuleStore
 from app.schemas.common import PageMeta
 from app.schemas.vuln_library import (
@@ -25,15 +32,19 @@ from app.schemas.vuln_library import (
 from app.services.vuln_library_service import (
     RuleCatalogMetadata,
     VulnLibraryService,
-    VulnLibrarySchemaNotReadyError,
     VulnRuleImportResult,
 )
+from app.tasks.vuln_intel_tasks import sync_vuln_intel_task
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 RULES_PATH = Path(__file__).resolve().parents[3] / "rules" / "risk_rules.yaml"
 RULE_STORE = RuleStore(RULES_PATH)
 RULE_SERVICE = VulnLibraryService(RULE_STORE)
+AUTO_INTEL_SYNC_COOLDOWN_SECONDS = 300
+_last_auto_sync_queued_at: datetime | None = None
+_last_auto_sync_task_id: str | None = None
 
 
 @router.get("/status", response_model=RuleEngineStatusRead)
@@ -55,16 +66,33 @@ def get_vuln_library_status(_: User = Depends(get_current_user)) -> RuleEngineSt
 
 
 @router.get("/intel/status", response_model=VulnIntelStatusRead)
-def get_vuln_intel_status(_: User = Depends(get_current_user)) -> VulnIntelStatusRead:
-    return _to_intel_status_read(RULE_SERVICE.get_intel_status())
+def get_vuln_intel_status(
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> VulnIntelStatusRead:
+    status_payload = RULE_SERVICE.get_intel_status()
+    return _to_intel_status_read(
+        status_payload,
+        auto_sync=_queue_auto_intel_sync_if_needed(status_payload, db=db),
+    )
 
 
 @router.post("/intel/sync", response_model=VulnIntelStatusRead)
-def sync_vuln_intel_catalog(_: User = Depends(get_admin_user)) -> VulnIntelStatusRead:
-    try:
-        return _to_intel_status_read(RULE_SERVICE.sync_intel())
-    except VulnLibrarySchemaNotReadyError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+def sync_vuln_intel_catalog(
+    _: User = Depends(get_admin_user),
+    db: Session = Depends(get_db_session),
+) -> VulnIntelStatusRead:
+    library_status = RULE_SERVICE.get_status()
+    if not library_status.schema_ready:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=library_status.schema_error or "数据库结构未升级，请先执行 alembic upgrade head",
+        )
+    status_payload = RULE_SERVICE.get_intel_status()
+    auto_sync = _queue_intel_sync(status_payload, force=True, db=db)
+    if auto_sync.get("sync_status") == "stale":
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="后台同步任务提交失败，请稍后重试")
+    return _to_intel_status_read(status_payload, auto_sync=auto_sync)
 
 
 @router.get("/rules", response_model=VulnRuleListResponse)
@@ -281,7 +309,116 @@ def _to_import_response(result: VulnRuleImportResult) -> VulnRuleImportResponse:
     )
 
 
-def _to_intel_status_read(payload) -> VulnIntelStatusRead:
+def _queue_auto_intel_sync_if_needed(status_payload, *, db: Session | None = None) -> dict[str, object]:
+    return _queue_intel_sync(status_payload, force=False, db=db)
+
+
+def _queue_intel_sync(status_payload, *, force: bool, db: Session | None = None) -> dict[str, object]:
+    global _last_auto_sync_queued_at, _last_auto_sync_task_id
+
+    try:
+        library_status = RULE_SERVICE.get_status()
+        if not library_status.schema_ready:
+            return {"sync_status": "schema_not_ready", "auto_sync_queued": False, "sync_task_id": None}
+    except Exception as exc:
+        logger.warning("vuln intel auto-sync status check failed: %s", exc)
+        return {"sync_status": "unknown", "auto_sync_queued": False, "sync_task_id": None}
+
+    if status_payload.tracked_rule_cves <= 0:
+        return {"sync_status": "fresh", "auto_sync_queued": False, "sync_task_id": None}
+    if not force and not status_payload.stale and status_payload.last_synced_at is not None:
+        return {"sync_status": "fresh", "auto_sync_queued": False, "sync_task_id": None}
+
+    now = datetime.now(UTC)
+    if (
+        not force
+        and _last_auto_sync_queued_at is not None
+        and now - _last_auto_sync_queued_at < timedelta(seconds=AUTO_INTEL_SYNC_COOLDOWN_SECONDS)
+    ):
+        return {"sync_status": "queued", "auto_sync_queued": False, "sync_task_id": _last_auto_sync_task_id}
+
+    active_task = _get_active_vuln_intel_task_run(db)
+    if active_task is not None:
+        _last_auto_sync_queued_at = now
+        _last_auto_sync_task_id = active_task.id
+        return {"sync_status": "queued", "auto_sync_queued": False, "sync_task_id": active_task.id}
+
+    try:
+        task_run_id = _create_vuln_intel_task_run(db)
+        task = sync_vuln_intel_task.delay(task_run_id)
+        _bind_vuln_intel_celery_task(db, task_run_id, str(task.id or ""))
+    except Exception as exc:
+        logger.warning("vuln intel auto-sync enqueue failed: %s", exc)
+        return {"sync_status": "stale", "auto_sync_queued": False, "sync_task_id": None}
+
+    _last_auto_sync_queued_at = now
+    _last_auto_sync_task_id = task_run_id
+    return {"sync_status": "queued", "auto_sync_queued": True, "sync_task_id": _last_auto_sync_task_id}
+
+
+def _get_active_vuln_intel_task_run(db: Session | None) -> TaskRun | None:
+    statuses = list(ACTIVE_TASK_STATUSES)
+    if db is not None:
+        return get_latest_task_run_for_scope(
+            db,
+            scope_type="vuln_library",
+            scope_id="intel",
+            task_type=TaskType.VULN_INTEL_SYNC,
+            statuses=statuses,
+        )
+    with SessionLocal() as fallback_db:
+        return get_latest_task_run_for_scope(
+            fallback_db,
+            scope_type="vuln_library",
+            scope_id="intel",
+            task_type=TaskType.VULN_INTEL_SYNC,
+            statuses=statuses,
+        )
+
+
+def _create_vuln_intel_task_run(db: Session | None) -> str:
+    if db is not None:
+        task_run = create_task_run(
+            db,
+            task_type=TaskType.VULN_INTEL_SYNC,
+            scope_type="vuln_library",
+            scope_id="intel",
+            message="漏洞情报同步任务已入队",
+        )
+        return task_run.id
+    with SessionLocal() as fallback_db:
+        task_run = create_task_run(
+            fallback_db,
+            task_type=TaskType.VULN_INTEL_SYNC,
+            scope_type="vuln_library",
+            scope_id="intel",
+            message="漏洞情报同步任务已入队",
+        )
+        return task_run.id
+
+
+def _bind_vuln_intel_celery_task(db: Session | None, task_run_id: str, celery_task_id: str) -> None:
+    if not celery_task_id:
+        return
+    if db is not None:
+        task_run = db.get(TaskRun, task_run_id)
+        if task_run is not None:
+            update_task_run(db, task_run, celery_task_id=celery_task_id)
+        return
+    with SessionLocal() as fallback_db:
+        task_run = fallback_db.get(TaskRun, task_run_id)
+        if task_run is not None:
+            update_task_run(fallback_db, task_run, celery_task_id=celery_task_id)
+
+
+def _to_intel_status_read(payload, *, auto_sync: dict[str, object] | None = None) -> VulnIntelStatusRead:
+    sync_status = "stale" if payload.stale else "fresh"
+    sync_task_id = None
+    auto_sync_queued = False
+    if isinstance(auto_sync, dict):
+        sync_status = str(auto_sync.get("sync_status") or sync_status)
+        sync_task_id = str(auto_sync.get("sync_task_id") or "").strip() or None
+        auto_sync_queued = bool(auto_sync.get("auto_sync_queued"))
     return VulnIntelStatusRead.model_validate(
         {
             "total_cves": payload.total_cves,
@@ -292,5 +429,8 @@ def _to_intel_status_read(payload) -> VulnIntelStatusRead:
             "last_synced_at": payload.last_synced_at,
             "sources": payload.sources,
             "updated_cves": payload.updated_cves,
+            "sync_status": sync_status,
+            "sync_task_id": sync_task_id,
+            "auto_sync_queued": auto_sync_queued,
         }
     )

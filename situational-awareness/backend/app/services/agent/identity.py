@@ -1,0 +1,2 @@
+AGENT_ID = "haor"
+AGENT_DISPLAY_NAME = "玄武"

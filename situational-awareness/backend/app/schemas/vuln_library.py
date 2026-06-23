@@ -215,6 +215,9 @@ class VulnIntelStatusRead(BaseModel):
     last_synced_at: datetime | None = None
     sources: list[str] = Field(default_factory=list)
     updated_cves: int = 0
+    sync_status: str = "fresh"
+    sync_task_id: str | None = None
+    auto_sync_queued: bool = False
 
 
 class VulnRuleBatchStatusRequest(BaseModel):

@@ -28,6 +28,7 @@ def _build_client(monkeypatch, db: _DummyDB) -> TestClient:  # type: ignore[no-u
 
     monkeypatch.setattr("app.main.Base.metadata.create_all", _noop_create_all)
     app = create_app()
+    monkeypatch.setattr("app.api.v1.endpoints.tasks.reconcile_stale_active_tasks", lambda _db: 0)
     app.dependency_overrides[get_db_session] = _get_test_db
     app.dependency_overrides[get_current_user] = _override_user
     return TestClient(app)

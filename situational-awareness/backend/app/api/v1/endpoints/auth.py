@@ -2,11 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db_session
+from app.api.deps import get_current_user, get_db_session
 from app.core.security import create_access_token, get_password_hash, verify_password
 from app.db.models.enums import UserRole
 from app.db.models.user import User
-from app.schemas.auth import BootstrapAdminRequest, BootstrapStatusResponse, LoginRequest, TokenResponse
+from app.schemas.auth import BootstrapAdminRequest, BootstrapStatusResponse, LoginRequest, TokenResponse, UserRead
 
 router = APIRouter()
 
@@ -60,3 +60,8 @@ def login(payload: LoginRequest, db: Session = Depends(get_db_session)) -> Token
 
     token = create_access_token(subject=user.id, extra={"role": user.role.value})
     return TokenResponse(access_token=token)
+
+
+@router.get("/me", response_model=UserRead)
+def me(current_user: User = Depends(get_current_user)) -> UserRead:
+    return UserRead.model_validate(current_user)

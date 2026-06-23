@@ -6,6 +6,7 @@ from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
+from app.services.agent.dlp import redact_sensitive_payload, redact_sensitive_text
 from app.utils.sanitize import sanitize_json_value, sanitize_text
 
 
@@ -61,7 +62,7 @@ def record_model_call(
             "input_tokens_estimate": estimate_tokens(request_text),
             "output_tokens_estimate": estimate_tokens(response_text),
             "parsed": bool(parsed),
-            "error": sanitize_text(error, max_length=240) if error else None,
+            "error": redact_sensitive_text(error, max_length=240) if error else None,
         }
     )
 
@@ -69,7 +70,7 @@ def record_model_call(
 def record_read_tool(trace: HaorTurnTrace | None, tool_trace: dict[str, Any], *, latency_ms: int | None = None) -> None:
     if trace is None:
         return
-    payload = sanitize_json_value(tool_trace if isinstance(tool_trace, dict) else {})
+    payload = redact_sensitive_payload(tool_trace if isinstance(tool_trace, dict) else {})
     if latency_ms is not None:
         payload["latency_ms"] = max(0, int(latency_ms))
     trace.read_tools.append(payload)
@@ -78,7 +79,7 @@ def record_read_tool(trace: HaorTurnTrace | None, tool_trace: dict[str, Any], *,
 def record_action(trace: HaorTurnTrace | None, action_result: dict[str, Any], *, latency_ms: int | None = None) -> None:
     if trace is None:
         return
-    payload = sanitize_json_value(action_result if isinstance(action_result, dict) else {})
+    payload = redact_sensitive_payload(action_result if isinstance(action_result, dict) else {})
     if latency_ms is not None:
         payload["latency_ms"] = max(0, int(latency_ms))
     trace.actions.append(payload)
@@ -121,21 +122,21 @@ def finalize_trace(
     return {
         "turn_id": trace.turn_id,
         "started_at": trace.started_at.isoformat(),
-        "model_calls": sanitize_json_value(trace.model_calls),
-        "read_tools": sanitize_json_value(trace.read_tools),
-        "actions": sanitize_json_value(trace.actions),
-        "outcome": sanitize_json_value(trace.outcome),
+        "model_calls": redact_sensitive_payload(trace.model_calls),
+        "read_tools": redact_sensitive_payload(trace.read_tools),
+        "actions": redact_sensitive_payload(trace.actions),
+        "outcome": redact_sensitive_payload(trace.outcome),
     }
 
 
 def append_trace_payload(agent_state_json: dict[str, Any] | None, trace_payload: dict[str, Any]) -> dict[str, Any]:
-    state = sanitize_json_value(agent_state_json if isinstance(agent_state_json, dict) else {})
+    state = redact_sensitive_payload(agent_state_json if isinstance(agent_state_json, dict) else {})
     if not trace_payload:
         return state
     traces = state.get("traces") if isinstance(state.get("traces"), list) else []
     traces = [item for item in traces if isinstance(item, dict)]
     traces.append(sanitize_json_value(trace_payload))
-    state["traces"] = traces[-20:]
-    state["last_trace"] = sanitize_json_value(trace_payload)
-    state["metrics"] = sanitize_json_value(trace_payload.get("outcome") if isinstance(trace_payload.get("outcome"), dict) else {})
+    state["traces"] = redact_sensitive_payload(traces[-20:])
+    state["last_trace"] = redact_sensitive_payload(trace_payload)
+    state["metrics"] = redact_sensitive_payload(trace_payload.get("outcome") if isinstance(trace_payload.get("outcome"), dict) else {})
     return state

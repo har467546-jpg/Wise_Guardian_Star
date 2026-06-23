@@ -1,46 +1,54 @@
 "use client";
 
-import { useState } from "react";
-import { Alert, Button, Card, Col, Form, Input, Row, Space, Typography, message, Divider, Tag } from "antd";
-import { RocketOutlined, AimOutlined, TagOutlined, CheckCircleOutlined, InfoCircleOutlined } from "@ant-design/icons";
+import { useEffect, useRef, useState } from "react";
+import { Alert, Button, Card, Col, Collapse, Form, Input, Row, Select, Space, Typography, message, Divider, Tag } from "antd";
+import { DownloadOutlined, ImportOutlined, RocketOutlined, AimOutlined, TagOutlined, CheckCircleOutlined, InfoCircleOutlined } from "@ant-design/icons";
 
 import DesktopPageHeader from "@/components/DesktopPageHeader";
-import { createDiscoveryJob } from "@/services/api";
+import { createDiscoveryJob, downloadServerImportTemplate, exportDataSet, getDiscoverySchedulingOptions, importServersCsv } from "@/services/api";
+import type { ExportDataType, ExportFileFormat, ServerImportResponse } from "@/types/data-exchange";
+import type { DiscoverySchedulingOption } from "@/types/discovery";
 
 const { Title, Paragraph, Text } = Typography;
 
-const pipelineStages = [
+const exportOptions: Array<{ type: ExportDataType; label: string; purpose: string }> = [
   {
-    code: "01",
-    title: "主机发现",
-    description: "识别 CIDR 范围内的可达主机，建立本轮发现入口。",
+    type: "servers",
+    label: "服务器列表",
+    purpose: "资产管理、批量导入",
   },
   {
-    code: "02",
-    title: "基础信息扫描",
-    description: "先把主机、基础资产信息和初始台账整理出来，优先给出第一批结果。",
+    type: "alerts",
+    label: "告警数据",
+    purpose: "告警分析、报告",
   },
   {
-    code: "03",
-    title: "端口与指纹",
-    description: "随后识别开放端口、服务类型和版本线索，补齐资产画像。",
+    type: "audit_logs",
+    label: "审计日志",
+    purpose: "审计、合规检查",
   },
   {
-    code: "04",
-    title: "风险验证",
-    description: "基于规则和主动校验补齐风险确认结果，进入任务中心持续跟踪。",
+    type: "reports",
+    label: "报表",
+    purpose: "汇报、归档",
   },
 ];
 
 type DiscoveryFormValues = {
   cidr: string;
   label?: string;
+  runner_asset_id?: string;
+  scanner_zone_id?: string;
 };
 
 type DiscoverySubmissionSummary = {
   normalizedCidr: string;
   estimatedHostCount: number | null;
   discoveredHostCount: number | null;
+  executionBoundary: string | null;
+  runnerAssetId: string | null;
+  scannerZoneId: string | null;
+  matchedZoneIds: string[];
 };
 
 function isValidDiscoveryCidr(value: string): boolean {
@@ -79,6 +87,8 @@ function normalizeDiscoveryValues(values: DiscoveryFormValues): DiscoveryFormVal
   return {
     cidr,
     label: label || undefined,
+    runner_asset_id: values.runner_asset_id?.trim() || undefined,
+    scanner_zone_id: values.scanner_zone_id?.trim() || undefined,
   };
 }
 
@@ -122,14 +132,54 @@ function extractDiscoveredHostCount(summaryJson: Record<string, unknown> | undef
 
 export default function DiscoveryForm() {
   const [form] = Form.useForm<DiscoveryFormValues>();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const watchedCidr = Form.useWatch("cidr", form);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [reused, setReused] = useState(false);
   const [submissionSummary, setSubmissionSummary] = useState<DiscoverySubmissionSummary | null>(null);
+  const [optionsLoading, setOptionsLoading] = useState(false);
+  const [options, setOptions] = useState<DiscoverySchedulingOption | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [exportingKey, setExportingKey] = useState<string | null>(null);
+  const [importResult, setImportResult] = useState<ServerImportResponse | null>(null);
+
+  useEffect(() => {
+    const cidr = watchedCidr;
+    if (!cidr || !isValidDiscoveryCidr(cidr)) {
+      setOptions(null);
+      return;
+    }
+    let cancelled = false;
+    setOptionsLoading(true);
+    void getDiscoverySchedulingOptions(cidr)
+      .then((result) => {
+        if (!cancelled) {
+          setOptions(result);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setOptions(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setOptionsLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [watchedCidr]);
 
   const onSubmit = async (values: DiscoveryFormValues) => {
     const payload = normalizeDiscoveryValues(values);
+    if (payload.runner_asset_id && payload.scanner_zone_id) {
+      message.error("扫描分区和指定 Runner 不能同时选择");
+      return;
+    }
 
     try {
       setSubmitting(true);
@@ -151,6 +201,12 @@ export default function DiscoveryForm() {
         normalizedCidr: String(response.job?.cidr || payload.cidr),
         estimatedHostCount: estimateDiscoverableHosts(String(response.job?.cidr || payload.cidr)),
         discoveredHostCount: extractDiscoveredHostCount(response.job?.summary_json),
+        executionBoundary: String((((response.job?.summary_json || {}) as Record<string, unknown>).request as Record<string, unknown> | undefined)?.execution_boundary || "") || null,
+        runnerAssetId: String((((response.job?.summary_json || {}) as Record<string, unknown>).request as Record<string, unknown> | undefined)?.runner_asset_id || "") || null,
+        scannerZoneId: String((((response.job?.summary_json || {}) as Record<string, unknown>).request as Record<string, unknown> | undefined)?.scanner_zone_id || "") || null,
+        matchedZoneIds: Array.isArray((((response.job?.summary_json || {}) as Record<string, unknown>).request as Record<string, unknown> | undefined)?.matched_zone_ids)
+          ? (((response.job?.summary_json || {}) as Record<string, unknown>).request as Record<string, unknown>).matched_zone_ids as string[]
+          : [],
       });
 
       if (response.reused) {
@@ -164,6 +220,63 @@ export default function DiscoveryForm() {
       message.error((error as Error).message || "任务提交失败，请重试");
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const saveBlob = (blob: Blob, filename: string | null, fallbackName: string) => {
+    const url = window.URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename || fallbackName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.URL.revokeObjectURL(url);
+  };
+
+  const onDownloadTemplate = async () => {
+    try {
+      const { blob, filename } = await downloadServerImportTemplate();
+      saveBlob(blob, filename, "server-import-template.csv");
+    } catch (error) {
+      message.error((error as Error).message || "模板下载失败");
+    }
+  };
+
+  const onImportFile = async (file: File | undefined) => {
+    if (!file) {
+      return;
+    }
+    try {
+      setImporting(true);
+      setImportResult(null);
+      const result = await importServersCsv(file);
+      setImportResult(result);
+      if (result.skipped) {
+        message.warning(`导入完成，跳过 ${result.skipped} 行`);
+      } else {
+        message.success("服务器列表导入完成");
+      }
+    } catch (error) {
+      message.error((error as Error).message || "服务器列表导入失败");
+    } finally {
+      setImporting(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
+  };
+
+  const onExport = async (dataType: ExportDataType, format: ExportFileFormat) => {
+    const key = `${dataType}-${format}`;
+    try {
+      setExportingKey(key);
+      const { blob, filename } = await exportDataSet(dataType, format);
+      saveBlob(blob, filename, `${dataType}.${format}`);
+    } catch (error) {
+      message.error((error as Error).message || "数据导出失败");
+    } finally {
+      setExportingKey(null);
     }
   };
 
@@ -221,6 +334,46 @@ export default function DiscoveryForm() {
                 />
               </Form.Item>
 
+              <Collapse
+                items={[
+                  {
+                    key: "advanced-dispatch",
+                    label: "高级调度",
+                    children: (
+                      <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                        <Form.Item name="scanner_zone_id" label={<Text strong>扫描分区</Text>}>
+                          <Select
+                            allowClear
+                            placeholder={optionsLoading ? "正在加载可用分区..." : "自动匹配或手动选择分区"}
+                            options={(options?.scanner_zones || []).map((zone) => ({
+                              label: `${zone.name} (${zone.zone_type})`,
+                              value: zone.id,
+                            }))}
+                            disabled={Boolean(form.getFieldValue("runner_asset_id"))}
+                          />
+                        </Form.Item>
+                        <Form.Item name="runner_asset_id" label={<Text strong>指定 Runner</Text>}>
+                          <Select
+                            allowClear
+                            placeholder={optionsLoading ? "正在加载可用 Runner..." : "指定扫描节点"}
+                            options={(options?.runner_assets || []).map((runner) => ({
+                              label: `${runner.asset_hostname || runner.asset_ip || runner.asset_id}${runner.scanner_zone_id ? ` · ${runner.scanner_zone_id}` : ""}`,
+                              value: runner.asset_id,
+                            }))}
+                            disabled={Boolean(form.getFieldValue("scanner_zone_id"))}
+                          />
+                        </Form.Item>
+                        {options?.recommended_zone_ids?.length ? (
+                          <Text type="secondary">当前 CIDR 推荐分区：{options.recommended_zone_ids.join("、")}</Text>
+                        ) : (
+                          <Text type="secondary">未指定调度时，系统将按 CIDR 自动匹配分区或走本地扫描。</Text>
+                        )}
+                      </Space>
+                    ),
+                  },
+                ]}
+              />
+
               <Button
                 type="primary"
                 htmlType="submit"
@@ -260,6 +413,10 @@ export default function DiscoveryForm() {
                           {submissionSummary.discoveredHostCount !== null
                             ? `，当前已识别在线 ${submissionSummary.discoveredHostCount} 台主机`
                             : ""}
+                          {submissionSummary.executionBoundary ? `，执行边界 ${submissionSummary.executionBoundary}` : ""}
+                          {submissionSummary.runnerAssetId ? `，Runner ${submissionSummary.runnerAssetId}` : ""}
+                          {submissionSummary.scannerZoneId ? `，分区 ${submissionSummary.scannerZoneId}` : ""}
+                          {submissionSummary.matchedZoneIds.length ? `，匹配分区 ${submissionSummary.matchedZoneIds.join("、")}` : ""}
                         </Text>
                       ) : null}
                     </Space>
@@ -271,24 +428,82 @@ export default function DiscoveryForm() {
         </Col>
 
         <Col xs={24} lg={9}>
-          <Card className="panel-card discovery-stage-card" data-haor-section="自动化流水线详情" bordered={false} title={<Text strong>自动化流水线详情</Text>}>
-            <div className="workflow-stage-list">
-              {pipelineStages.map((stage) => (
-                <div key={stage.code} className="workflow-stage-item">
-                  <span className="workflow-stage-index">{stage.code}</span>
-                  <div className="workflow-stage-copy">
-                    <strong>{stage.title}</strong>
-                    <p>{stage.description}</p>
-                  </div>
+          <Card className="panel-card discovery-stage-card" data-haor-section="导入导出工具" bordered={false} title={<Text strong>导入 / 导出</Text>}>
+            <Space direction="vertical" size={14} style={{ width: "100%" }}>
+              <Alert
+                showIcon
+                type="info"
+                message="服务器列表 CSV 导入"
+                description="必填 name、hostname、ip；password 将使用 AES-256-GCM 加密存储。"
+              />
+              <Space wrap>
+                <Button icon={<DownloadOutlined />} onClick={() => void onDownloadTemplate()}>
+                  下载 CSV 模板
+                </Button>
+                <Button icon={<ImportOutlined />} loading={importing} onClick={() => fileInputRef.current?.click()}>
+                  导入服务器 CSV
+                </Button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".csv,text/csv"
+                  style={{ display: "none" }}
+                  onChange={(event) => void onImportFile(event.target.files?.[0])}
+                />
+              </Space>
+
+              {importResult ? (
+                <div className="data-exchange-import-result">
+                  <Tag color="blue">{`总行数 ${importResult.total_rows}`}</Tag>
+                  <Tag color="green">{`新增 ${importResult.created}`}</Tag>
+                  <Tag color="cyan">{`更新 ${importResult.updated}`}</Tag>
+                  <Tag color="purple">{`凭据 ${importResult.credential_saved}`}</Tag>
+                  {importResult.skipped ? <Tag color="orange">{`跳过 ${importResult.skipped}`}</Tag> : null}
+                  {importResult.issues.slice(0, 3).map((issue) => (
+                    <Text key={`${issue.row}-${issue.field}-${issue.message}`} type="secondary" className="ui-detail-wrap">
+                      第 {issue.row} 行{issue.field ? ` ${issue.field}` : ""}：{issue.message}
+                    </Text>
+                  ))}
                 </div>
-              ))}
-            </div>
-            <Alert
-              showIcon
-              type="info"
-              message="提交后会在任务中心自动持续追踪"
-              description="如果系统检测到相同 CIDR 已存在排队中或运行中的任务，本页会自动显示任务复用状态。"
-            />
+              ) : null}
+
+              <Divider style={{ margin: "4px 0" }} />
+
+              <div className="data-exchange-export-list">
+                {exportOptions.map((item) => (
+                  <div key={item.type} className="data-exchange-export-item">
+                    <div>
+                      <Text strong>{item.label}</Text>
+                      <br />
+                      <Text type="secondary">{item.purpose}</Text>
+                    </div>
+                    <Space>
+                      <Button
+                        size="small"
+                        onClick={() => void onExport(item.type, "csv")}
+                        loading={exportingKey === `${item.type}-csv`}
+                      >
+                        CSV
+                      </Button>
+                      <Button
+                        size="small"
+                        onClick={() => void onExport(item.type, "json")}
+                        loading={exportingKey === `${item.type}-json`}
+                      >
+                        JSON
+                      </Button>
+                    </Space>
+                  </div>
+                ))}
+              </div>
+
+              <Alert
+                showIcon
+                type="success"
+                message="CSV 导出已带 UTF-8 BOM"
+                description="中文字段名可直接用 Excel 打开，日期字段按标准格式输出。"
+              />
+            </Space>
           </Card>
         </Col>
       </Row>

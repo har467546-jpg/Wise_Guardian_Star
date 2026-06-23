@@ -5,8 +5,8 @@
 - 重点说明当前真实运行时实体、关系、索引方向与模型边界。
 
 ## 当前实现范围
-- 当前项目不是只有资产与风险两张表，而是围绕资产、任务、修复、Haor、日志和规则治理构成完整运行时模型。
-- ORM 入口位于 `backend/app/db/models/`，数据库会通过 Alembic 与运行时初始化共同维护。
+- 当前项目不是只有资产与风险两张表，而是围绕资产、任务、修复、玄武、日志和规则治理构成完整运行时模型。
+- ORM 入口位于 `backend/app/db/models/`，数据库应以 Alembic 迁移为主维护；运行时自动建表只作为显式开发兜底能力。
 
 ## 运行时模型域
 
@@ -48,7 +48,7 @@
 
 ### 5. 智能体运行时域
 - `agent_sessions`
-  - Haor 当前会话状态、页面上下文、工作上下文和运行时状态。
+  - 玄武当前会话状态、页面上下文、工作上下文和运行时状态。
 - `agent_goals`
   - 当前目标、成功标准、阻塞原因与恢复策略。
 - `agent_messages`
@@ -112,9 +112,23 @@
   - `backend/app/db/models/platform_log_entry.py`
 
 ## 迁移与维护说明
-- 新库或演示环境可以依赖启动时的 `create_all()` 兜底建表。
+- 新库或演示环境可以在显式启用 `AUTO_CREATE_SCHEMA=true` 时依赖启动时的 `create_all()` 兜底建表。
 - 已有数据库升级必须以 Alembic 迁移为准，不应依赖运行时自动建表替代列升级和索引变更。
 - 运行时配置或平台设置变更不会直接修改 schema，但可能影响任务和日志等运行数据形态。
+
+## JSON 字段治理清单
+- `discovery_jobs.summary_json`
+  现状：保存发现结果、请求上下文、执行摘要。
+  建议：保留为审计与原始上下文字段；高频调度字段优先结构化到显式列或任务上下文映射。
+- `task_runs.result_json`
+  现状：保存多类任务运行态、执行上下文、阶段结果。
+  建议：保留为通用运行负载；`execution_boundary`、`scanner_zone_id`、`runner_asset_id` 这类高频查询字段建议逐步结构化。
+- `host_runners.capabilities_json`
+  现状：保存 Runner 兼容性、运行时形态、主机事实。
+  建议：保留为半结构化能力描述；列表页常用字段如 `runtime_kind`、`install_mode` 已做显式投影，应继续沿这个方向扩展。
+- `scanner_zones.default_scan_profile_json`
+  现状：保存分区默认扫描策略。
+  建议：继续保留 JSON，配合 schema version 演进。
 
 ## 历史说明
 - 早期文档曾用 `assets / services / findings / tasks / scan_results` 五张核心表来讨论业务骨架。

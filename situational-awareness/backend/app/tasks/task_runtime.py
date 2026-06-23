@@ -9,6 +9,7 @@ from app.db.models.task_run import TaskRun
 from app.db.session import SessionLocal
 from app.repositories.task_event_repo import create_task_event
 from app.repositories.task_repo import get_task_run, update_task_run
+from app.services.agent.async_state import serialize_celery_payload
 
 _CURRENT_TASK_RUN_ID: ContextVar[str | None] = ContextVar("current_task_run_id", default=None)
 _IMMUTABLE_TASK_STATUSES = {
@@ -57,6 +58,7 @@ def append_task_event(
     progress: int | None = None,
     payload_json: dict | None = None,
 ) -> None:
+    serialized_payload = serialize_celery_payload(payload_json or {})
     with SessionLocal() as db:
         task = get_task_run(db, task_run_id)
         if task is None:
@@ -72,7 +74,7 @@ def append_task_event(
             stage_name=stage_name,
             message=message,
             progress=progress,
-            payload_json=payload_json,
+            payload_json=serialized_payload if isinstance(serialized_payload, dict) else {},
         )
         db.commit()
 
@@ -163,13 +165,15 @@ def set_task_progress(
             if task and task.status == TaskExecutionStatus.CANCELED:
                 raise TaskCanceledError("任务已中断")
             if task and not _is_task_immutable(task):
+                serialized_result = serialize_celery_payload(result_json if result_json is not None else task.result_json)
+                serialized_result_json = serialized_result if isinstance(serialized_result, dict) else {}
                 update_task_run(
                     db,
                     task,
                     status=TaskExecutionStatus.RUNNING,
                     progress=progress,
                     message=message,
-                    result_json=result_json if result_json is not None else task.result_json,
+                    result_json=serialized_result_json,
                 )
                 create_task_event(
                     db,
@@ -180,7 +184,7 @@ def set_task_progress(
                     stage_name=stage_name or message,
                     message=message,
                     progress=progress,
-                    payload_json=result_json if result_json is not None else task.result_json,
+                    payload_json=serialized_result_json,
                 )
                 db.commit()
 
@@ -192,13 +196,15 @@ def set_task_success(task_run_id: str, message: str, result_json: dict | None = 
             if task and task.status == TaskExecutionStatus.CANCELED:
                 raise TaskCanceledError("任务已中断")
             if task and not _is_task_immutable(task):
+                serialized_result = serialize_celery_payload(result_json if result_json is not None else task.result_json)
+                serialized_result_json = serialized_result if isinstance(serialized_result, dict) else {}
                 update_task_run(
                     db,
                     task,
                     status=TaskExecutionStatus.SUCCESS,
                     progress=100,
                     message=message,
-                    result_json=result_json if result_json is not None else task.result_json,
+                    result_json=serialized_result_json,
                 )
                 create_task_event(
                     db,
@@ -207,7 +213,7 @@ def set_task_success(task_run_id: str, message: str, result_json: dict | None = 
                     level="info",
                     message=message,
                     progress=100,
-                    payload_json=result_json if result_json is not None else task.result_json,
+                    payload_json=serialized_result_json,
                 )
                 db.commit()
 
@@ -217,14 +223,15 @@ def set_task_retry(task_run_id: str, retry_count: int, message: str) -> None:
         with SessionLocal() as db:
             task = get_task_run(db, task_run_id)
             if task and not _is_task_immutable(task):
-                error_json = {"error": message}
+                error_json = serialize_celery_payload({"error": message})
+                error_payload = error_json if isinstance(error_json, dict) else {"error": ""}
                 update_task_run(
                     db,
                     task,
                     status=TaskExecutionStatus.RETRY,
                     message=message,
                     retry_count=retry_count,
-                    error_json=error_json,
+                    error_json=error_payload,
                 )
                 create_task_event(
                     db,
@@ -233,7 +240,7 @@ def set_task_retry(task_run_id: str, retry_count: int, message: str) -> None:
                     level="warning",
                     message=message,
                     progress=task.progress,
-                    payload_json=error_json,
+                    payload_json=error_payload,
                 )
                 db.commit()
 
@@ -243,7 +250,8 @@ def set_task_failure(task_run_id: str, retry_count: int, message: str) -> None:
         with SessionLocal() as db:
             task = get_task_run(db, task_run_id)
             if task and not _is_task_immutable(task):
-                error_json = {"error": message}
+                error_json = serialize_celery_payload({"error": message})
+                error_payload = error_json if isinstance(error_json, dict) else {"error": ""}
                 update_task_run(
                     db,
                     task,
@@ -251,7 +259,7 @@ def set_task_failure(task_run_id: str, retry_count: int, message: str) -> None:
                     progress=100,
                     message=message,
                     retry_count=retry_count,
-                    error_json=error_json,
+                    error_json=error_payload,
                 )
                 create_task_event(
                     db,
@@ -260,6 +268,6 @@ def set_task_failure(task_run_id: str, retry_count: int, message: str) -> None:
                     level="error",
                     message=message,
                     progress=100,
-                    payload_json=error_json,
+                    payload_json=error_payload,
                 )
                 db.commit()

@@ -15,9 +15,11 @@ from app.core.config import settings
 from app.core.security import SecurityError, decode_access_token
 from app.db.models.user import User
 from app.db.session import SessionLocal
+from app.repositories.audit_log_repo import list_audit_log_entries
 from app.repositories.platform_log_repo import list_platform_log_entries
 from app.schemas.common import PageMeta
-from app.schemas.logs import LogEntryListResponse, LogEntryRead
+from app.schemas.logs import AuditLogEntryListResponse, AuditLogEntryRead, LogEntryListResponse, LogEntryRead
+from app.services.audit_log_service import serialize_audit_log_entry
 from app.services.platform_log_service import (
     DEFAULT_LOG_HEARTBEAT_SECONDS,
     PLATFORM_LOG_CHANNEL,
@@ -149,6 +151,40 @@ def get_logs(
     )
     return LogEntryListResponse(
         items=[LogEntryRead.model_validate(item) for item in items],
+        meta=PageMeta(total=total, page=page, page_size=page_size),
+    )
+
+
+@router.get("/audit", response_model=AuditLogEntryListResponse)
+def get_audit_logs(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=100, ge=1, le=200),
+    actor_user_id: str | None = Query(default=None),
+    method: str | None = Query(default=None),
+    path: str | None = Query(default=None),
+    action: str | None = Query(default=None),
+    resource_type: str | None = Query(default=None),
+    outcome: str | None = Query(default=None),
+    status_code: int | None = Query(default=None, ge=100, le=599),
+    keyword: str | None = Query(default=None),
+    db: Session = Depends(get_db_session),
+    _: User = Depends(get_admin_user),
+) -> AuditLogEntryListResponse:
+    items, total = list_audit_log_entries(
+        db,
+        page=page,
+        page_size=page_size,
+        actor_user_id=actor_user_id,
+        method=method.upper() if method else None,
+        path=path,
+        action=action,
+        resource_type=resource_type,
+        outcome=outcome,
+        status_code=status_code,
+        keyword=keyword,
+    )
+    return AuditLogEntryListResponse(
+        items=[AuditLogEntryRead.model_validate(serialize_audit_log_entry(item)) for item in items],
         meta=PageMeta(total=total, page=page, page_size=page_size),
     )
 

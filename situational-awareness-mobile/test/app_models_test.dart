@@ -8,7 +8,7 @@ void main() {
         'id': 'task-agent-1',
         'task_type': 'agent_orchestrate',
         'status': 'running',
-        'message': 'HAOR 正在执行',
+        'message': '玄武正在执行',
         'progress': 55,
         'timing': <String, dynamic>{},
         'stage_timings': [],
@@ -16,6 +16,6 @@ void main() {
     );
 
     expect(model.taskType, TaskTypeModel.agentOrchestrate);
-    expect(model.taskType.label, 'HAOR 执行');
+    expect(model.taskType.label, '玄武执行');
   });
 }

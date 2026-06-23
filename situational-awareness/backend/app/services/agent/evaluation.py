@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.agent.identity import AGENT_DISPLAY_NAME
 from app.services.agent_playbook_service import (
     PLAYBOOK_ANALYZE_ASSET_RISKS,
     PLAYBOOK_CONFIGURE_SSH_CREDENTIAL,
@@ -87,7 +88,7 @@ DEFAULT_PLAYBOOK_EVAL_CASES: tuple[AgentEvalCase, ...] = (
             read_tools=[],
             auto_actions=[],
             proposed_actions=[],
-            reply_contains=["haor"],
+            reply_contains=[AGENT_DISPLAY_NAME],
         ),
     ),
     AgentEvalCase(

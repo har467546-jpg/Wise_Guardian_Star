@@ -365,6 +365,7 @@ def to_fingerprint_json(record: dict[str, Any]) -> dict[str, Any]:
         "nse_summary": record.get("nse_summary") if isinstance(record.get("nse_summary"), dict) else {},
         "nse_last_phase": nse_last_phase,
         "nse_last_collected_at": nse_last_collected_at,
+        "web": record.get("web") if isinstance(record.get("web"), dict) else {},
     }
 
 

@@ -26,7 +26,7 @@ services:
       dockerfile: Dockerfile
     container_name: sa-backend
     restart: unless-stopped
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["sh", "-lc", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     env_file:
       - path: ../backend/.env.example
         required: true
@@ -36,6 +36,7 @@ services:
       PYTHONUNBUFFERED: "1"
       DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
       REDIS_URL: redis://redis:6379/0
+      AUTO_CREATE_SCHEMA: "false"
     depends_on:
       - postgres
       - redis
@@ -60,6 +61,25 @@ services:
       DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
       REDIS_URL: redis://redis:6379/0
     command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report", "--loglevel=info"]
+
+  beat:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: sa-beat
+    restart: unless-stopped
+    env_file:
+      - path: ../backend/.env.example
+        required: true
+      - path: ../backend/.env.runtime
+        required: false
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
+      REDIS_URL: redis://redis:6379/0
+    command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=info"]
 
   settings-helper:
     build:
@@ -100,7 +120,7 @@ services:
       dockerfile: Dockerfile
     container_name: sa-backend-dev
     restart: unless-stopped
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
+    command: ["sh", "-lc", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app"]
     env_file:
       - path: ../backend/.env.example
         required: true
@@ -111,6 +131,7 @@ services:
       PYTHONUNBUFFERED: "1"
       DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
       REDIS_URL: redis://redis:6379/0
+      AUTO_CREATE_SCHEMA: "false"
     depends_on:
       - postgres
       - redis
@@ -139,6 +160,29 @@ services:
       DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
       REDIS_URL: redis://redis:6379/0
     command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "discovery,collection,risk,report", "--loglevel=info"]
+    volumes:
+      - ../backend:/app
+
+  beat-dev:
+    profiles: ["dev"]
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: sa-beat-dev
+    restart: unless-stopped
+    env_file:
+      - path: ../backend/.env.example
+        required: true
+      - path: ../backend/.env.runtime
+        required: false
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      ENV: dev
+      DATABASE_URL: postgresql+pg8000://asset:asset@postgres:5432/assetdb
+      REDIS_URL: redis://redis:6379/0
+    command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=info"]
     volumes:
       - ../backend:/app
 

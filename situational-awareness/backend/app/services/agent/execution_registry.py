@@ -41,6 +41,7 @@ class AgentActionExecutorContext:
     session_user_id: str
     platform_url: str
     get_manual_credential: Callable[[Session, str], Any]
+    session_user_role: str = "admin"
 
 
 def _coerce_bool(value: Any) -> bool:

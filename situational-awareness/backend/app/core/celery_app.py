@@ -42,8 +42,8 @@ celery_app.conf.task_routes = {
 }
 
 celery_app.conf.beat_schedule = {
-    "daily-vuln-intel-sync": {
+    "hourly-vuln-intel-sync": {
         "task": "app.tasks.vuln_intel_tasks.sync_vuln_intel",
-        "schedule": crontab(hour=3, minute=0),
+        "schedule": crontab(minute=0),
     }
 }

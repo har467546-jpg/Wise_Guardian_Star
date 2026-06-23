@@ -1,5 +1,5 @@
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -93,7 +93,7 @@ def _task(
 
 def test_dashboard_overview_endpoint_returns_aggregated_payload() -> None:
     client, session_local = _build_client()
-    now = datetime(2026, 3, 25, 6, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
 
     with session_local() as db:
         assets = [
@@ -233,22 +233,29 @@ def test_dashboard_overview_endpoint_returns_aggregated_payload() -> None:
                     task_id="task-newest",
                     task_type=TaskType.ASSET_SCAN,
                     status=TaskExecutionStatus.RUNNING,
-                    updated_at=datetime(2026, 3, 25, 6, 5, tzinfo=timezone.utc),
+                    updated_at=now,
                     message="newest",
                 ),
                 _task(
                     task_id="task-middle",
                     task_type=TaskType.RISK_VERIFY,
                     status=TaskExecutionStatus.PENDING,
-                    updated_at=datetime(2026, 3, 25, 6, 4, tzinfo=timezone.utc),
+                    updated_at=now - timedelta(minutes=1),
                     message="middle",
                 ),
                 _task(
                     task_id="task-oldest",
                     task_type=TaskType.REPORT_GENERATE,
                     status=TaskExecutionStatus.SUCCESS,
-                    updated_at=datetime(2026, 3, 25, 6, 3, tzinfo=timezone.utc),
+                    updated_at=now - timedelta(minutes=2),
                     message="oldest",
+                ),
+                _task(
+                    task_id="task-stale-pending",
+                    task_type=TaskType.REPORT_GENERATE,
+                    status=TaskExecutionStatus.PENDING,
+                    updated_at=now - timedelta(hours=48),
+                    message="stale",
                 ),
             ]
         )
@@ -282,11 +289,20 @@ def test_dashboard_overview_endpoint_returns_aggregated_payload() -> None:
     ]
     assert payload["risky_assets"][0]["highest_severity"] == "critical"
     assert payload["risky_assets"][1]["finding_count"] == 3
-    assert [item["id"] for item in payload["task_health"]] == [
+    task_health_by_id = {item["id"]: item for item in payload["task_health"]}
+    assert set(task_health_by_id) == {
         "task-newest",
         "task-middle",
         "task-oldest",
-    ]
+        "task-stale-pending",
+    }
+    assert task_health_by_id["task-stale-pending"]["status"] == "failure"
     assert payload["recent_risks"][0]["id"] == "risk-critical-1"
+
+    with session_local() as db:
+        stale_task = db.get(TaskRun, "task-stale-pending")
+        assert stale_task is not None
+        assert stale_task.status == TaskExecutionStatus.FAILURE
+        assert stale_task.error_json["reason"] == "stale_active_task"
 
     client.close()

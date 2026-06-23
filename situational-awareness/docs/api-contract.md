@@ -23,7 +23,7 @@
 | 管理员鉴权 | `Authorization: Bearer <access_token>` 且用户角色为 `admin` | 用于配置、校区、修复、日志、规则管理等高权限操作。 |
 | Runner 鉴权 | `X-Runner-Token: <runner_token>` 或 `Authorization: Bearer <runner_token>` | Runner 注册后获取。 |
 | settings-helper 鉴权 | `X-Settings-Helper-Token: <token>` | 内部回调接口使用。 |
-| WebSocket 鉴权 | 多数为 `?token=<access_token>`；Haor 流也支持首帧 `{"type":"auth","token":"..."}` | 鉴权失败关闭码通常为 `1008`。 |
+| WebSocket 鉴权 | 多数为 `?token=<access_token>`；玄武流也支持首帧 `{"type":"auth","token":"..."}` | 鉴权失败关闭码通常为 `1008`。 |
 
 ## 常用枚举
 | 枚举 | 可选值 |
@@ -86,7 +86,7 @@ curl -X POST http://localhost:8000/api/v1/auth/login \
 
 `DashboardOverviewRead` 返回资产总数、在线资产数、高风险风险数、活跃任务数、发现入口状态、近期风险、高风险资产、风险等级统计和任务健康列表。
 
-## Agent / Haor
+## Agent / 玄武（兼容路径 haor）
 | 方法 | 路径 | 鉴权 | 参数/Body | 响应 |
 | --- | --- | --- | --- | --- |
 | `GET` | `/api/v1/agent/haor/summary` | 用户 | 无 | `AgentSessionSummaryRead` |
@@ -359,7 +359,7 @@ curl -X POST http://localhost:8000/api/v1/auth/login \
 | `ws /api/v1/logs/stream?token=...` | 管理员 | 无主动业务消息 | `snapshot`, `log_append`, `heartbeat`, `error` |
 | `ws /api/v1/mobile/alerts/stream?token=...` | 用户 | 任意文本用于保持连接 | `ready` 和设备异常告警事件 |
 
-### Haor WebSocket 客户端消息
+### 玄武 WebSocket 客户端消息
 `AgentStreamClientEnvelope` 字段：
 - `type`: `hello`, `message`, `ui_step`, `approve_plan`, `ping`。
 - `client_message_id?`, `step_request_id?`, `content?`, `note?`。
@@ -439,5 +439,5 @@ PY
 - 文档总索引：[README.md](README.md)
 - 后端设计：[backend-design.md](backend-design.md)
 - 前端设计：[frontend-design.md](frontend-design.md)
-- Haor 设计：[haor-agent-design.md](haor-agent-design.md)
+- 玄武设计：[haor-agent-design.md](haor-agent-design.md)
 - 运行手册：[runbook.md](runbook.md)

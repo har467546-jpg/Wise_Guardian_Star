@@ -27,7 +27,7 @@
   - 修复工作台、Runner 安装、修复会话推进
   - 漏洞库、规则导入导出、索引治理
   - 任务中心、日志中心
-  - Haor 站内自治助手
+  - 玄武站内自治助手
 
 详细说明见：[situational-awareness/README.md](/root/Desktop/Project/situational-awareness/README.md)
 
@@ -41,7 +41,7 @@
   - 总览、资产、任务、风险、我的
   - 资产详情、任务详情、风险详情、发现任务详情
   - `admin` 可见修复工作台
-  - 移动 Haor 助手入口
+  - 移动玄武助手入口
   - Android 前台 WebSocket 实时提醒 + 本地通知 + 后台定时同步
 
 详细说明见：[situational-awareness-mobile/README.md](/root/Desktop/Project/situational-awareness-mobile/README.md)
@@ -56,7 +56,7 @@
 | 规则库治理 | 支持 | 不承载 |
 | 漏洞修复编排 | 完整支持 | 仅 `admin` 轻量跟进 |
 | 实时提醒 | 页面内可视化与日志联动 | WebSocket + 本地通知 |
-| Haor | 完整站内自治助手 | 移动端助手入口与会话联动 |
+| 玄武 | 完整站内自治助手 | 移动端助手入口与会话联动 |
 
 ## 联调关系
 

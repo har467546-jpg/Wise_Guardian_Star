@@ -1,5 +1,6 @@
 import "@/styles/globals.css";
 import "antd/dist/reset.css";
+import "@xterm/xterm/css/xterm.css";
 
 import type { Metadata } from "next";
 import type { ReactNode } from "react";

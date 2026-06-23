@@ -2,6 +2,7 @@ from sqlalchemy import Select, String, and_, cast, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models.asset import Asset, AssetTag
+from app.db.models.credential import AssetCredentialBinding, SSHCredential
 from app.db.models.enums import AssetStatus
 from app.db.models.risk_finding import RiskFinding
 
@@ -67,7 +68,10 @@ def replace_asset_tags(db: Session, asset: Asset, tag_ids: list[str]) -> None:
 
 
 def delete_asset(db: Session, asset: Asset) -> None:
+    asset_id = asset.id
     db.delete(asset)
+    db.flush()
+    _delete_unbound_manual_credentials(db, [asset_id])
     db.commit()
 
 
@@ -79,13 +83,29 @@ def batch_delete_assets(db: Session, asset_ids: list[str]) -> tuple[int, list[st
     missing_ids = [asset_id for asset_id in asset_ids if asset_id not in existing_ids]
     deleted_count = 0
     if existing_ids:
+        asset_ids_to_cleanup = list(existing_ids)
         deleted_count = (
             db.query(Asset)
             .filter(Asset.id.in_(list(existing_ids)))
             .delete(synchronize_session=False)
         )
+        _delete_unbound_manual_credentials(db, asset_ids_to_cleanup)
         db.commit()
     return int(deleted_count), missing_ids
+
+
+def _delete_unbound_manual_credentials(db: Session, asset_ids: list[str]) -> None:
+    if not asset_ids:
+        return
+
+    credential_names = [f"manual-asset-{asset_id}" for asset_id in asset_ids]
+    credentials = db.scalars(select(SSHCredential).where(SSHCredential.name.in_(credential_names))).all()
+    for credential in credentials:
+        still_bound = db.scalar(
+            select(AssetCredentialBinding.id).where(AssetCredentialBinding.credential_id == credential.id).limit(1)
+        )
+        if still_bound is None:
+            db.delete(credential)
 
 
 def summarize_asset_risk(db: Session, asset_id: str) -> tuple[int, str | None]:

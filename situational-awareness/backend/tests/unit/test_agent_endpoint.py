@@ -281,7 +281,7 @@ def test_get_haor_session_summary_returns_running_task_attention(monkeypatch) ->
                 scope_type="agent_session",
                 scope_id=session_id,
                 progress=45,
-                message="正在执行 haor 编排",
+                message="正在执行 玄武 编排",
                 retry_count=0,
                 result_json={},
                 error_json={},
@@ -532,7 +532,7 @@ def test_post_haor_message_unlocks_completed_pending_message_turn(monkeypatch) -
                 session_id=session.id,
                 role="assistant",
                 message_type="text",
-                content="你好，我是 haor。",
+                content="你好，我是 玄武。",
                 payload_json={"stop_reason": "playbook_quick_smalltalk"},
                 created_at=now + timedelta(milliseconds=1),
             )
@@ -1534,7 +1534,7 @@ def test_step_haor_session_returns_409_when_no_active_session(monkeypatch) -> No
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "当前没有可继续的 haor 会话"
+    assert response.json()["detail"] == "当前没有可继续的 玄武 会话"
 
 
 def test_post_haor_message_maps_known_agent_upstream_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1923,7 +1923,7 @@ def test_interrupt_haor_session_returns_409_when_no_running_task(monkeypatch) ->
     response = client.post("/api/v1/agent/haor/session/interrupt", json={})
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "当前没有运行中的 haor 编排任务"
+    assert response.json()["detail"] == "当前没有运行中的 玄武 编排任务"
 
 
 def test_soft_focus_is_not_rebound_by_page_change_without_reference(monkeypatch) -> None:  # type: ignore[no-untyped-def]

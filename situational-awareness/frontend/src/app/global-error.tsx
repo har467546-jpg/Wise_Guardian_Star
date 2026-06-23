@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-const CHUNK_RELOAD_STORAGE_KEY = "haor:chunk-reload-signature";
+const CHUNK_RELOAD_STORAGE_KEY = "app:chunk-reload-signature";
 
 function isRecoverableChunkError(message: string): boolean {
   return [
@@ -15,7 +15,7 @@ function isRecoverableChunkError(message: string): boolean {
 
 function buildReloadUrl() {
   const url = new URL(window.location.href);
-  url.searchParams.set("__haor_chunk_reload", String(Date.now()));
+  url.searchParams.set("__app_chunk_reload", String(Date.now()));
   return url.toString();
 }
 

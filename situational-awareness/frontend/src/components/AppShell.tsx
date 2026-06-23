@@ -9,7 +9,8 @@ import { Button, ConfigProvider, Spin, Tooltip } from "antd";
 
 import GlobalSettingsModal from "@/components/GlobalSettingsModal";
 import HaorAgentLauncher from "@/components/HaorAgentLauncher";
-import { clearStoredToken, getStoredToken, getStoredUserRole } from "@/lib/auth";
+import { clearStoredToken, getStoredToken, getStoredUserRole, setStoredUserRole } from "@/lib/auth";
+import { getCurrentUser } from "@/services/api";
 
 // --- 类型定义与配置 ---
 type RouteMeta = {
@@ -29,6 +30,7 @@ const routeMetaMap: Array<{ match: (pathname: string) => boolean; meta: RouteMet
   { match: (p) => p === "/tasks/logs", meta: { title: "任务日志", description: "查看结构化任务事件、告警与重试记录。", kicker: "任务日志" } },
   { match: (p) => p.startsWith("/tasks/"), meta: { title: "任务详情", description: "查看任务耗时、阶段切片与结构化事件日志。", kicker: "任务详情" } },
   { match: (p) => p === "/risks", meta: { title: "全局风险列表", description: "按资产维度查看全局风险，并跳转到资产详情继续验证与处置。", kicker: "风险总览" } },
+  { match: (p) => p === "/settings", meta: { title: "系统设置中心", description: "调整平台安全、扫描、修复与 AI 接入运行参数。", kicker: "平台设置" } },
 ];
 
 // --- 辅助函数 ---
@@ -63,16 +65,44 @@ export default function AppShell({ children }: { children: ReactNode }) {
   // 1. 路由守卫与身份核验
   useEffect(() => {
     const token = getStoredToken() || process.env.NEXT_PUBLIC_TOKEN || "";
-    const hasAuth = Boolean(token);
-    
-    setAuthenticated(hasAuth);
-    setReady(true);
-
-    if (!hasAuth && currentPathname !== "/login") {
-      router.replace("/login");
-    } else if (hasAuth && currentPathname === "/login") {
-      router.replace("/");
+    if (!token) {
+      setAuthenticated(false);
+      setReady(true);
+      if (currentPathname !== "/login") {
+        router.replace("/login");
+      }
+      return;
     }
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const currentUser = await getCurrentUser();
+        if (cancelled) {
+          return;
+        }
+        setStoredUserRole(currentUser.role);
+        setAuthenticated(true);
+        setReady(true);
+        if (currentPathname === "/login") {
+          router.replace("/");
+        }
+      } catch {
+        if (cancelled) {
+          return;
+        }
+        clearStoredToken();
+        setAuthenticated(false);
+        setReady(true);
+        if (currentPathname !== "/login") {
+          router.replace("/login");
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [currentPathname, router]);
 
   // 2. 时钟更新
@@ -85,7 +115,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
     setNavOpen(false);
   }, [currentPathname]);
 
-  const userRole = getStoredUserRole();
+  const userRole = authenticated ? getStoredUserRole() : "";
   const currentMeta = useMemo(() => resolveRouteMeta(currentPathname), [currentPathname]);
   const isLoginPage = currentPathname === "/login";
   const handleLogout = () => {

@@ -1,9 +1,22 @@
 from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.db.base import Base
 from app.db.models.enums import TaskExecutionStatus, TaskType
 from app.db.models.task_event import TaskEvent
 from app.db.models.task_run import TaskRun
-from app.repositories.task_repo import cancel_task_run, create_task_run, update_task_run
+from app.repositories.task_repo import cancel_task_run, create_task_run, mark_stale_active_task_runs, update_task_run
+
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_for_sqlite(_type, _compiler, **_kw):  # type: ignore[no-untyped-def]
+    return "JSON"
 
 
 class _FakeDB:
@@ -142,3 +155,84 @@ def test_update_task_run_ensures_postgres_enum_before_cancel(monkeypatch) -> Non
     assert canceled.status == TaskExecutionStatus.CANCELED
     assert db.rollback_count == 1
     assert pg_calls == ["connect", "__enter__", "execution_options:AUTOCOMMIT", "execute", "__exit__"]
+
+
+def test_mark_stale_active_task_runs_marks_only_expired_active_tasks() -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    session_local = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+        class_=Session,
+    )
+    TaskRun.__table__.create(bind=engine)
+    TaskEvent.__table__.create(bind=engine)
+    now = datetime.now(timezone.utc)
+    stale_time = now - timedelta(hours=30)
+    fresh_time = now - timedelta(minutes=10)
+
+    with session_local() as db:
+        db.add_all(
+            [
+                TaskRun(
+                    id="task-stale",
+                    task_type=TaskType.REPORT_GENERATE,
+                    status=TaskExecutionStatus.PENDING,
+                    progress=0,
+                    message="资产报告已入队",
+                    retry_count=0,
+                    result_json={},
+                    error_json={},
+                    created_at=stale_time,
+                    updated_at=stale_time,
+                ),
+                TaskRun(
+                    id="task-fresh",
+                    task_type=TaskType.ASSET_SCAN,
+                    status=TaskExecutionStatus.RUNNING,
+                    progress=60,
+                    message="扫描中",
+                    retry_count=0,
+                    result_json={},
+                    error_json={},
+                    created_at=fresh_time,
+                    updated_at=fresh_time,
+                ),
+                TaskRun(
+                    id="task-done",
+                    task_type=TaskType.RISK_VERIFY,
+                    status=TaskExecutionStatus.SUCCESS,
+                    progress=100,
+                    message="完成",
+                    retry_count=0,
+                    result_json={},
+                    error_json={},
+                    created_at=stale_time,
+                    updated_at=stale_time,
+                ),
+            ]
+        )
+        db.commit()
+
+        marked = mark_stale_active_task_runs(db, stale_after_hours=24)
+        stale = db.get(TaskRun, "task-stale")
+        fresh = db.get(TaskRun, "task-fresh")
+        done = db.get(TaskRun, "task-done")
+        events = db.query(TaskEvent).filter(TaskEvent.task_run_id == "task-stale").all()
+
+    assert marked == 1
+    assert stale is not None
+    assert stale.status == TaskExecutionStatus.FAILURE
+    assert stale.finished_at is not None
+    assert stale.error_json["reason"] == "stale_active_task"
+    assert stale.error_json["previous_status"] == "pending"
+    assert fresh is not None and fresh.status == TaskExecutionStatus.RUNNING
+    assert done is not None and done.status == TaskExecutionStatus.SUCCESS
+    assert len(events) == 1
+    assert events[0].event_type == "failure"
+    assert events[0].payload_json["reason"] == "stale_active_task"

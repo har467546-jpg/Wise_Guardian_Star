@@ -87,14 +87,14 @@ def _wait_for_session_message(
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         status, session = client.request("GET", "/agent/haor/session")
-        _expect(status, 200, "读取 Haor 会话失败")
+        _expect(status, 200, "读取玄武会话失败")
         messages = session.get("messages") or []
         if messages:
             last = messages[-1]
             if predicate(last, session):
                 return session, last
         time.sleep(1.5)
-    raise AssertionError("等待 Haor 会话消息超时")
+    raise AssertionError("等待玄武会话消息超时")
 
 
 def _message_content(message: dict) -> str:
@@ -107,7 +107,7 @@ def _runtime_snapshot(session: dict) -> dict:
 
 def scenario_scan_and_followup(client: ApiClient, *, cidr: str) -> SmokeResult:
     status, _ = client.request("POST", "/agent/haor/session/reset", {})
-    _expect(status, 200, "重置 Haor 会话失败")
+    _expect(status, 200, "重置玄武会话失败")
 
     status, session = client.request(
         "POST",
@@ -145,7 +145,7 @@ def scenario_scan_and_followup(client: ApiClient, *, cidr: str) -> SmokeResult:
 
 def scenario_verify_and_followup(client: ApiClient, *, asset_id: str) -> SmokeResult:
     status, _ = client.request("POST", "/agent/haor/session/reset", {})
-    _expect(status, 200, "重置 Haor 会话失败")
+    _expect(status, 200, "重置玄武会话失败")
 
     status, session = client.request(
         "POST",
@@ -183,7 +183,7 @@ def scenario_verify_and_followup(client: ApiClient, *, asset_id: str) -> SmokeRe
 
 def scenario_remediation_with_maintenance_window(client: ApiClient, *, asset_id: str, maintenance_window_id: str) -> SmokeResult:
     status, _ = client.request("POST", "/agent/haor/session/reset", {})
-    _expect(status, 200, "重置 Haor 会话失败")
+    _expect(status, 200, "重置玄武会话失败")
 
     page_context = {"pathname": f"/assets/{asset_id}", "asset_id": asset_id, "query": {}}
     status, session = client.request(
@@ -199,7 +199,7 @@ def scenario_remediation_with_maintenance_window(client: ApiClient, *, asset_id:
     if session.get("status") != "waiting_approval":
         raise AssertionError(f"修复计划未进入待审批: {session.get('status')}")
 
-    status, approve = client.request("POST", "/agent/haor/session/approve", {"note": "haor smoke approve 1"})
+    status, approve = client.request("POST", "/agent/haor/session/approve", {"note": "玄武 smoke approve 1"})
     _expect(status, 202, "首次批准修复计划失败")
     orchestrate_task_id = str(approve.get("task_id") or "").strip()
     if not orchestrate_task_id:
@@ -237,7 +237,7 @@ def scenario_remediation_with_maintenance_window(client: ApiClient, *, asset_id:
     if params.get("maintenance_window_id") != maintenance_window_id:
         raise AssertionError("维护窗口 ID 没有写回待确认计划")
 
-    status, approve2 = client.request("POST", "/agent/haor/session/approve", {"note": "haor smoke approve 2"})
+    status, approve2 = client.request("POST", "/agent/haor/session/approve", {"note": "玄武 smoke approve 2"})
     _expect(status, 202, "带维护窗口的修复批准失败")
     orchestrate_task_id_2 = str(approve2.get("task_id") or "").strip()
     if not orchestrate_task_id_2:
@@ -285,7 +285,7 @@ def scenario_remediation_with_maintenance_window(client: ApiClient, *, asset_id:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Haor closed-loop smoke tests against a live local stack.")
+    parser = argparse.ArgumentParser(description="Run 玄武 closed-loop smoke tests against a live local stack.")
     parser.add_argument("--base-url", default="http://localhost:8000/api/v1")
     parser.add_argument("--user-id", default="user-1")
     parser.add_argument("--jwt-secret", default="change-this-secret")

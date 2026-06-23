@@ -1,12 +1,15 @@
 import logging
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.v1.router import api_router
@@ -18,7 +21,14 @@ from app.db.session import SessionLocal, engine
 from app.services.device_alert_service import device_alert_hub
 from app.services.campus_bootstrap_service import ensure_campus_auto_bootstrap
 from app.services.local_asset_service import purge_local_assets
+from app.services.audit_log_service import ensure_audit_log_storage, monotonic_ms, new_request_id, write_audit_log
 from app.services.platform_log_service import disable_platform_log_capture, enable_platform_log_capture, install_platform_log_capture
+from app.services.rate_limit_service import (
+    build_rate_limit_headers,
+    check_rate_limit,
+    close_rate_limit_client,
+    should_skip_rate_limit,
+)
 from app.utils.local_asset import remember_local_asset_hint
 
 _LOCAL_ASSET_PURGE_COMPLETED = False
@@ -71,6 +81,26 @@ def _purge_removed_vuln_library_tasks(logger: logging.Logger) -> None:
         )
 
 
+def _read_alembic_head_revision() -> str | None:
+    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    if not versions_dir.exists():
+        return None
+    revisions = sorted(item.stem.split("_", 1)[0] for item in versions_dir.glob("*.py") if item.is_file() and item.name != "__init__.py")
+    return revisions[-1] if revisions else None
+
+
+def _read_current_db_revision() -> str | None:
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))
+            row = result.first()
+            if not row:
+                return None
+            return str(row[0] or "").strip() or None
+    except Exception:
+        return None
+
+
 def create_app() -> FastAPI:
     configure_logging()
     install_platform_log_capture(service_name="backend")
@@ -85,8 +115,20 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         platform_log_capture_enabled = False
         try:
-            Base.metadata.create_all(bind=engine)
+            if settings.AUTO_CREATE_SCHEMA:
+                Base.metadata.create_all(bind=engine)
+            elif settings.STRICT_SCHEMA_REVISION_CHECK:
+                logger.info("AUTO_CREATE_SCHEMA disabled; expecting schema to be managed by Alembic")
+                head_revision = _read_alembic_head_revision()
+                current_revision = _read_current_db_revision()
+                if head_revision and current_revision and head_revision != current_revision:
+                    raise RuntimeError(
+                        f"Database revision mismatch: current={current_revision}, expected={head_revision}. Run alembic upgrade head first."
+                    )
+                if head_revision:
+                    logger.info("Expected Alembic head revision: %s", head_revision)
             _purge_removed_vuln_library_tasks(logger)
+            ensure_audit_log_storage()
             with SessionLocal() as db:
                 try:
                     bootstrap_summary = ensure_campus_auto_bootstrap(db)
@@ -109,6 +151,10 @@ def create_app() -> FastAPI:
         finally:
             if platform_log_capture_enabled:
                 disable_platform_log_capture()
+            try:
+                await close_rate_limit_client()
+            except Exception:
+                pass
             await device_alert_hub.stop()
 
     app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
@@ -134,6 +180,46 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def security_boundary(request: Request, call_next):
+        request_id = new_request_id(request)
+        started_at = time.perf_counter()
+        response = None
+        rate_decision = None
+        rate_limited = False
+        error_message = None
+        try:
+            if not should_skip_rate_limit(request):
+                rate_decision = await check_rate_limit(request)
+                if not rate_decision.allowed:
+                    rate_limited = True
+                    response = JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后重试"})
+                    return response
+
+            response = await call_next(request)
+            return response
+        except Exception as exc:
+            error_message = str(exc)
+            raise
+        finally:
+            status_code = response.status_code if response is not None else 500
+            if response is not None:
+                response.headers["X-Request-ID"] = request_id
+                if rate_decision is not None:
+                    response.headers.update(build_rate_limit_headers(rate_decision))
+            write_audit_log(
+                request=request,
+                request_id=request_id,
+                status_code=status_code,
+                duration_ms=monotonic_ms(started_at),
+                rate_limited=rate_limited,
+                error_message=error_message,
+                payload_json={
+                    "rate_limited": rate_limited,
+                    "rate_limit_remaining": rate_decision.remaining if rate_decision is not None else None,
+                },
+            )
 
     @app.exception_handler(RequestValidationError)
     async def log_request_validation_error(request: Request, exc: RequestValidationError):

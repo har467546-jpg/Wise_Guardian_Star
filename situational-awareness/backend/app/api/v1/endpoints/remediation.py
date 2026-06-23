@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from datetime import datetime, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.orm import Session
@@ -9,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_admin_user, get_db_session
 from app.core.security import SecurityError, decode_access_token
 from app.db.models.asset import Asset
+from app.db.models.audit_log_entry import AuditLogEntry
 from app.db.models.enums import TaskExecutionStatus, TaskType, UserRole
 from app.db.models.remediation_session import RemediationSession
 from app.db.models.user import User
@@ -56,6 +60,13 @@ from app.services.runner_service import (
     resolve_runner_by_asset_for_read,
     resolve_runner_public_url,
     serialize_host_runner,
+)
+from app.services.ssh_terminal_service import (
+    SSHTerminalError,
+    build_ssh_terminal_profile,
+    clamp_terminal_cols,
+    clamp_terminal_rows,
+    run_ssh_terminal,
 )
 from app.services.task_observability_service import serialize_task_event
 from app.tasks.remediation_tasks import run_remediation_execute_task
@@ -404,6 +415,81 @@ def get_remediation_task_evidence(
     )
 
 
+@router.websocket("/assets/{asset_id}/terminal")
+async def stream_asset_terminal(asset_id: str, websocket: WebSocket) -> None:
+    request_id = f"ws-{uuid4().hex}"
+    started_at = time.perf_counter()
+    token = websocket.query_params.get("token") or ""
+    if not token:
+        _write_terminal_audit(
+            websocket=websocket,
+            user=None,
+            asset_id=asset_id,
+            request_id=request_id,
+            started_at=started_at,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            outcome="failure",
+            error_message="missing token",
+        )
+        await websocket.close(code=1008, reason="missing token")
+        return
+    with SessionLocal() as db:
+        user = _resolve_websocket_admin(db, token)
+        if user is None:
+            _write_terminal_audit(
+                websocket=websocket,
+                user=None,
+                asset_id=asset_id,
+                request_id=request_id,
+                started_at=started_at,
+                status_code=status.HTTP_403_FORBIDDEN,
+                outcome="failure",
+                error_message="unauthorized",
+            )
+            await websocket.close(code=1008, reason="unauthorized")
+            return
+        try:
+            terminal_profile = build_ssh_terminal_profile(db, asset_id)
+        except SSHTerminalError:
+            _write_terminal_audit(
+                websocket=websocket,
+                user=user,
+                asset_id=asset_id,
+                request_id=request_id,
+                started_at=started_at,
+                status_code=status.HTTP_403_FORBIDDEN,
+                outcome="failure",
+                error_message="terminal not allowed",
+            )
+            await websocket.close(code=1008, reason="terminal not allowed")
+            return
+    cols = clamp_terminal_cols(websocket.query_params.get("cols"))
+    rows = clamp_terminal_rows(websocket.query_params.get("rows"))
+    await websocket.accept()
+    session_started = False
+    try:
+        session_started = await run_ssh_terminal(websocket, terminal_profile, cols=cols, rows=rows)
+    finally:
+        _write_terminal_audit(
+            websocket=websocket,
+            user=user,
+            asset_id=asset_id,
+            request_id=request_id,
+            started_at=started_at,
+            status_code=status.HTTP_101_SWITCHING_PROTOCOLS if session_started else status.HTTP_502_BAD_GATEWAY,
+            outcome="success" if session_started else "failure",
+            payload_json={
+                "event": "terminal_session_closed" if session_started else "terminal_session_failed",
+                "cols": cols,
+                "rows": rows,
+            },
+        )
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass
+
+
 @router.websocket("/tasks/{task_id}/stream")
 async def stream_remediation_task(task_id: str, websocket: WebSocket) -> None:
     token = websocket.query_params.get("token") or ""
@@ -563,3 +649,56 @@ def _resolve_platform_url(request: Request) -> str:
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+def _write_terminal_audit(
+    *,
+    websocket: WebSocket,
+    user: User | None,
+    asset_id: str,
+    request_id: str,
+    started_at: float,
+    status_code: int,
+    outcome: str,
+    error_message: str | None = None,
+    payload_json: dict[str, object] | None = None,
+) -> None:
+    try:
+        with SessionLocal() as db:
+            db.add(
+                AuditLogEntry(
+                    request_id=request_id,
+                    actor_user_id=user.id if user else None,
+                    actor_role=(user.role.value if hasattr(user.role, "value") else str(user.role)) if user else None,
+                    client_ip=_resolve_websocket_client_ip(websocket),
+                    user_agent=str(websocket.headers.get("user-agent") or "").strip()[:512] or None,
+                    method="WS",
+                    path=str(websocket.url.path)[:512],
+                    action="remediation_terminal_stream",
+                    resource_type="asset",
+                    resource_id=asset_id,
+                    status_code=status_code,
+                    outcome=outcome,
+                    duration_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
+                    query_json={
+                        "cols": clamp_terminal_cols(websocket.query_params.get("cols")),
+                        "rows": clamp_terminal_rows(websocket.query_params.get("rows")),
+                    },
+                    payload_json=payload_json or {"event": "terminal_session_rejected"},
+                    error_message=error_message,
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+            db.commit()
+    except Exception:
+        pass
+
+
+def _resolve_websocket_client_ip(websocket: WebSocket) -> str | None:
+    forwarded_for = str(websocket.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    if forwarded_for:
+        return forwarded_for[:64]
+    real_ip = str(websocket.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip[:64]
+    return websocket.client.host[:64] if websocket.client else None

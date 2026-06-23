@@ -18,6 +18,7 @@ from app.schemas.risk import RiskFindingMobileRead
 from app.schemas.task import TaskRunRead
 from app.repositories.task_event_repo import list_task_events_for_runs
 from app.services.task_observability_service import serialize_task_run
+from app.services.task_reconciliation_service import reconcile_stale_active_tasks
 
 ACTIVE_TASK_STATUSES = (
     TaskExecutionStatus.PENDING,
@@ -154,6 +155,7 @@ def _load_risky_assets(db: Session, *, limit: int = 5) -> list[DashboardRiskyAss
 
 
 def build_dashboard_overview(db: Session) -> DashboardOverviewRead:
+    reconcile_stale_active_tasks(db)
     return DashboardOverviewRead(
         asset_total=_count_assets(db),
         online_assets=_count_assets(db, status=AssetStatus.ONLINE),

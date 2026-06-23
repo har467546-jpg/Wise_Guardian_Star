@@ -93,6 +93,9 @@ def schedule_campus_discovery_job(
         update_task_run(
             db,
             child_task,
+            execution_boundary="runner_dispatch",
+            runner_asset_id=assignment.asset_id,
+            scanner_zone_id=zone.id,
             result_json={
                 "scan_phase": "baseline",
                 "context": {

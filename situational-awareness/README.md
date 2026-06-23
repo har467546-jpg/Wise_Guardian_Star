@@ -8,13 +8,13 @@
 - 风险识别：规则匹配、风险分级、主动验证、治理与修复模板生成
 - 修复闭环：Runner 安装、修复会话、执行跟踪、复验与回滚工件
 - 平台观测：任务中心、平台日志、实时监控、移动端告警流
-- 智能体协同：Haor 站内自治助手，支持页面理解、审批控制与任务联动
+- 智能体协同：玄武站内自治助手，支持页面理解、审批控制与任务联动
 
 ## 技术栈
 - 前端：Next.js 15、React 19、TypeScript、Ant Design 5
 - 后端：FastAPI、SQLAlchemy 2、Pydantic 2、Celery 5
 - 数据与基础设施：PostgreSQL 16、Redis 7、Docker Compose
-- 安全与智能：JWT、bcrypt、Fernet、asyncssh、可切换 LLM provider、Haor
+- 安全与智能：JWT、bcrypt、Fernet、asyncssh、可切换 LLM provider、玄武
 
 ## 快速开始
 1. 按需检查环境变量模板：
@@ -49,14 +49,14 @@ docker compose --profile dev up -d --build backend-dev worker-dev frontend-dev
 - 接口说明：[docs/api-contract.md](docs/api-contract.md)
 - 运行手册：[docs/runbook.md](docs/runbook.md)
 - 测试与验收：[docs/testing-and-acceptance.md](docs/testing-and-acceptance.md)
-- Haor 设计：[docs/haor-agent-design.md](docs/haor-agent-design.md)
+- 玄武设计：[docs/haor-agent-design.md](docs/haor-agent-design.md)
 
 历史记录入口：
 - 记录索引：[docs/records/README.md](docs/records/README.md)
 
 ## 目录说明
 - `backend/`：FastAPI、业务服务、任务编排、数据库模型与测试
-- `frontend/`：Next.js 桌面控制台、Haor 前端运行时与页面组件
+- `frontend/`：Next.js 桌面控制台、玄武前端运行时与页面组件
 - `infra/`：Docker Compose、PostgreSQL 初始化、settings helper
 - `docs/`：标准项目文档与标准化历史记录
 - `situational-awareness-mobile/`：移动端配套应用

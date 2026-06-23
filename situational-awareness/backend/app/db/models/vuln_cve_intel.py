@@ -15,7 +15,7 @@ class VulnCveIntel(Base):
     )
 
     cve_id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    source: Mapped[str] = mapped_column(String(128), default="nvd")
+    source: Mapped[str] = mapped_column(String(128), default="cve_project")
     cvss_v3: Mapped[float | None] = mapped_column(Float, nullable=True)
     epss_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     kev_flag: Mapped[bool] = mapped_column(Boolean, default=False)

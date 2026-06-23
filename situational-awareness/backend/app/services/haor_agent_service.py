@@ -69,9 +69,12 @@ from app.schemas.agent import (
     AgentUIStepRequest,
 )
 from app.services.ai.providers import LLMMessage, LLMRequest, build_provider
+from app.services.agent.async_state import AsyncStatePatch, merge_task_async_state, suspend_agent_session
 from app.services.agent.context_service import sanitize_browser_context_summary
+from app.services.agent.dlp import redact_sensitive_payload, redact_sensitive_text
 from app.services.agent.execution_registry import AgentActionExecutorContext, AgentExecutionResult
 from app.services.agent.execution_service import AgentExecutionService
+from app.services.agent.identity import AGENT_DISPLAY_NAME, AGENT_ID
 from app.services.haor.action_policy import (
     ACTION_POLICY_REGISTRY,
     AUTO_EXECUTE_ACTIONS,
@@ -124,7 +127,6 @@ from app.utils.net import normalize_cidr
 from app.utils.sanitize import sanitize_json_value, sanitize_text
 
 
-AGENT_ID = "haor"
 ACTIVE_TASK_STATUSES = {
     TaskExecutionStatus.PENDING,
     TaskExecutionStatus.RUNNING,
@@ -919,6 +921,7 @@ def _normalize_browser_runtime(browser_runtime: dict[str, Any] | None) -> dict[s
     pending_secure_input = _normalize_pending_secure_input(
         payload.get("pending_secure_input") if isinstance(payload.get("pending_secure_input"), dict) else {}
     )
+    async_state = payload.get("async_state") if isinstance(payload.get("async_state"), dict) else {}
     normalized_pending_actions = []
     for item in pending_ui_actions[:MAX_UI_ACTION_BATCH]:
         normalized_action = _normalize_ui_action(item if isinstance(item, dict) else {})
@@ -935,6 +938,7 @@ def _normalize_browser_runtime(browser_runtime: dict[str, Any] | None) -> dict[s
         "completed_ui_actions": _normalize_ui_action_results(completed_ui_actions),
         "last_ui_results": _normalize_ui_action_results(last_ui_results),
         "pending_secure_input": pending_secure_input,
+        "async_state": redact_sensitive_payload(async_state),
         "auto_executed_actions": sanitize_json_value(auto_executed_actions) if auto_executed_actions else [],
         "last_browser_context": _normalize_browser_context(
             payload.get("last_browser_context") if isinstance(payload.get("last_browser_context"), dict) else {}
@@ -1507,6 +1511,7 @@ def _normalize_agent_state(payload: dict[str, Any] | None, *, last_task_id: str 
     execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}
     explanation = raw.get("explanation") if isinstance(raw.get("explanation"), dict) else {}
     watch = raw.get("watch") if isinstance(raw.get("watch"), dict) else {}
+    async_state = raw.get("async_state") if isinstance(raw.get("async_state"), dict) else {}
 
     normalized_focus = {
         "summary": sanitize_text(str(focus.get("summary") or ""), max_length=255) or None,
@@ -1577,6 +1582,7 @@ def _normalize_agent_state(payload: dict[str, Any] | None, *, last_task_id: str 
         "execution": normalized_execution,
         "explanation": normalized_explanation,
         "watch": normalized_watch,
+        "async_state": redact_sensitive_payload(async_state),
         "traces": normalized_traces,
         "last_trace": sanitize_json_value(last_trace if isinstance(last_trace, dict) else {}),
         "metrics": sanitize_json_value(metrics if isinstance(metrics, dict) else {}),
@@ -1596,7 +1602,7 @@ def _session_last_task_id(session: AgentSession | Any) -> str | None:
 
 def _build_agent_state_delta(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     delta: dict[str, Any] = {}
-    for key in ("focus", "execution", "explanation", "watch"):
+    for key in ("focus", "execution", "explanation", "watch", "async_state"):
         if sanitize_json_value(previous.get(key)) != sanitize_json_value(current.get(key)):
             delta[key] = sanitize_json_value(current.get(key))
     return delta
@@ -2889,7 +2895,7 @@ def _build_reply_stream_request(
         messages=[
             LLMMessage.from_text(
                 "system",
-                "你是 haor 的回复整理器。"
+                f"你是 {AGENT_DISPLAY_NAME} 的回复整理器。"
                 f"你的任务是：{goal}。"
                 "不要改变事实，不要新增对象 ID、动作、风险结论或执行结果，不要泄露 JSON 结构，只输出最终中文正文。"
                 "不要重复句子、不要整段复述同一结果、不要把动作日志原样再说一遍。",
@@ -2912,8 +2918,8 @@ def _append_message(
         session_id=session.id,
         role=_sanitize_line(role, max_length=32) or "assistant",
         message_type=_sanitize_line(message_type, max_length=32) or "text",
-        content=sanitize_text(content, max_length=MAX_ASSISTANT_MESSAGE_CHARS) or "",
-        payload_json=sanitize_json_value(payload_json or {}),
+        content=redact_sensitive_text(content, max_length=MAX_ASSISTANT_MESSAGE_CHARS) or "",
+        payload_json=redact_sensitive_payload(payload_json or {}),
     )
     session.updated_at = _now()
     db.add(message)
@@ -3502,7 +3508,7 @@ def _log_message_turn_event(
 def _raise_if_session_running(session: AgentSession | None, *, stage: str) -> None:
     if session is None or str(session.status or "") != "running":
         return
-    raise AgentConflictError("当前 haor 正在执行编排任务，请先中断当前任务", session_id=session.id, stage=stage)
+    raise AgentConflictError(f"当前 {AGENT_DISPLAY_NAME} 正在执行编排任务，请先中断当前任务", session_id=session.id, stage=stage)
 
 
 def mark_agent_session_interrupted(
@@ -5354,7 +5360,7 @@ def _classify_agent_service_error(
             session_id=session_id,
             stage=stage,
         )
-    detail = sanitize_text(str(exc), max_length=300) or "haor 请求失败"
+    detail = sanitize_text(str(exc), max_length=300) or f"{AGENT_DISPLAY_NAME} 请求失败"
     if isinstance(exc, PermissionError):
         return AgentPermissionDeniedError(detail, session_id=session_id, stage=stage)
     if isinstance(exc, ValueError):
@@ -5368,7 +5374,7 @@ def _classify_agent_service_error(
         if any(
             marker in detail
             for marker in (
-                "当前没有可继续的 haor 会话",
+                f"当前没有可继续的 {AGENT_DISPLAY_NAME} 会话",
                 "当前没有待批准的智能体动作计划",
                 "当前待批准计划为空或不受支持",
                 "当前待确认计划不存在",
@@ -6001,7 +6007,7 @@ def _build_model_request(
     messages: list[LLMMessage] = [
         LLMMessage.from_text(
             "system",
-            "你是 haor，负责在资产态势感知平台内充当站内自治助手。"
+            f"你是 {AGENT_DISPLAY_NAME}，负责在资产态势感知平台内充当站内自治助手。"
             "同一会话可以连续处理不同资产、风险、任务和修复对象；页面地址只是提示，不是硬性上下文绑定。"
             "你必须优先推进当前目标，能做动作时不要退化成纯说明，并严格遵守平台白名单工具与动作边界。",
         ),
@@ -6266,7 +6272,7 @@ def _build_mock_model_decision(
     target_summary = _working_context_summary(working_context) or page_context.get("pathname") or "未识别"
     role_label = "管理员" if _normalize_role(user.role) == "admin" else "分析员"
     lines = [
-        "当前 haor 处于模拟模式（mock），未接入真实模型推理。",
+        f"当前 {AGENT_DISPLAY_NAME} 处于模拟模式（mock），未接入真实模型推理。",
         f"当前身份：{role_label}",
         f"当前页面：{page_summary.get('page_kind') or page_context.get('pathname') or 'unknown'}",
         f"当前焦点：{target_summary}",
@@ -8243,7 +8249,7 @@ def post_agent_message(
             phase=current_phase,
             result="conflict",
         )
-        raise AgentConflictError("当前 haor 正在处理上一轮消息，请稍候或重试", session_id=session.id, stage="message")
+        raise AgentConflictError(f"当前 {AGENT_DISPLAY_NAME} 正在处理上一轮消息，请稍候或重试", session_id=session.id, stage="message")
 
     page_context = _normalize_page_context(payload.page_context.model_dump(mode="json"))
     browser_context = _normalize_browser_context(payload.browser_context.model_dump(mode="json"))
@@ -10028,7 +10034,7 @@ def post_agent_step(
     if session is not None and _reconcile_session_runtime_state(db, session=session):
         db.flush()
     if session is None or not is_active_public_session_status(str(session.status or "")):
-        raise AgentConflictError("当前没有可继续的 haor 会话", stage="step")
+        raise AgentConflictError(f"当前没有可继续的 {AGENT_DISPLAY_NAME} 会话", stage="step")
     _raise_if_session_running(session, stage="step")
     session_last_task_id = _session_last_task_id(session)
 
@@ -10497,12 +10503,15 @@ def execute_approved_action(
     session_user_id: str,
     platform_url: str,
 ) -> AgentExecutionResult:
+    actor = db.get(User, session_user_id)
+    session_user_role = _normalize_role(getattr(actor, "role", "")) if actor is not None else ""
     return AGENT_EXECUTION_SERVICE.execute(
         AgentActionExecutorContext(
             db=db,
             session_user_id=session_user_id,
             platform_url=platform_url,
             get_manual_credential=get_manual_credential,
+            session_user_role=session_user_role,
         ),
         action=action,
     )
@@ -10546,7 +10555,7 @@ def approve_agent_session(
 ) -> AgentApprovalResponse:
     session = _load_recent_session(db, user_id=user.id)
     if session is None:
-        raise AgentNotFoundError("当前没有可批准的 haor 会话", stage="approve")
+        raise AgentNotFoundError(f"当前没有可批准的 {AGENT_DISPLAY_NAME} 会话", stage="approve")
     if _reconcile_session_runtime_state(db, session=session):
         db.flush()
     _raise_if_session_running(session, stage="approve")
@@ -10563,7 +10572,7 @@ def approve_agent_session(
         task_type=TaskType.AGENT_ORCHESTRATE,
         scope_type="agent_session",
         scope_id=session.id,
-        message="haor 编排任务已入队",
+        message=f"{AGENT_DISPLAY_NAME} 编排任务已入队",
     )
     result_json = {
         "context": {
@@ -10594,12 +10603,38 @@ def approve_agent_session(
             "results": [],
         },
     }
+    result_json = merge_task_async_state(
+        result_json,
+        AsyncStatePatch(
+            stage="queued",
+            message=f"{AGENT_DISPLAY_NAME} 编排任务已入队",
+            suspend_reason="awaiting_task",
+            task_id=task_run.id,
+            progress=0,
+            payload={
+                "session_id": session.id,
+                "action_count": len(sanitized_actions),
+                "first_action_type": sanitized_actions[0].get("action_type") if sanitized_actions else None,
+            },
+        ),
+    )
     update_task_run(db, task_run, result_json=result_json)
     session.status = "running"
     session.pending_plan_json = {}
     session.dialog_state_json = {}
     session.browser_runtime_json = {}
     session.last_task_id = task_run.id
+    suspend_agent_session(
+        session,
+        reason="awaiting_task",
+        task_id=task_run.id,
+        message=task_run.message or f"{AGENT_DISPLAY_NAME} 编排任务已入队",
+        runtime_phase="running",
+        payload={
+            "action_count": len(sanitized_actions),
+            "first_action_type": sanitized_actions[0].get("action_type") if sanitized_actions else None,
+        },
+    )
     sync_agent_task_watch_state(
         session,
         task_id=task_run.id,

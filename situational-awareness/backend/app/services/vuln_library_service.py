@@ -273,15 +273,19 @@ class VulnLibraryService:
         with self.session_factory() as db:
             return get_vuln_intel_status(db, rules=rules)
 
-    def sync_intel(self) -> VulnIntelSyncResult:
+    def sync_intel(self, progress_callback: Callable[[int, str, dict[str, Any]], None] | None = None) -> VulnIntelSyncResult:
         ruleset = self.rule_store.loader.maybe_reload()
         schema_status = self._get_schema_status()
         if not schema_status.ready:
             raise VulnLibrarySchemaNotReadyError(schema_status.error or self._default_schema_error_message())
         expected_hash = self._calculate_source_hash(ruleset.rules)
         with self.session_factory() as db:
-            result = sync_vuln_intel(db, rules=ruleset.rules)
+            result = sync_vuln_intel(db, rules=ruleset.rules, progress_callback=progress_callback)
+            if progress_callback is not None:
+                progress_callback(94, "正在刷新漏洞规则索引", {"indexed_rules": len(ruleset.rules)})
             self._rebuild_index_in_session(db, ruleset.rules, expected_hash)
+            if progress_callback is not None:
+                progress_callback(97, "正在重算开放风险优先级", {"indexed_rules": len(ruleset.rules)})
             recalculate_open_finding_priorities(db, rules=ruleset.rules)
             return result
 

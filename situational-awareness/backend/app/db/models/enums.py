@@ -53,6 +53,7 @@ class TaskType(str, Enum):
     REMEDIATION_EXECUTE = "remediation_execute"
     AGENT_ORCHESTRATE = "agent_orchestrate"
     SETTINGS_APPLY = "settings_apply"
+    VULN_INTEL_SYNC = "vuln_intel_sync"
 
 
 class TaskExecutionStatus(str, Enum):

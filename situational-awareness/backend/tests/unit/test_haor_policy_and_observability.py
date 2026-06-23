@@ -4,6 +4,7 @@ from app.services.haor.action_policy import (
     AUTO_EXECUTE_ACTIONS,
     SUPPORTED_WRITE_ACTIONS,
     action_allows_auto_execute,
+    is_action_allowed_for_role,
 )
 from app.services.haor.observability import (
     append_trace_payload,
@@ -22,7 +23,10 @@ def test_action_policy_is_single_source_for_supported_and_auto_actions() -> None
     )
     assert action_allows_auto_execute("create_discovery_job") is True
     assert action_allows_auto_execute("approve_remediation_session") is False
+    assert is_action_allowed_for_role("create_discovery_job", "admin") is True
+    assert is_action_allowed_for_role("create_discovery_job", "analyst") is False
     assert ACTION_POLICY_REGISTRY["configure_ssh_credential"]["risk_level"] == "sensitive_input"
+    assert ACTION_POLICY_REGISTRY["configure_ssh_credential"]["allowed_roles"] == ["admin"]
 
 
 def test_observability_trace_summarizes_latency_tokens_and_success() -> None:

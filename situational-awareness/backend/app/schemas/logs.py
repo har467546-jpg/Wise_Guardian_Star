@@ -25,3 +25,29 @@ class LogEntryRead(ORMModel):
 class LogEntryListResponse(BaseModel):
     items: list[LogEntryRead]
     meta: PageMeta
+
+
+class AuditLogEntryRead(BaseModel):
+    id: str
+    request_id: str
+    actor_user_id: str | None
+    actor_role: str | None
+    client_ip: str | None
+    user_agent: str | None
+    method: str
+    path: str
+    action: str
+    resource_type: str | None
+    resource_id: str | None
+    status_code: int
+    outcome: str
+    duration_ms: int
+    query_json: dict
+    payload_json: dict
+    error_message: str | None
+    created_at: datetime
+
+
+class AuditLogEntryListResponse(BaseModel):
+    items: list[AuditLogEntryRead]
+    meta: PageMeta

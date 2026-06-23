@@ -66,7 +66,7 @@ def _make_task_run(*, result_json: dict | None = None, status: TaskExecutionStat
         id="task-orchestrate-1",
         status=status,
         progress=0,
-        message="haor 编排任务已入队",
+        message="玄武 编排任务已入队",
         result_json=deepcopy(result_json) if isinstance(result_json, dict) else {},
         error_json={},
     )

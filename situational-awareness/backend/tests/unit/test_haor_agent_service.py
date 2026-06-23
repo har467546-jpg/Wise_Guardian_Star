@@ -111,7 +111,7 @@ def test_build_model_request_uses_structured_messages() -> None:
     )
 
     assert request.messages[0].role == "system"
-    assert "haor" in request.messages[0].text_content()
+    assert "玄武" in request.messages[0].text_content()
     assert request.messages[1].role == "system"
     assert "output_schema" in request.messages[1].text_content()
     assert '"conversation_focus"' in request.messages[2].text_content()
@@ -497,7 +497,7 @@ def test_append_or_stream_assistant_message_skips_rewrite_when_payload_requests_
         _FakeUnitDB(),
         session=session,
         message_type="text",
-        content="你好，我是 haor。",
+        content="你好，我是 玄武。",
         payload_json={"skip_reply_rewrite": True, "stop_reason": "playbook_quick_smalltalk"},
         user_content="你好",
         tool_traces=[],
@@ -509,9 +509,9 @@ def test_append_or_stream_assistant_message_skips_rewrite_when_payload_requests_
     delta_text = "".join(str(item.get("delta") or "") for item in events if item.get("type") == "assistant_message_delta")
     done_event = next(item for item in events if item.get("type") == "assistant_message_done")
 
-    assert delta_text == "你好，我是 haor。"
-    assert done_event["message"]["content"] == "你好，我是 haor。"
-    assert message.content == "你好，我是 haor。"
+    assert delta_text == "你好，我是 玄武。"
+    assert done_event["message"]["content"] == "你好，我是 玄武。"
+    assert message.content == "你好，我是 玄武。"
 
 
 def test_append_or_stream_assistant_message_skips_rewrite_for_long_reply(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -881,7 +881,7 @@ def test_recover_agent_session_unlocks_completed_pending_message_turn(monkeypatc
                 id="msg-assistant-1",
                 role="assistant",
                 message_type="text",
-                content="你好，我是 haor。",
+                content="你好，我是 玄武。",
                 payload_json={"stop_reason": "playbook_quick_smalltalk"},
                 created_at=now,
             ),

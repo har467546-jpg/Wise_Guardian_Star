@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 ActionRiskLevel = Literal["low", "high", "sensitive_input"]
 TaskFollowupStrategy = Literal["watch_task", "session", "secure_input"]
+ActionRole = Literal["admin", "analyst"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +17,7 @@ class HaorActionPolicy:
     needs_confirmation: bool
     auto_execute_allowed: bool
     task_followup_strategy: TaskFollowupStrategy
+    allowed_roles: tuple[ActionRole, ...] = ("admin",)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -24,6 +26,7 @@ class HaorActionPolicy:
             "needs_confirmation": self.needs_confirmation,
             "auto_execute_allowed": self.auto_execute_allowed,
             "task_followup_strategy": self.task_followup_strategy,
+            "allowed_roles": list(self.allowed_roles),
         }
 
 
@@ -105,3 +108,10 @@ def action_allows_auto_execute(action_type: str) -> bool:
     policy = get_action_policy(action_type)
     return bool(policy and policy.auto_execute_allowed)
 
+
+def is_action_allowed_for_role(action_type: str, role: str) -> bool:
+    policy = get_action_policy(action_type)
+    if policy is None:
+        return False
+    normalized_role = str(role or "").strip().lower()
+    return normalized_role in policy.allowed_roles

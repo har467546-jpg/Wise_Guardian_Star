@@ -13,6 +13,8 @@ import '../../shared/models/agent_models.dart';
 import '../../shared/models/app_models.dart';
 import 'haor_runtime.dart';
 
+const haorAgentDisplayName = '玄武';
+
 final haorAssistantOpenProvider = StateProvider<bool>((ref) => false);
 
 class MobileHaorAssistantLauncher extends ConsumerStatefulWidget {
@@ -298,7 +300,7 @@ class _MobileHaorAssistantLauncherState
             return;
           }
           setState(() {
-            _streamError = 'haor 流式连接异常，正在尝试恢复';
+            _streamError = '$haorAgentDisplayName 流式连接异常，正在尝试恢复';
           });
         },
         onDone: _handleSocketDone,
@@ -316,7 +318,7 @@ class _MobileHaorAssistantLauncherState
         return;
       }
       setState(() {
-        _streamError = 'haor 流式连接异常，正在尝试恢复';
+        _streamError = '$haorAgentDisplayName 流式连接异常，正在尝试恢复';
         _connectionState = _ConnectionState.connecting;
       });
       _scheduleReconnect();
@@ -359,7 +361,8 @@ class _MobileHaorAssistantLauncherState
       _connectionState = _providerOpen
           ? _ConnectionState.connecting
           : _ConnectionState.disconnected;
-      _streamError = _providerOpen ? 'haor 流式连接已断开，正在尝试恢复' : null;
+      _streamError =
+          _providerOpen ? '$haorAgentDisplayName 流式连接已断开，正在尝试恢复' : null;
       _draftAssistantMessage = null;
       _assistantPlaceholder = null;
       _pendingUiRequest = null;
@@ -383,7 +386,7 @@ class _MobileHaorAssistantLauncherState
         return;
       }
       setState(() {
-        _streamError = 'haor 流式数据解析失败';
+        _streamError = '$haorAgentDisplayName 流式数据解析失败';
       });
     }
   }
@@ -1110,7 +1113,7 @@ class _MobileHaorAssistantLauncherState
                                             ),
                                             SizedBox(height: 2),
                                             Text(
-                                              'haor',
+                                              haorAgentDisplayName,
                                               style: TextStyle(
                                                 fontSize: 20,
                                                 fontWeight: FontWeight.w900,
@@ -1188,7 +1191,8 @@ class _MobileHaorAssistantLauncherState
                                           (_session?.messages.isEmpty ?? true))
                                         const _EmptyCard(
                                           title: '正在恢复会话',
-                                          message: 'haor 正在同步最近的聊天记录和任务状态。',
+                                          message:
+                                              '$haorAgentDisplayName 正在同步最近的聊天记录和任务状态。',
                                         ),
                                       if (!_loading &&
                                           (_session?.messages.isEmpty ??
@@ -1198,7 +1202,7 @@ class _MobileHaorAssistantLauncherState
                                         const _EmptyCard(
                                           title: '开始聊天',
                                           message:
-                                              '直接像聊天一样提问，或告诉 haor 你想在站内执行什么操作。',
+                                              '直接像聊天一样提问，或告诉 $haorAgentDisplayName 你想在站内执行什么操作。',
                                         ),
                                       for (final message
                                           in _session?.messages ??
@@ -1494,10 +1498,10 @@ class _MobileHaorAssistantLauncherState
       return _streamError!;
     }
     if (_connectionState == _ConnectionState.connecting) {
-      return 'haor 正在连接流式会话通道，恢复后会继续接收动作和回复。';
+      return '$haorAgentDisplayName 正在连接流式会话通道，恢复后会继续接收动作和回复。';
     }
     if (_stepping || _pendingUiActions.isNotEmpty) {
-      return 'haor 正在执行当前页面动作，并会继续把结果沉淀到聊天记录里。';
+      return '$haorAgentDisplayName 正在执行当前页面动作，并会继续把结果沉淀到聊天记录里。';
     }
     if (_normalizeStatus(_task?.status.name) == 'running') {
       return '当前正在执行已批准的编排任务，如需继续输入请先中断。';
@@ -1513,10 +1517,10 @@ class _MobileHaorAssistantLauncherState
       return '当前任务执行中，输入已锁定';
     }
     if (_sending) {
-      return 'haor 正在生成回复...';
+      return '$haorAgentDisplayName 正在生成回复...';
     }
     if (_stepping) {
-      return 'haor 正在继续处理当前请求...';
+      return '$haorAgentDisplayName 正在继续处理当前请求...';
     }
     return '支持多轮追问、审批和站内动作联动';
   }
@@ -1603,7 +1607,7 @@ class _HaorFab extends StatelessWidget {
                   ),
                   const SizedBox(width: 10),
                   const Text(
-                    'haor',
+                    haorAgentDisplayName,
                     style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w800,

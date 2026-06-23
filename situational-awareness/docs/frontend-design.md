@@ -2,11 +2,11 @@
 
 ## 文档目的与适用读者
 - 面向维护 `frontend/` 的前端工程师和需要联调 Web 控制台的后端工程师。
-- 重点说明页面结构、组件组织、API 调用、实时交互和 Haor 前端运行时。
+- 重点说明页面结构、组件组织、API 调用、实时交互和玄武前端运行时。
 
 ## 当前实现范围
 - 前端采用 Next.js 15 App Router、React 19、TypeScript 与 Ant Design 5。
-- 覆盖登录、总览、发现、资产、风险、修复、漏洞库、任务中心与 Haor 会话抽屉。
+- 覆盖登录、总览、发现、资产、风险、修复、漏洞库、任务中心与玄武会话抽屉。
 
 ## 核心模块与数据流
 
@@ -14,7 +14,7 @@
 - `frontend/src/app/layout.tsx`
   - 注入全局样式、Ant Design reset 和统一外壳。
 - `frontend/src/components/AppShell.tsx`
-  - 负责路由守卫、导航、顶部信息、主题、设置弹层和 Haor 入口。
+  - 负责路由守卫、导航、顶部信息、主题、设置弹层和玄武入口。
 - 页面入口主要位于：
   - `frontend/src/app/page.tsx`
   - `frontend/src/app/discovery/page.tsx`
@@ -47,21 +47,21 @@
 ### 实时交互
 - 轮询：
   - 总览页定时拉取平台实时监控指标。
-  - Haor 悬浮入口在未打开时定时拉取摘要。
+  - 玄武悬浮入口在未打开时定时拉取摘要。
 - WebSocket：
-  - Haor 会话流
+  - 玄武会话流
   - 平台日志流
   - 修复任务流
   - 移动端异常告警流对应的前端兼容接口
 
-### Haor 前端运行时
+### 玄武前端运行时
 - `frontend/src/components/HaorAgentLauncher.tsx`
   - 提供全站悬浮入口和注意力提示。
 - `frontend/src/components/HaorAgentDrawer.tsx`
   - 负责消息流、审批、恢复、打断、任务观察和安全输入弹层。
 - `frontend/src/lib/haor-browser-runtime.ts`
   - 采集路由、选中对象、DOM 摘要、表单、开放面板与候选 UI 动作。
-- 这套运行时把当前页面状态结构化后交给后端 Haor 编排层，而不是只发送纯文本消息。
+- 这套运行时把当前页面状态结构化后交给后端玄武编排层，而不是只发送纯文本消息。
 
 ## 关键代码入口
 - `frontend/src/app/layout.tsx`
@@ -85,5 +85,5 @@
 - 总体架构：[architecture.md](architecture.md)
 - 后端设计：[backend-design.md](backend-design.md)
 - 接口说明：[api-contract.md](api-contract.md)
-- Haor 设计：[haor-agent-design.md](haor-agent-design.md)
+- 玄武设计：[haor-agent-design.md](haor-agent-design.md)
 - 测试与验收：[testing-and-acceptance.md](testing-and-acceptance.md)

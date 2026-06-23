@@ -16,7 +16,7 @@ from app.services.agent.llm_replay_evaluation import evaluate_llm_replay_cases, 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Haor LLM replay regression evaluation.")
+    parser = argparse.ArgumentParser(description="Run 玄武 LLM replay regression evaluation.")
     parser.add_argument("--fixture", help="Optional JSON fixture containing recorded LLM outputs.")
     parser.add_argument("--json", action="store_true", help="Print the full machine-readable evaluation payload.")
     parser.add_argument("--fail-under", type=float, default=1.0, help="Minimum pass rate required for exit code 0.")
@@ -29,7 +29,7 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(
-            "Haor LLM replay eval: "
+            "玄武 LLM replay eval: "
             f"{result.passed}/{result.total} passed, "
             f"pass_rate={result.pass_rate:.2%}, "
             f"unsafe_auto_execute_count={result.unsafe_auto_execute_count}"

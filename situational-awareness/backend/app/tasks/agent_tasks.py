@@ -13,7 +13,16 @@ from app.db.models.agent_session import AgentSession
 from app.db.models.enums import TaskExecutionStatus
 from app.db.session import SessionLocal
 from app.repositories.task_repo import get_task_run, update_task_run
+from app.services.agent.async_state import (
+    AsyncStatePatch,
+    build_orchestrate_progress_result as build_async_orchestrate_progress_result,
+    merge_task_async_state,
+    serialize_celery_payload,
+    suspend_agent_session,
+)
+from app.services.agent.tool_rbac import ToolRbacError
 from app.services.haor_agent_service import (
+    AGENT_DISPLAY_NAME,
     append_blocked_action_result_message,
     append_agent_task_message,
     build_auto_action_task_followup_content,
@@ -83,33 +92,38 @@ def _build_orchestrate_progress_result(
     task_run_id: str,
     *,
     runtime_patch: dict[str, Any],
+    async_patch: AsyncStatePatch | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     current_result = _load_task_result_json(task_run_id)
-    execution = current_result.get("execution") if isinstance(current_result.get("execution"), dict) else {}
-    current_result["execution"] = _deep_merge_dict(execution, {"runtime": runtime_patch})
-    return current_result
+    return build_async_orchestrate_progress_result(
+        current_result,
+        runtime_patch=runtime_patch,
+        async_patch=async_patch,
+    )
 
 
 def _humanize_orchestrate_error(exc: Exception) -> str:
     raw_message = str(exc).strip()
     if not raw_message:
-        return "haor 编排执行失败，请稍后重试"
+        return f"{AGENT_DISPLAY_NAME} 编排执行失败，请稍后重试"
     if isinstance(exc, DetachedInstanceError) or (
         "is not bound to a Session" in raw_message and "attribute refresh operation cannot proceed" in raw_message
     ):
         return "会话状态已过期，请刷新页面后重试"
+    if isinstance(exc, ToolRbacError):
+        return sanitize_text(raw_message, max_length=200, single_line=True) or "当前账号无权执行该平台动作"
     if isinstance(exc, (IntegrityError, ProgrammingError)):
         lowered = raw_message.lower()
         if "remediation_sessions_approved_by_fkey" in raw_message or (
             "remediation_sessions" in lowered and "approved_by" in lowered
         ):
             return "审批人信息无效，请刷新页面后重试"
-        return "haor 编排执行失败，请稍后重试"
+        return f"{AGENT_DISPLAY_NAME} 编排执行失败，请稍后重试"
     for message in _NON_RETRYABLE_ORCHESTRATE_ERRORS:
         if message in raw_message:
             return message
     sanitized = sanitize_text(raw_message, max_length=200, single_line=True) or ""
-    return sanitized or "haor 编排执行失败，请稍后重试"
+    return sanitized or f"{AGENT_DISPLAY_NAME} 编排执行失败，请稍后重试"
 
 
 def _is_post_verify_upstream_failure(exc: Exception) -> bool:
@@ -225,6 +239,8 @@ def _should_retry_orchestrate_error(
 ) -> bool:
     if entered_action_execution:
         return False
+    if isinstance(exc, ToolRbacError):
+        return False
     if isinstance(terminal_followup, dict) and str(terminal_followup.get("message_type") or "") == "error":
         return False
     if isinstance(exc, (IntegrityError, ProgrammingError)):
@@ -304,7 +320,7 @@ def run_agent_orchestrate_task(
                     raise RuntimeError("编排任务不存在")
                 session = db.get(AgentSession, session_id)
                 if session is None:
-                    raise RuntimeError("haor 会话不存在")
+                    raise RuntimeError(f"{AGENT_DISPLAY_NAME} 会话不存在")
                 result_json = task_run.result_json if isinstance(task_run.result_json, dict) else {}
                 plan = result_json.get("plan") if isinstance(result_json.get("plan"), dict) else {}
                 actions = plan.get("proposed_write_actions") if isinstance(plan.get("proposed_write_actions"), list) else []
@@ -316,10 +332,11 @@ def run_agent_orchestrate_task(
                 if not actions:
                     raise RuntimeError("当前编排任务未找到已批准动作")
 
+            prepare_message = f"载入 {AGENT_DISPLAY_NAME} 会话与已批准动作计划"
             set_task_progress(
                 task_run_id,
                 8,
-                "载入 haor 会话与已批准动作计划",
+                prepare_message,
                 _build_orchestrate_progress_result(
                     task_run_id,
                     runtime_patch={
@@ -327,6 +344,14 @@ def run_agent_orchestrate_task(
                         "session_id": session_id,
                         "action_count": len(actions),
                     },
+                    async_patch=AsyncStatePatch(
+                        stage="prepare",
+                        message=prepare_message,
+                        suspend_reason="awaiting_task",
+                        task_id=task_run_id,
+                        progress=8,
+                        payload={"session_id": session_id, "action_count": len(actions)},
+                    ),
                 ),
                 stage_code="agent_prepare",
                 stage_name="载入计划",
@@ -338,10 +363,11 @@ def run_agent_orchestrate_task(
                 ensure_task_not_canceled(task_run_id)
                 title = str(action.get("title") or action.get("action_type") or f"动作 {index}")
                 stage_progress = min(85, 10 + int((index - 1) * 70 / max(total_actions, 1)))
+                execute_message = f"执行动作 {index}/{total_actions}: {title}"
                 set_task_progress(
                     task_run_id,
                     stage_progress,
-                    f"执行动作 {index}/{total_actions}: {title}",
+                    execute_message,
                     _build_orchestrate_progress_result(
                         task_run_id,
                         runtime_patch={
@@ -351,6 +377,17 @@ def run_agent_orchestrate_task(
                             "action_type": action.get("action_type"),
                             "title": title,
                         },
+                        async_patch=AsyncStatePatch(
+                            stage="execute_action",
+                            message=execute_message,
+                            suspend_reason="awaiting_task",
+                            task_id=task_run_id,
+                            action_type=str(action.get("action_type") or ""),
+                            action_index=index,
+                            total_actions=total_actions,
+                            progress=stage_progress,
+                            payload={"title": title},
+                        ),
                     ),
                     stage_code="agent_execute_action",
                     stage_name="执行动作",
@@ -358,7 +395,7 @@ def run_agent_orchestrate_task(
                 with SessionLocal() as db:
                     session = db.get(AgentSession, session_id)
                     if session is None:
-                        raise RuntimeError("haor 会话不存在")
+                        raise RuntimeError(f"{AGENT_DISPLAY_NAME} 会话不存在")
                     current_goal_id = getattr(session, "current_goal_id", None)
                     entered_action_execution = True
                     result = execute_approved_action(
@@ -367,7 +404,7 @@ def run_agent_orchestrate_task(
                         session_user_id=session.user_id,
                         platform_url=str(platform_url or ""),
                     )
-                    action_result = {
+                    raw_action_result = {
                         "index": index,
                         "action_type": action.get("action_type"),
                         "title": title,
@@ -375,6 +412,8 @@ def run_agent_orchestrate_task(
                         "summary": result.summary,
                         "payload": result.payload or {},
                     }
+                    action_result = serialize_celery_payload(raw_action_result)
+                    action_result = action_result if isinstance(action_result, dict) else raw_action_result
                     action_results.append(action_result)
                     if result.child_task_id:
                         session.last_task_id = result.child_task_id
@@ -386,6 +425,19 @@ def run_agent_orchestrate_task(
                             action=action_result,
                             watching=True,
                         )
+                        suspend_agent_session(
+                            session,
+                            reason="awaiting_task",
+                            task_id=task_run_id,
+                            child_task_id=result.child_task_id,
+                            message=result.summary or f"等待子任务 {result.child_task_id} 完成",
+                            runtime_phase="awaiting_task",
+                            payload={
+                                "action_type": action.get("action_type"),
+                                "action_index": index,
+                                "total_actions": total_actions,
+                            },
+                        )
                         db.add(session)
                     task_run = get_task_run(db, task_run_id)
                     if task_run is not None:
@@ -393,6 +445,20 @@ def run_agent_orchestrate_task(
                         execution = current_result.get("execution") if isinstance(current_result.get("execution"), dict) else {}
                         execution["results"] = action_results
                         current_result["execution"] = execution
+                        current_result = merge_task_async_state(
+                            current_result,
+                            AsyncStatePatch(
+                                stage="action_dispatched",
+                                message=result.summary,
+                                suspend_reason="awaiting_task",
+                                task_id=task_run_id,
+                                child_task_id=result.child_task_id,
+                                action_type=str(action.get("action_type") or ""),
+                                action_index=index,
+                                total_actions=total_actions,
+                                progress=stage_progress,
+                            ),
+                        )
                         update_task_run(db, task_run, result_json=current_result)
                 append_current_task_event(
                     event_type="stage",
@@ -404,16 +470,38 @@ def run_agent_orchestrate_task(
                     payload_json=action_results[-1],
                 )
                 if result.child_task_id:
-                    append_current_task_event(
-                        event_type="stage",
-                        level="info",
+                    wait_message = f"等待子任务 {result.child_task_id} 完成"
+                    wait_progress = min(90, stage_progress + 5)
+                    set_task_progress(
+                        task_run_id,
+                        wait_progress,
+                        wait_message,
+                        _build_orchestrate_progress_result(
+                            task_run_id,
+                            runtime_patch={
+                                "stage": "await_child_task",
+                                "action_index": index,
+                                "total_actions": total_actions,
+                                "action_type": action.get("action_type"),
+                                "child_task_id": result.child_task_id,
+                            },
+                            async_patch=AsyncStatePatch(
+                                stage="await_child_task",
+                                message=wait_message,
+                                suspend_reason="awaiting_task",
+                                task_id=task_run_id,
+                                child_task_id=result.child_task_id,
+                                action_type=str(action.get("action_type") or ""),
+                                action_index=index,
+                                total_actions=total_actions,
+                                progress=wait_progress,
+                            ),
+                        ),
                         stage_code="agent_wait_subtask",
                         stage_name="等待子任务",
-                        message=f"等待子任务 {result.child_task_id} 完成",
-                        progress=min(90, stage_progress + 5),
-                        payload_json={"child_task_id": result.child_task_id},
                     )
-                    child_summary = wait_for_child_task(result.child_task_id)
+                    child_summary = serialize_celery_payload(wait_for_child_task(result.child_task_id))
+                    child_summary = child_summary if isinstance(child_summary, dict) else {"task_id": result.child_task_id}
                     action_results[-1]["child_task"] = child_summary
                     followup_action = {**action, "payload": result.payload or {}}
                     followup_message_type, followup_content, followup_resume_hint = build_auto_action_task_followup_content(
@@ -441,6 +529,21 @@ def run_agent_orchestrate_task(
                             execution = current_result.get("execution") if isinstance(current_result.get("execution"), dict) else {}
                             execution["results"] = action_results
                             current_result["execution"] = execution
+                            current_result = merge_task_async_state(
+                                current_result,
+                                AsyncStatePatch(
+                                    stage="child_task_finished",
+                                    message=str(child_summary.get("message") or "子任务已结束"),
+                                    suspend_reason=None,
+                                    task_id=task_run_id,
+                                    child_task_id=result.child_task_id,
+                                    action_type=str(action.get("action_type") or ""),
+                                    action_index=index,
+                                    total_actions=total_actions,
+                                    progress=min(92, wait_progress + 2),
+                                    payload={"child_status": child_summary.get("status")},
+                                ),
+                            )
                             update_task_run(db, task_run, result_json=current_result)
                     if child_summary.get("status") != TaskExecutionStatus.SUCCESS.value:
                         raise RuntimeError(followup_content)
@@ -461,16 +564,24 @@ def run_agent_orchestrate_task(
                     }
 
             ensure_task_not_canceled(task_run_id)
+            finalize_message = f"{AGENT_DISPLAY_NAME} 编排计划执行完成，正在写入总结"
             set_task_progress(
                 task_run_id,
                 92,
-                "haor 编排计划执行完成，正在写入总结",
+                finalize_message,
                 _build_orchestrate_progress_result(
                     task_run_id,
                     runtime_patch={
                         "stage": "finalize",
                         "completed_actions": len(action_results),
                     },
+                    async_patch=AsyncStatePatch(
+                        stage="finalize",
+                        message=finalize_message,
+                        task_id=task_run_id,
+                        progress=92,
+                        payload={"completed_actions": len(action_results)},
+                    ),
                 ),
                 stage_code="agent_finalize",
                 stage_name="结果收尾",
@@ -486,7 +597,7 @@ def run_agent_orchestrate_task(
                 session = db.get(AgentSession, session_id)
                 if session is not None:
                     final_message_type = "task_update"
-                    final_message_content = f"已完成本轮 haor 编排，共执行 {len(action_results)} 个动作。"
+                    final_message_content = f"已完成本轮 {AGENT_DISPLAY_NAME} 编排，共执行 {len(action_results)} 个动作。"
                     final_message_payload = {"results": action_results, "task_id": task_run_id}
                     final_watch_task_id = task_run_id
                     if len(action_results) == 1 and isinstance(terminal_followup, dict):
@@ -495,6 +606,17 @@ def run_agent_orchestrate_task(
                         followup_content = str(terminal_followup.get("content") or final_message_content)
                         followup_payload_json = followup_payload if isinstance(followup_payload, dict) else {}
                         if followup_message_type == _TERMINAL_FOLLOWUP_SECURE_INPUT:
+                            current_result = merge_task_async_state(
+                                current_result,
+                                AsyncStatePatch(
+                                    stage="awaiting_secure_input",
+                                    message=followup_content,
+                                    suspend_reason="awaiting_secure_input",
+                                    task_id=task_run_id,
+                                    progress=100,
+                                    payload={"session_id": session_id},
+                                ),
+                            )
                             transition_session_to_remediation_secure_input(
                                 db,
                                 session_id=session_id,
@@ -508,9 +630,20 @@ def run_agent_orchestrate_task(
                                 content=followup_content,
                             )
                             db.commit()
-                            set_task_success(task_run_id, "haor 编排任务完成", current_result)
+                            set_task_success(task_run_id, f"{AGENT_DISPLAY_NAME} 编排任务完成", current_result)
                             return task_run_id
                         if followup_message_type == _TERMINAL_FOLLOWUP_BLOCKED:
+                            current_result = merge_task_async_state(
+                                current_result,
+                                AsyncStatePatch(
+                                    stage="blocked",
+                                    message=followup_content,
+                                    suspend_reason="blocked",
+                                    task_id=task_run_id,
+                                    progress=100,
+                                    payload={"session_id": session_id},
+                                ),
+                            )
                             append_blocked_action_result_message(
                                 db,
                                 session_id=session_id,
@@ -524,7 +657,7 @@ def run_agent_orchestrate_task(
                                 content=followup_content,
                             )
                             db.commit()
-                            set_task_success(task_run_id, "haor 编排任务完成", current_result)
+                            set_task_success(task_run_id, f"{AGENT_DISPLAY_NAME} 编排任务完成", current_result)
                             return task_run_id
                         final_message_type = followup_message_type
                         final_message_content = followup_content
@@ -556,10 +689,38 @@ def run_agent_orchestrate_task(
                         payload_json=final_message_payload,
                         message_type=final_message_type,
                     )
+                current_result = merge_task_async_state(
+                    current_result,
+                    AsyncStatePatch(
+                        stage="completed",
+                        message=f"{AGENT_DISPLAY_NAME} 编排任务完成",
+                        task_id=task_run_id,
+                        progress=100,
+                        payload={"session_id": session_id, "completed_actions": len(action_results)},
+                    ),
+                )
                 db.commit()
-                set_task_success(task_run_id, "haor 编排任务完成", current_result)
+                set_task_success(task_run_id, f"{AGENT_DISPLAY_NAME} 编排任务完成", current_result)
     except TaskCanceledError:
         with SessionLocal() as db:
+            task_run = get_task_run(db, task_run_id)
+            if task_run is not None:
+                update_task_run(
+                    db,
+                    task_run,
+                    result_json=merge_task_async_state(
+                        task_run.result_json if isinstance(task_run.result_json, dict) else {},
+                        AsyncStatePatch(
+                            stage="interrupted",
+                            message="任务已中断",
+                            suspend_reason="interrupted",
+                            task_id=task_run_id,
+                            payload={"session_id": session_id},
+                        ),
+                    ),
+                    commit=False,
+                    refresh=False,
+                )
             mark_agent_session_interrupted(
                 db,
                 session_id=session_id,
@@ -581,9 +742,11 @@ def run_agent_orchestrate_task(
         humanized_error = _humanize_orchestrate_error(exc)
         with SessionLocal() as db:
             session = db.get(AgentSession, session_id)
+            task_run = get_task_run(db, task_run_id)
+            task_state_updated = False
             if session is not None:
                 final_message_type = "error"
-                final_message_content = f"本轮 haor 编排失败：{humanized_error}"
+                final_message_content = f"本轮 {AGENT_DISPLAY_NAME} 编排失败：{humanized_error}"
                 final_message_payload = {"task_id": task_run_id, "error": humanized_error}
                 final_watch_task_id = task_run_id
                 if isinstance(terminal_followup, dict):
@@ -618,6 +781,26 @@ def run_agent_orchestrate_task(
                     payload_json=final_message_payload,
                     message_type=final_message_type,
                 )
+            if task_run is not None:
+                update_task_run(
+                    db,
+                    task_run,
+                    result_json=merge_task_async_state(
+                        task_run.result_json if isinstance(task_run.result_json, dict) else {},
+                        AsyncStatePatch(
+                            stage="failed",
+                            message=humanized_error,
+                            suspend_reason="failed",
+                            task_id=task_run_id,
+                            progress=100,
+                            payload={"session_id": session_id, "entered_action_execution": entered_action_execution},
+                        ),
+                    ),
+                    commit=False,
+                    refresh=False,
+                )
+                task_state_updated = True
+            if session is not None or task_state_updated:
                 db.commit()
         should_retry = _should_retry_orchestrate_error(
             exc,
@@ -643,16 +826,19 @@ def run_agent_auto_followup_task(
     child_task_id: str,
     action: dict | None = None,
 ) -> str:
-    normalized_action = action if isinstance(action, dict) else {}
+    normalized_action = serialize_celery_payload(action if isinstance(action, dict) else {})
+    normalized_action = normalized_action if isinstance(normalized_action, dict) else {}
     try:
-        child_summary = wait_for_child_task(child_task_id, interval_seconds=0.5)
+        child_summary = serialize_celery_payload(wait_for_child_task(child_task_id, interval_seconds=0.5))
+        child_summary = child_summary if isinstance(child_summary, dict) else {"task_id": child_task_id}
     except Exception as exc:
-        child_summary = {
+        child_summary = serialize_celery_payload({
             "task_id": child_task_id,
             "status": TaskExecutionStatus.FAILURE.value,
             "message": str(exc),
             "error_json": {"error": str(exc)},
-        }
+        })
+        child_summary = child_summary if isinstance(child_summary, dict) else {"task_id": child_task_id}
 
     with SessionLocal() as db:
         session = db.get(AgentSession, session_id)
@@ -800,19 +986,22 @@ def run_agent_secure_post_verify_resume_task(
     action: dict | None = None,
     asset_id: str | None = None,
 ) -> str:
-    normalized_action = action if isinstance(action, dict) else {}
+    normalized_action = serialize_celery_payload(action if isinstance(action, dict) else {})
+    normalized_action = normalized_action if isinstance(normalized_action, dict) else {}
     normalized_asset_id = str(asset_id or "").strip() or (
         str((normalized_action.get("params") if isinstance(normalized_action.get("params"), dict) else {}).get("asset_id") or "").strip()
     )
     try:
-        refresh_summary = wait_for_child_task(refresh_task_id, interval_seconds=0.5)
+        refresh_summary = serialize_celery_payload(wait_for_child_task(refresh_task_id, interval_seconds=0.5))
+        refresh_summary = refresh_summary if isinstance(refresh_summary, dict) else {"task_id": refresh_task_id}
     except Exception as exc:
-        refresh_summary = {
+        refresh_summary = serialize_celery_payload({
             "task_id": refresh_task_id,
             "status": TaskExecutionStatus.FAILURE.value,
             "message": str(exc),
             "error_json": {"error": str(exc)},
-        }
+        })
+        refresh_summary = refresh_summary if isinstance(refresh_summary, dict) else {"task_id": refresh_task_id}
 
     refresh_terminal_status = str(refresh_summary.get("status") or "").strip().lower()
     if refresh_terminal_status != TaskExecutionStatus.SUCCESS.value:

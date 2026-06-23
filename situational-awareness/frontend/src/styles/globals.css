@@ -777,10 +777,6 @@ pre {
   word-break: break-word;
 }
 
-.remediation-plan-summary-grid .remediation-summary-card {
-  min-height: 0;
-}
-
 .remediation-workbench-shell {
   position: relative;
 }
@@ -856,6 +852,92 @@ pre {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.remediation-plan-summary-text {
+  display: -webkit-box;
+  margin-bottom: 0 !important;
+  overflow: hidden;
+  color: var(--text-secondary);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.remediation-plan-compact-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.remediation-stage-scroll,
+.remediation-ai-message-scroll {
+  max-height: min(58vh, 620px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.remediation-ai-message-scroll {
+  max-height: min(42vh, 420px);
+}
+
+.remediation-ai-card .ant-card-body {
+  padding: 12px 14px !important;
+}
+
+.remediation-ai-card-content {
+  width: 100% !important;
+  margin: 0 !important;
+}
+
+.remediation-ai-card-content.remediation-workbench-collapsed-summary {
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.remediation-ai-card-content.ant-space {
+  display: flex;
+}
+
+.remediation-ai-card-content .ant-space-item,
+.remediation-ai-card-content .ant-alert,
+.remediation-ai-card-content .ant-input,
+.remediation-ai-card-content .ant-list,
+.remediation-ai-card-content .ant-list-items,
+.remediation-ai-card-content .ant-list-item {
+  width: 100%;
+}
+
+.remediation-ai-card .ant-list {
+  margin: 0;
+}
+
+.remediation-ai-card .ant-list-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.remediation-ai-card .remediation-message-item {
+  margin: 0;
+}
+
+.remediation-ai-summary-text {
+  display: inline-block;
+  max-width: min(100%, 760px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remediation-ai-message-content {
+  display: -webkit-box;
+  margin-bottom: 0 !important;
+  overflow: hidden;
+  white-space: pre-wrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
 }
 
 .remediation-stage-card {
@@ -4202,6 +4284,7 @@ a {
 }
 
 .remediation-summary-card {
+  min-height: 84px;
   padding: 18px;
 }
 
@@ -4213,9 +4296,9 @@ a {
 }
 
 .remediation-summary-value {
-  margin-top: 10px;
+  margin-top: 6px;
   color: var(--text-primary);
-  font-size: 24px;
+  font-size: 21px;
   line-height: 1.08;
 }
 
@@ -4229,7 +4312,7 @@ a {
 .remediation-workbench-shell,
 .remediation-section-grid,
 .remediation-stage-stack {
-  gap: 16px;
+  gap: 12px;
 }
 
 .remediation-workbench-sidebar {
@@ -4246,7 +4329,94 @@ a {
 .remediation-step-card,
 .remediation-asset-list-card,
 .remediation-summary-card {
-  padding: 18px;
+  padding: 14px;
+}
+
+.remediation-stage-scroll {
+  max-height: min(56vh, 600px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.remediation-ai-message-scroll {
+  max-height: min(40vh, 400px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.remediation-ai-card .ant-card-body {
+  padding: 12px 14px !important;
+}
+
+.remediation-ai-card-content {
+  width: 100% !important;
+  margin: 0 !important;
+}
+
+.remediation-ai-card-content.remediation-workbench-collapsed-summary {
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.remediation-ai-card-content.ant-space {
+  display: flex;
+}
+
+.remediation-ai-card-content .ant-space-item,
+.remediation-ai-card-content .ant-alert,
+.remediation-ai-card-content .ant-input,
+.remediation-ai-card-content .ant-list,
+.remediation-ai-card-content .ant-list-items,
+.remediation-ai-card-content .ant-list-item {
+  width: 100%;
+}
+
+.remediation-ai-card .ant-list {
+  margin: 0;
+}
+
+.remediation-ai-card .ant-list-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.remediation-ai-card .remediation-message-item {
+  margin: 0;
+}
+
+.remediation-plan-summary-text {
+  display: -webkit-box;
+  margin-bottom: 0 !important;
+  overflow: hidden;
+  color: var(--text-secondary);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.remediation-plan-compact-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.remediation-ai-summary-text {
+  display: inline-block;
+  max-width: min(100%, 760px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remediation-ai-message-content {
+  display: -webkit-box;
+  margin-bottom: 0 !important;
+  overflow: hidden;
+  white-space: pre-wrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
 }
 
 .remediation-stage-card-header,
@@ -4296,6 +4466,67 @@ a {
   font-family: var(--font-code);
   font-size: 12px;
   line-height: 1.7;
+}
+
+.remote-ssh-terminal-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.remote-ssh-terminal-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.remote-ssh-terminal-notice,
+.remote-ssh-terminal-disabled {
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(173, 199, 227, 0.34);
+  background: rgba(248, 251, 255, 0.92);
+}
+
+.remote-ssh-terminal-disabled {
+  border-color: rgba(245, 158, 11, 0.3);
+  background: rgba(255, 251, 235, 0.76);
+}
+
+.remote-ssh-terminal-surface {
+  position: relative;
+  width: 100%;
+  height: clamp(320px, 48vh, 560px);
+  min-height: 320px;
+  overflow: hidden;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(71, 85, 105, 0.58);
+  background: #07111d;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 18px 36px rgba(15, 23, 42, 0.16);
+}
+
+.remote-ssh-terminal-surface .xterm {
+  height: 100%;
+  min-height: 100%;
+}
+
+.remote-ssh-terminal-surface .xterm-screen,
+.remote-ssh-terminal-surface .xterm-viewport {
+  border-radius: 6px;
+}
+
+.remote-ssh-terminal-surface .xterm-viewport {
+  background: #07111d !important;
+}
+
+.remote-ssh-terminal-surface .xterm-helper-textarea {
+  opacity: 0;
 }
 
 .remediation-workbench-command {
@@ -4369,6 +4600,31 @@ a {
   color: var(--text-secondary);
   font-size: 13px;
   line-height: 1.65;
+}
+
+.data-exchange-import-result,
+.data-exchange-export-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.data-exchange-import-result {
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(173, 199, 227, 0.22);
+  background: rgba(248, 251, 255, 0.86);
+}
+
+.data-exchange-export-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(173, 199, 227, 0.2);
+  background: rgba(248, 251, 255, 0.78);
 }
 
 .exception-shell {
@@ -5448,4 +5704,27 @@ a {
     overflow-y: visible;
     padding-right: 0;
   }
+}
+
+.settings-page {
+  width: 100%;
+}
+
+.settings-page-card {
+  min-height: 180px;
+}
+
+.settings-page-stack {
+  width: 100%;
+}
+
+.settings-page-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.settings-page-heading .ant-typography {
+  margin-bottom: 0;
 }

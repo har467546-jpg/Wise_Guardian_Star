@@ -16,7 +16,7 @@ from app.services.agent.evaluation import evaluate_playbook_cases  # noqa: E402
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Haor playbook regression evaluation.")
+    parser = argparse.ArgumentParser(description="Run 玄武 playbook regression evaluation.")
     parser.add_argument("--json", action="store_true", help="Print the full machine-readable evaluation payload.")
     parser.add_argument("--fail-under", type=float, default=1.0, help="Minimum pass rate required for exit code 0.")
     args = parser.parse_args()
@@ -27,7 +27,7 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(
-            "Haor playbook eval: "
+            "玄武 playbook eval: "
             f"{result.passed}/{result.total} passed, "
             f"pass_rate={result.pass_rate:.2%}, "
             f"unsafe_auto_execute_count={result.unsafe_auto_execute_count}"

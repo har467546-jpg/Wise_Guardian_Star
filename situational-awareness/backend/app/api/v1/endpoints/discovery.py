@@ -1,22 +1,74 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db_session
+from app.db.models.host_runner import HostRunner
 from app.db.models.enums import DiscoveryJobStatus, TaskExecutionStatus, TaskType
 from app.db.models.user import User
 from app.repositories.discovery_repo import create_job, get_active_job_by_cidr, get_job, list_jobs
 from app.repositories.task_repo import create_task_run, get_latest_task_run_for_scope, update_task_run
 from app.schemas.common import PageMeta
-from app.schemas.discovery import DiscoveryJobCreate, DiscoveryJobCreateResponse, DiscoveryJobListResponse, DiscoveryJobRead
+from app.schemas.discovery import (
+    DiscoveryJobCreate,
+    DiscoveryJobCreateResponse,
+    DiscoveryJobListResponse,
+    DiscoveryJobRead,
+    DiscoveryRunnerOptionRead,
+    DiscoverySchedulingOptionRead,
+)
+from app.schemas.campus import ScannerZoneRead
 from app.services.campus_bootstrap_service import ensure_campus_auto_bootstrap
 from app.services.campus_discovery_service import schedule_campus_discovery_job
-from app.services.campus_zone_service import find_matching_scanner_zones, get_scanner_zone
+from app.services.campus_zone_service import find_matching_scanner_zones, get_scanner_zone, list_scanner_zones
 from app.services.runner_service import resolve_runner_by_asset_for_read
 from app.tasks.scan_tasks import run_asset_scan_task
 from app.utils.net import normalize_cidr
 
 router = APIRouter()
+
+
+@router.get("/options", response_model=DiscoverySchedulingOptionRead)
+def get_discovery_scheduling_options(
+    cidr: str | None = Query(default=None),
+    db: Session = Depends(get_db_session),
+    _: User = Depends(get_current_user),
+) -> DiscoverySchedulingOptionRead:
+    normalized_cidr = normalize_cidr(cidr) if cidr else None
+    matched_zones = find_matching_scanner_zones(db, normalized_cidr) if normalized_cidr else []
+    all_enabled_zones = [zone for zone in list_scanner_zones(db, page=1, page_size=500)[0] if zone.enabled]
+    runners = db.scalars(select(HostRunner).order_by(HostRunner.updated_at.desc())).all()
+    readable_runners: list[DiscoveryRunnerOptionRead] = []
+    for runner in runners:
+        if runner.asset is None:
+            continue
+        if runner.install_status != "installed":
+            continue
+        if runner.status not in {"online", "busy"}:
+            continue
+        readable_runners.append(
+            DiscoveryRunnerOptionRead(
+                runner_id=runner.id,
+                asset_id=runner.asset_id,
+                asset_ip=str(runner.asset.ip) if getattr(runner.asset, "ip", None) is not None else None,
+                asset_hostname=getattr(runner.asset, "hostname", None),
+                status=runner.status,
+                install_status=runner.install_status,
+                version=runner.version,
+                scanner_zone_id=runner.scanner_zone_id,
+                last_seen_at=runner.last_seen_at.isoformat() if runner.last_seen_at else None,
+                detected_os=str((runner.capabilities_json or {}).get("host_facts", {}).get("os") or "").strip() or None,
+                detected_arch=str((runner.capabilities_json or {}).get("host_facts", {}).get("arch") or "").strip() or None,
+                compatibility_issues=list((runner.capabilities_json or {}).get("compatibility_issues") or []),
+                capabilities_json=dict(runner.capabilities_json or {}),
+            )
+        )
+    return DiscoverySchedulingOptionRead(
+        recommended_zone_ids=[zone.id for zone in matched_zones],
+        scanner_zones=[ScannerZoneRead.model_validate(zone) for zone in all_enabled_zones],
+        runner_assets=readable_runners,
+    )
 
 
 @router.post("/jobs", response_model=DiscoveryJobCreateResponse, status_code=status.HTTP_201_CREATED)
@@ -58,9 +110,25 @@ def create_discovery_job(
         if use_runner_dispatch:
             result_json["scan_phase"] = "baseline"
         if use_runner_dispatch:
-            return update_task_run(db, created, result_json=result_json, message="等待扫描节点接单")
+            return update_task_run(
+                db,
+                created,
+                result_json=result_json,
+                message="等待扫描节点接单",
+                execution_boundary="runner_dispatch",
+                runner_asset_id=runner_asset_id,
+                scanner_zone_id=scanner_zone_id,
+            )
         celery_task = run_asset_scan_task.delay(created.id, job_id)
-        return update_task_run(db, created, celery_task_id=celery_task.id, result_json=result_json)
+        return update_task_run(
+            db,
+            created,
+            celery_task_id=celery_task.id,
+            result_json=result_json,
+            execution_boundary="local",
+            runner_asset_id=runner_asset_id,
+            scanner_zone_id=scanner_zone_id,
+        )
 
     cidr_text = normalize_cidr(str(payload.cidr))
     runner_asset_id = str(getattr(payload, "runner_asset_id", "") or "").strip() or None

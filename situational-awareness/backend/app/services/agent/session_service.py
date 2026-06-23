@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.db.models.agent_session import AgentSession
 from app.db.models.task_run import TaskRun
 from app.db.models.user import User
+from app.services.agent.identity import AGENT_DISPLAY_NAME
 from app.services.agent.state_machine import is_active_public_session_status
 
 
@@ -85,6 +86,16 @@ def append_interrupted_task_message(
     )
 
 
+def _resolve_async_state_task_id(session: AgentSession, sanitize_line_fn) -> str:
+    for source in (getattr(session, "browser_runtime_json", None), getattr(session, "agent_state_json", None)):
+        payload = source if isinstance(source, dict) else {}
+        async_state = payload.get("async_state") if isinstance(payload.get("async_state"), dict) else {}
+        async_task_id = sanitize_line_fn(str(async_state.get("task_id") or ""), max_length=64)
+        if async_task_id:
+            return async_task_id
+    return ""
+
+
 def mark_agent_session_interrupted(
     db: Session,
     *,
@@ -121,12 +132,29 @@ def reconcile_running_session_state(
         return False
 
     task_id = sanitize_line_fn(str(session.last_task_id or ""), max_length=64)
+    watched_task_id = task_id
+    task_id = _resolve_async_state_task_id(session, sanitize_line_fn) or task_id
     if not task_id:
         restore_session_from_running_state_fn(session)
         db.add(session)
         return True
 
     task = get_task_run_fn(db, task_id)
+    if task is None or not is_session_orchestrate_task_fn(task, session_id=session.id):
+        if watched_task_id and watched_task_id != task_id:
+            watched_task = get_task_run_fn(db, watched_task_id)
+            if watched_task is not None and is_session_orchestrate_task_fn(watched_task, session_id=session.id):
+                task_id = watched_task_id
+                task = watched_task
+            else:
+                restore_session_from_running_state_fn(session)
+                db.add(session)
+                return True
+        else:
+            restore_session_from_running_state_fn(session)
+            db.add(session)
+            return True
+
     if task is None or not is_session_orchestrate_task_fn(task, session_id=session.id):
         restore_session_from_running_state_fn(session)
         db.add(session)
@@ -173,34 +201,37 @@ def interrupt_agent_session(
 ):
     session = load_recent_session_fn(db, user_id=user.id)
     if session is None:
-        raise agent_not_found_error_cls("当前 haor 会话不存在", stage="interrupt")
+        raise agent_not_found_error_cls(f"当前 {AGENT_DISPLAY_NAME} 会话不存在", stage="interrupt")
 
     if reconcile_running_session_state_fn(db, session=session, interrupted_source="session_interrupt_reconcile"):
         db.commit()
         db.refresh(session)
 
     if str(session.status or "") != "running":
-        raise agent_conflict_error_cls("当前没有运行中的 haor 编排任务", session_id=session.id, stage="interrupt")
+        raise agent_conflict_error_cls(f"当前没有运行中的 {AGENT_DISPLAY_NAME} 编排任务", session_id=session.id, stage="interrupt")
 
-    task_id = sanitize_line_fn(str(session.last_task_id or ""), max_length=64)
+    task_id = _resolve_async_state_task_id(session, sanitize_line_fn) or sanitize_line_fn(
+        str(session.last_task_id or ""),
+        max_length=64,
+    )
     if not task_id:
         restore_session_from_running_state_fn(session)
         db.commit()
         db.refresh(session)
-        raise agent_conflict_error_cls("当前没有运行中的 haor 编排任务", session_id=session.id, stage="interrupt")
+        raise agent_conflict_error_cls(f"当前没有运行中的 {AGENT_DISPLAY_NAME} 编排任务", session_id=session.id, stage="interrupt")
 
     task: TaskRun | None = get_task_run_fn(db, task_id)
     if task is None:
         restore_session_from_running_state_fn(session)
         db.commit()
         db.refresh(session)
-        raise agent_conflict_error_cls("当前没有运行中的 haor 编排任务", session_id=session.id, stage="interrupt")
+        raise agent_conflict_error_cls(f"当前没有运行中的 {AGENT_DISPLAY_NAME} 编排任务", session_id=session.id, stage="interrupt")
 
     if not is_session_orchestrate_task_fn(task, session_id=session.id):
         restore_session_from_running_state_fn(session)
         db.commit()
         db.refresh(session)
-        raise agent_conflict_error_cls("当前没有运行中的 haor 编排任务", session_id=session.id, stage="interrupt")
+        raise agent_conflict_error_cls(f"当前没有运行中的 {AGENT_DISPLAY_NAME} 编排任务", session_id=session.id, stage="interrupt")
 
     if not is_active_task_status_fn(task.status):
         restore_session_from_running_state_fn(session)
@@ -217,7 +248,7 @@ def interrupt_agent_session(
             )
         except Exception as exc:
             raise agent_upstream_error_cls(
-                f"haor 编排中断请求下发失败：{exc}",
+                f"{AGENT_DISPLAY_NAME} 编排中断请求下发失败：{exc}",
                 session_id=session.id,
                 stage="interrupt",
             ) from exc
@@ -225,7 +256,7 @@ def interrupt_agent_session(
     cancel_task_run_fn(
         db,
         task,
-        message="haor 编排任务已中断",
+        message=f"{AGENT_DISPLAY_NAME} 编排任务已中断",
         payload_json={
             "source": "agent_session_interrupt",
             "celery_task_id": task.celery_task_id,

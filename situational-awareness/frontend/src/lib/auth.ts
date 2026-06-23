@@ -1,4 +1,5 @@
 const TOKEN_KEY = "sa_access_token";
+const ROLE_KEY = "sa_user_role";
 export type StoredUserRole = "admin" | "analyst" | "";
 
 export function getStoredToken(): string {
@@ -20,6 +21,18 @@ export function clearStoredToken(): void {
     return;
   }
   window.localStorage.removeItem(TOKEN_KEY);
+  window.localStorage.removeItem(ROLE_KEY);
+}
+
+export function setStoredUserRole(role: StoredUserRole): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (!role) {
+    window.localStorage.removeItem(ROLE_KEY);
+    return;
+  }
+  window.localStorage.setItem(ROLE_KEY, role);
 }
 
 function decodeTokenPayload(token: string): Record<string, unknown> | null {
@@ -41,12 +54,7 @@ export function getStoredUserRole(): StoredUserRole {
   if (typeof window === "undefined") {
     return "";
   }
-  const token = getStoredToken();
-  if (!token) {
-    return "";
-  }
-  const payload = decodeTokenPayload(token);
-  const role = typeof payload?.role === "string" ? payload.role.toLowerCase() : "";
+  const role = (window.localStorage.getItem(ROLE_KEY) || "").toLowerCase();
   if (role === "admin" || role === "analyst") {
     return role;
   }

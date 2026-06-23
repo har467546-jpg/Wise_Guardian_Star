@@ -27,6 +27,7 @@ def _build_client(monkeypatch, db: _DummyDB) -> TestClient:  # type: ignore[no-u
 
     monkeypatch.setattr("app.main.Base.metadata.create_all", _noop_create_all)
     app = create_app()
+    monkeypatch.setattr("app.api.v1.endpoints.mobile.reconcile_stale_active_tasks", lambda _db: 0)
     app.dependency_overrides[get_db_session] = _get_test_db
     app.dependency_overrides[get_current_user] = _override_user
     return TestClient(app)
@@ -61,9 +62,14 @@ def test_mobile_overview_endpoint_returns_aggregates(monkeypatch) -> None:
         title="弱口令风险",
         description="检测到默认口令",
         evidence_json={"service_name": "ssh"},
+        identity_hash="risk-hash-1",
         detected_at=datetime(2026, 3, 19, 1, 59, tzinfo=timezone.utc),
         resolved_at=None,
         asset=SimpleNamespace(ip="10.10.0.8", hostname="srv-01"),
+        resolved_yaml_rule_id=lambda: "ssh.weak_password",
+        evidence=lambda: {"service_name": "ssh"},
+        resolved_verification_status=lambda: None,
+        resolved_match_source=lambda: None,
     )
 
     monkeypatch.setattr(
@@ -113,11 +119,20 @@ def test_risk_list_endpoint_returns_mobile_payload(monkeypatch) -> None:
         title="公开暴露",
         description="高危端口暴露",
         evidence_json={"port": 6379},
+        identity_hash="risk-hash-1",
         detected_at=datetime(2026, 3, 19, 3, 0, tzinfo=timezone.utc),
         resolved_at=None,
         asset=SimpleNamespace(ip="10.10.0.9", hostname="redis-01"),
+        governance=None,
+        waivers=[],
+        resolved_yaml_rule_id=lambda: "redis.open",
+        evidence=lambda: {"port": 6379},
+        resolved_verification_status=lambda: None,
+        resolved_match_source=lambda: None,
     )
     monkeypatch.setattr(risks_endpoint, "list_findings_page", lambda *args, **kwargs: ([risk], 1))
+    monkeypatch.setattr(risks_endpoint, "ensure_governance_for_findings", lambda *args, **kwargs: {})
+    monkeypatch.setattr(risks_endpoint, "_current_rules", lambda: [])
 
     response = client.get("/api/v1/risks", params={"severity": "critical"})
 

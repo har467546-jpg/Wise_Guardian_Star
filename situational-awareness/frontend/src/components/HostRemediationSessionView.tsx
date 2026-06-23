@@ -19,7 +19,7 @@ import {
 } from "antd";
 
 import CollapsibleJsonBlock from "@/components/CollapsibleJsonBlock";
-import DesktopPageHeader from "@/components/DesktopPageHeader";
+import RemoteSshTerminal from "@/components/RemoteSshTerminal";
 import RollbackArtifactPanel from "@/components/RollbackArtifactPanel";
 import StatusTag from "@/components/StatusTag";
 import { getStoredToken } from "@/lib/auth";
@@ -89,22 +89,6 @@ function workbenchStatusLabel(status: string | null | undefined): string {
       return "已中断";
     default:
       return "未知";
-  }
-}
-
-function workbenchStatusTone(status: string | null | undefined): "neutral" | "accent" | "success" | "warning" | "danger" {
-  switch (String(status || "").trim().toLowerCase()) {
-    case "ready":
-    case "completed":
-      return "success";
-    case "running":
-      return "accent";
-    case "failed":
-      return "danger";
-    case "canceled":
-      return "warning";
-    default:
-      return "neutral";
   }
 }
 
@@ -466,6 +450,7 @@ type WorkbenchViewState = {
   planGuideOpen: boolean;
   runnerDetailsOpen: boolean;
   aiOpen: boolean;
+  terminalOpen: boolean;
   outputOpen: boolean;
 };
 
@@ -479,6 +464,7 @@ function buildDefaultWorkbenchViewState(options?: { outputOpen?: boolean }): Wor
     planGuideOpen: false,
     runnerDetailsOpen: false,
     aiOpen: false,
+    terminalOpen: false,
     outputOpen: Boolean(options?.outputOpen),
   };
 }
@@ -499,6 +485,7 @@ function normalizeWorkbenchViewState(rawValue: unknown, fallback: WorkbenchViewS
     planGuideOpen: typeof record.planGuideOpen === "boolean" ? record.planGuideOpen : fallback.planGuideOpen,
     runnerDetailsOpen: typeof record.runnerDetailsOpen === "boolean" ? record.runnerDetailsOpen : fallback.runnerDetailsOpen,
     aiOpen: typeof record.aiOpen === "boolean" ? record.aiOpen : fallback.aiOpen,
+    terminalOpen: typeof record.terminalOpen === "boolean" ? record.terminalOpen : fallback.terminalOpen,
     outputOpen: typeof record.outputOpen === "boolean" ? record.outputOpen : fallback.outputOpen,
   };
 }
@@ -847,11 +834,6 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
 
   const plan = session?.plan || null;
   const planStages = plan?.stages || [];
-  const remainingOpenRiskDetail = buildRecentStageOutcomeDetail({
-    findingCount: findings.length,
-    task,
-    stages: planStages,
-  });
   const currentStage =
     planStages.find((item) => item.stage_code === plan?.current_stage_code)
     || planStages.find((item) => item.gate_status === "running")
@@ -1012,6 +994,20 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
     : activeTaskId
       ? `已关联任务 ${activeTaskId}`
       : "当前暂无任务输出";
+  const terminalBlockedReasons = assetDetail
+    ? [
+        ...(!assetDetail.authorization.credential_bound ? ["当前资产未配置 SSH 管理员凭据"] : []),
+        ...(assetDetail.authorization.admin_authorized ? [] : ["当前 SSH 凭据尚未确认管理员授权"]),
+        ...(String(assetDetail.authorization.last_verification_status || "").trim().toLowerCase() === "success"
+          ? []
+          : ["当前 SSH 凭据尚未完成管理员权限验证"]),
+        ...(["root", "sudo"].includes(String(assetDetail.authorization.effective_privilege || "").trim().toLowerCase())
+          ? []
+          : ["当前 SSH 凭据未验证到管理员权限"]),
+      ]
+    : ["暂无资产上下文"];
+  const terminalEnabled = Boolean(assetDetail && terminalBlockedReasons.length === 0);
+  const terminalAssetLabel = assetDetail?.asset.hostname || assetDetail?.asset.ip || assetId;
 
   useEffect(() => {
     if (activeTaskId && previousTaskIdRef.current !== activeTaskId) {
@@ -1417,29 +1413,6 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
 
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      <DesktopPageHeader
-        eyebrow="漏洞修复"
-        title="修复工作台"
-        description="围绕当前资产的授权、Runner、整机修复计划和任务输出进行统一执行与追踪。"
-        meta={[
-          { label: "当前资产", value: assetDetail?.asset.hostname || assetDetail?.asset.ip || assetId, tone: "success" },
-          { label: "工作台状态", value: workbenchStatusLabel(session?.status), tone: workbenchStatusTone(session?.status) },
-          { label: "剩余开放风险", value: findings.length, detail: remainingOpenRiskDetail, tone: findings.length ? "danger" : "neutral" },
-          { label: "当前任务", value: activeTaskId || "无", tone: activeTaskId ? "accent" : "neutral" },
-        ]}
-        actions={(
-          <Space wrap>
-            <Button onClick={() => router.push("/remediation")}>返回资产选择</Button>
-            <Button onClick={() => activeTaskId && router.push(`/tasks/${activeTaskId}`)} disabled={!activeTaskId}>
-              查看任务详情
-            </Button>
-            <Button onClick={() => void onRefresh()} loading={assetLoading || sessionLoading || taskLoading}>
-              刷新工作台
-            </Button>
-          </Space>
-        )}
-      />
-
       {error ? <Alert type="error" showIcon message={error} /> : null}
 
       <div className="remediation-summary-grid">
@@ -1647,6 +1620,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                   </Space>
 
                   <Space wrap>
+                    <Button onClick={() => router.push("/remediation")}>返回资产选择</Button>
                     <Button
                       type="primary"
                       onClick={() => void onApprove("dry_run")}
@@ -1750,26 +1724,15 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                         {session.plan.blocked_stage_count ? <Tag color="orange">{session.plan.blocked_stage_count} 个阻塞阶段</Tag> : null}
                       </Space>
 
-                      <Typography.Paragraph style={{ marginBottom: 0 }}>{session.plan.summary_text}</Typography.Paragraph>
+                      <Typography.Paragraph className="remediation-plan-summary-text">
+                        {session.plan.summary_text}
+                      </Typography.Paragraph>
 
-                      <div className="remediation-summary-grid remediation-plan-summary-grid">
-                        <div className="remediation-summary-card">
-                          <span className="remediation-summary-label">风险聚焦</span>
-                          <strong className="remediation-summary-value">{focusedRiskLabel}</strong>
-                          <span className="remediation-summary-detail">{serviceFilterLabel}</span>
-                        </div>
-                        <div className="remediation-summary-card">
-                          <span className="remediation-summary-label">匹配步骤</span>
-                          <strong className="remediation-summary-value">{filteredStepTotal || session.plan.steps.length}</strong>
-                          <span className="remediation-summary-detail">{stepStateFilterLabel}</span>
-                        </div>
-                        <div className="remediation-summary-card">
-                          <span className="remediation-summary-label">阶段推进</span>
-                          <strong className="remediation-summary-value">{session.plan.ready_stage_count}</strong>
-                          <span className="remediation-summary-detail">
-                            {session.plan.blocked_stage_count ? `${session.plan.blocked_stage_count} 个阶段阻塞` : "当前无阻塞阶段"}
-                          </span>
-                        </div>
+                      <div className="remediation-plan-compact-meta">
+                        <Tag>{focusedRiskLabel}</Tag>
+                        <Tag>{serviceFilterLabel}</Tag>
+                        <Tag>{stepStateFilterLabel}</Tag>
+                        <Tag>{`${filteredStepTotal || session.plan.steps.length} 个匹配步骤`}</Tag>
                       </div>
 
                       <div className="remediation-plan-filter-cluster">
@@ -1924,13 +1887,15 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                         />
                       ) : null}
 
-                      {filteredStages.length ? (
-                        <div className="remediation-stage-stack">
-                          {filteredStages.map((stage) => renderStageCard(stage))}
-                        </div>
-                      ) : (
-                        <Empty description="当前筛选条件下没有匹配的执行阶段。" />
-                      )}
+                      <div className="remediation-stage-scroll">
+                        {filteredStages.length ? (
+                          <div className="remediation-stage-stack">
+                            {filteredStages.map((stage) => renderStageCard(stage))}
+                          </div>
+                        ) : (
+                          <Empty description="当前筛选条件下没有匹配的执行阶段。" />
+                        )}
+                      </div>
 
                       {hasStageFilters && filteredBlockedMessages.length ? (
                         <Alert
@@ -1946,7 +1911,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
               </div>
 
               <Card
-                className="panel-card"
+                className="panel-card remediation-ai-card"
                 title="AI 解读与会话"
                 extra={(
                   <Space wrap className="remediation-workbench-card-extra">
@@ -1958,11 +1923,11 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                 )}
               >
                 {!viewState.aiOpen ? (
-                  <div className="remediation-workbench-collapsed-summary">
+                  <div className="remediation-workbench-collapsed-summary remediation-ai-card-content">
                     <Tag>{`${latestMessages.length} 条消息`}</Tag>
                     {aiGenerationPending ? <Tag color="processing">生成中</Tag> : null}
                     {aiGenerationError ? <Tag color="orange">已回退</Tag> : null}
-                    <Typography.Text type="secondary" className="ui-detail-wrap">
+                    <Typography.Text type="secondary" className="ui-detail-wrap remediation-ai-summary-text">
                       {latestAiMessage
                         ? latestAiMessage.content
                         : latestAuditMessage
@@ -1971,7 +1936,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                     </Typography.Text>
                   </div>
                 ) : (
-                  <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                  <Space className="remediation-ai-card-content" direction="vertical" size={10}>
                     {messageLoading ? <Alert type="info" showIcon message="正在提交会话操作..." /> : null}
                     {aiGenerationPending ? <Alert type="info" showIcon message="正在生成 AI 解读..." /> : null}
                     {aiGenerationError ? (
@@ -1985,7 +1950,7 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
 
                     <Space direction="vertical" size={8} style={{ width: "100%" }}>
                       <Input.TextArea
-                        rows={3}
+                        rows={2}
                         placeholder="可选：记录本次窗口期、影响说明或审批备注"
                         value={sessionNote}
                         onChange={(event) => setSessionNote(event.target.value)}
@@ -2012,31 +1977,62 @@ export default function HostRemediationSessionView({ assetId }: { assetId: strin
                     </Space>
 
                     {latestMessages.length ? (
-                      <List
-                        dataSource={latestMessages}
-                        renderItem={(item) => (
-                          <List.Item className="remediation-message-item">
-                            <Space direction="vertical" size={6} style={{ width: "100%" }}>
-                              <Space wrap>
-                                <Typography.Text strong>{remediationMessageAuthorLabel(item.role, item.message_type)}</Typography.Text>
-                                <Tag color={remediationMessageTagColor(item.message_type)}>
-                                  {remediationMessageTypeLabel(item.message_type)}
-                                </Tag>
+                      <div className="remediation-ai-message-scroll">
+                        <List
+                          dataSource={latestMessages}
+                          renderItem={(item) => (
+                            <List.Item className="remediation-message-item">
+                              <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                                <Space wrap>
+                                  <Typography.Text strong>{remediationMessageAuthorLabel(item.role, item.message_type)}</Typography.Text>
+                                  <Tag color={remediationMessageTagColor(item.message_type)}>
+                                    {remediationMessageTypeLabel(item.message_type)}
+                                  </Tag>
+                                </Space>
+                                <Typography.Paragraph className="remediation-ai-message-content">
+                                  {item.content}
+                                </Typography.Paragraph>
+                                <Typography.Text type="secondary">{formatDateTime(item.created_at)}</Typography.Text>
                               </Space>
-                              <Typography.Paragraph style={{ marginBottom: 0, whiteSpace: "pre-wrap" }}>
-                                {item.content}
-                              </Typography.Paragraph>
-                              <Typography.Text type="secondary">{formatDateTime(item.created_at)}</Typography.Text>
-                            </Space>
-                          </List.Item>
-                        )}
-                      />
+                            </List.Item>
+                          )}
+                        />
+                      </div>
                     ) : aiGenerationPending ? (
                       <Typography.Text type="secondary">AI 解读将在后台生成完成后自动回补到当前工作台。</Typography.Text>
                     ) : (
                       <Typography.Text type="secondary">暂无 AI 解读与会话消息。</Typography.Text>
                     )}
                   </Space>
+                )}
+              </Card>
+
+              <Card
+                className="panel-card"
+                title="交互终端"
+                extra={(
+                  <Space wrap className="remediation-workbench-card-extra">
+                    <Tag color={terminalEnabled ? "green" : "orange"}>{terminalEnabled ? "可连接" : "受限"}</Tag>
+                    <Button size="small" onClick={() => updateViewState((current) => ({ ...current, terminalOpen: !current.terminalOpen }))}>
+                      {viewState.terminalOpen ? "收起" : "展开"}
+                    </Button>
+                  </Space>
+                )}
+              >
+                {!viewState.terminalOpen ? (
+                  <div className="remediation-workbench-collapsed-summary">
+                    <Tag color={terminalEnabled ? "green" : "orange"}>{terminalEnabled ? "SSH 已就绪" : "SSH 未就绪"}</Tag>
+                    <Typography.Text type="secondary" className="ui-detail-wrap">
+                      {terminalEnabled ? `${terminalAssetLabel} · ${assetDetail?.authorization.effective_privilege}` : terminalBlockedReasons.join("；")}
+                    </Typography.Text>
+                  </div>
+                ) : (
+                  <RemoteSshTerminal
+                    assetId={assetId}
+                    assetLabel={terminalAssetLabel}
+                    enabled={terminalEnabled}
+                    blockedReasons={terminalBlockedReasons}
+                  />
                 )}
               </Card>
 

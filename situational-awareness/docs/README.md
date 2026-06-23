@@ -13,8 +13,8 @@
 6. 接口说明：[api-contract.md](api-contract.md)
 7. 运行手册：[runbook.md](runbook.md)
 8. 测试与验收：[testing-and-acceptance.md](testing-and-acceptance.md)
-9. Haor 设计：[haor-agent-design.md](haor-agent-design.md)
-10. Haor 评测：[agent-evaluation.md](agent-evaluation.md)
+9. 玄武设计：[haor-agent-design.md](haor-agent-design.md)
+10. 玄武评测：[agent-evaluation.md](agent-evaluation.md)
 
 ## 标准文档
 
@@ -24,13 +24,13 @@
 
 ### 前后端实现
 - [frontend-design.md](frontend-design.md)
-  - 说明 Next.js 页面结构、组件组织、API 接入、实时交互与 Haor 前端运行时。
+  - 说明 Next.js 页面结构、组件组织、API 接入、实时交互与玄武前端运行时。
 - [backend-design.md](backend-design.md)
   - 说明 FastAPI、service/task/repository 分层、配置、安全、日志与监控。
 - [haor-agent-design.md](haor-agent-design.md)
-  - 说明 Haor 的会话模型、playbook、动作策略、审批、恢复与流式反馈。
+  - 说明玄武的会话模型、playbook、动作策略、审批、恢复与流式反馈。
 - [agent-evaluation.md](agent-evaluation.md)
-  - 说明 Haor playbook 与动作策略的离线评测集、运行方式、指标和扩展方向。
+  - 说明玄武 playbook 与动作策略的离线评测集、运行方式、指标和扩展方向。
 
 ### 数据与接口
 - [database-schema.md](database-schema.md)
@@ -49,7 +49,7 @@
   - 标准化保留迁移、联调和验证记录；这些文档用于证据留存，不作为主入口。
 
 ## 当前实现范围
-- 当前文档体系覆盖桌面端 Web 控制台、后端平台服务、任务编排、Haor 智能体、数据库模型与运维流程。
+- 当前文档体系覆盖桌面端 Web 控制台、后端平台服务、任务编排、玄武智能体、数据库模型与运维流程。
 - 移动端只在需要理解接口或告警流时做简要提及，不作为本套研发交接文档主线。
 
 ## 相关文档

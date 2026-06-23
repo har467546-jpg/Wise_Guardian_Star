@@ -5,7 +5,7 @@
 - 重点说明 FastAPI 应用结构、任务编排、配置安全、日志监控与关键代码入口。
 
 ## 当前实现范围
-- 后端当前覆盖认证、发现、采集、风险、修复、任务、日志、设置、校园扫描、移动端概览和 Haor 智能体。
+- 后端当前覆盖认证、发现、采集、风险、修复、任务、日志、设置、校园扫描、移动端概览和玄武智能体。
 - 核心技术栈为 FastAPI + SQLAlchemy 2 + Pydantic 2 + Celery 5 + Redis + PostgreSQL。
 
 ## 核心模块与数据流
@@ -49,7 +49,7 @@
   - `backend/app/tasks/risk_tasks.py`
   - `backend/app/tasks/remediation_tasks.py`
   - `backend/app/tasks/agent_tasks.py`
-- 统一任务运行状态通过 `task_runs` 与 `task_events` 记录，前端任务中心、修复工作区和 Haor 会复用同一条观测链路。
+- 统一任务运行状态通过 `task_runs` 与 `task_events` 记录，前端任务中心、修复工作区和玄武会复用同一条观测链路。
 
 ### 发现、采集、风险、修复
 - 发现链路：
@@ -88,12 +88,13 @@
 - 默认通过 Docker Compose 提供 PostgreSQL 与 Redis。
 - JWT 和敏感字段保护依赖 `SECRET_KEY`、`ENCRYPTION_KEY`。
 - 平台设置写入 `backend/.env.runtime`；运行时实际值可能覆盖 `.env.example`。
-- `backend/app/api/v1/endpoints/reports.py` 目前存在实现文件，但未挂载到 `api_router`，不属于当前对外标准 API。
+- `backend/app/api/v1/endpoints/reports.py` 已挂载到 `api_router`，属于当前对外标准 API。
+- 数据库 schema 应优先通过 Alembic 迁移维护；`create_all()` 仅适合显式启用的开发兜底场景。
 
 ## 相关文档
 - 项目总入口：[../README.md](../README.md)
 - 总体架构：[architecture.md](architecture.md)
 - 接口说明：[api-contract.md](api-contract.md)
 - 数据模型：[database-schema.md](database-schema.md)
-- Haor 设计：[haor-agent-design.md](haor-agent-design.md)
+- 玄武设计：[haor-agent-design.md](haor-agent-design.md)
 - 运行手册：[runbook.md](runbook.md)

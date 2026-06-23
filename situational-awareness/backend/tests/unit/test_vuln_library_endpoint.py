@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB
@@ -8,14 +10,16 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_db_session
 from app.api.v1.endpoints import vuln_library
 from app.db.base import Base
-from app.db.models.enums import UserRole
+from app.db.models.enums import TaskType, UserRole
+from app.db.models.task_run import TaskRun
 from app.db.models.vuln_rule_index import VulnRuleIndex
 from app.main import create_app
 from app.rules.rule_store import RuleStore
-from app.services.vuln_library_service import VulnLibrarySchemaNotReadyError, VulnLibraryService
+from app.services.vuln_library_service import VulnLibraryService
+from app.tasks import vuln_intel_tasks
 
 
 @compiles(JSONB, "sqlite")
@@ -73,6 +77,12 @@ def _build_client(tmp_path, role: UserRole, content: str = "rules: []\n") -> tup
     service = _build_service(tmp_path, content)
     app = create_app()
     app.dependency_overrides[get_current_user] = _override_user(role)
+
+    def _override_db():
+        with SessionLocal() as db:
+            yield db
+
+    app.dependency_overrides[get_db_session] = _override_db
     vuln_library.RULE_SERVICE = service
     return TestClient(app), service
 
@@ -203,18 +213,133 @@ def test_vuln_library_intel_status_endpoint_returns_summary(tmp_path) -> None:
     assert body["updated_cves"] == 0
 
 
-def test_vuln_library_intel_sync_returns_409_when_schema_not_ready(tmp_path, monkeypatch) -> None:
-    client, service = _build_client(tmp_path, UserRole.ADMIN)
+def test_vuln_library_intel_status_auto_queues_stale_sync(monkeypatch) -> None:
+    _reset_index_table()
+    status_payload = SimpleNamespace(
+        total_cves=0,
+        tracked_rule_cves=1,
+        synced_cves=0,
+        stale=True,
+        stale_count=1,
+        last_synced_at=None,
+        sources=["cve_project", "osv", "kev", "epss"],
+        updated_cves=0,
+    )
+    monkeypatch.setattr(vuln_library, "_last_auto_sync_queued_at", None)
+    monkeypatch.setattr(vuln_library, "_last_auto_sync_task_id", None)
+    monkeypatch.setattr(
+        vuln_library,
+        "RULE_SERVICE",
+        SimpleNamespace(get_status=lambda: SimpleNamespace(schema_ready=True)),
+    )
+    monkeypatch.setattr(vuln_library.sync_vuln_intel_task, "delay", lambda task_run_id: SimpleNamespace(id=f"celery-{task_run_id}"))
 
-    def _raise_schema_error():
-        raise VulnLibrarySchemaNotReadyError("数据库结构未升级，请先执行 alembic upgrade head")
+    with SessionLocal() as db:
+        auto_sync = vuln_library._queue_auto_intel_sync_if_needed(status_payload, db=db)
+    body = vuln_library._to_intel_status_read(status_payload, auto_sync=auto_sync).model_dump(mode="json")
 
-    monkeypatch.setattr(service, "sync_intel", _raise_schema_error)
+    assert body["sync_status"] == "queued"
+    assert body["sync_task_id"]
+    assert body["auto_sync_queued"] is True
+    with SessionLocal() as db:
+        task = db.get(TaskRun, body["sync_task_id"])
+        assert task is not None
+        assert task.task_type == TaskType.VULN_INTEL_SYNC
 
-    response = client.post("/api/v1/vuln-library/intel/sync")
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "数据库结构未升级，请先执行 alembic upgrade head"
+def test_vuln_library_intel_sync_queues_background_task(monkeypatch) -> None:
+    _reset_index_table()
+    status_payload = SimpleNamespace(
+        total_cves=0,
+        tracked_rule_cves=1,
+        synced_cves=0,
+        stale=False,
+        stale_count=0,
+        last_synced_at=None,
+        sources=["cve_project", "osv", "kev", "epss"],
+        updated_cves=0,
+    )
+    monkeypatch.setattr(vuln_library, "_last_auto_sync_queued_at", None)
+    monkeypatch.setattr(vuln_library, "_last_auto_sync_task_id", None)
+    monkeypatch.setattr(
+        vuln_library,
+        "RULE_SERVICE",
+        SimpleNamespace(
+            get_status=lambda: SimpleNamespace(schema_ready=True, schema_error=None),
+            get_intel_status=lambda: status_payload,
+        ),
+    )
+    monkeypatch.setattr(vuln_library.sync_vuln_intel_task, "delay", lambda task_run_id: SimpleNamespace(id=f"celery-{task_run_id}"))
+
+    with SessionLocal() as db:
+        response = vuln_library.sync_vuln_intel_catalog(SimpleNamespace(id="user-1", role=UserRole.ADMIN), db)
+
+    body = response.model_dump(mode="json")
+    assert body["sync_status"] == "queued"
+    assert body["sync_task_id"]
+    assert body["auto_sync_queued"] is True
+    with SessionLocal() as db:
+        task = db.get(TaskRun, body["sync_task_id"])
+        assert task is not None
+        assert task.task_type == TaskType.VULN_INTEL_SYNC
+
+
+def test_scheduled_vuln_intel_sync_creates_task_run(monkeypatch) -> None:
+    _reset_index_table()
+    monkeypatch.setattr(vuln_intel_tasks, "SessionLocal", SessionLocal)
+    monkeypatch.setattr(vuln_intel_tasks, "_acquire_sync_lock", lambda token, *, task_run_id: True)
+    monkeypatch.setattr(vuln_intel_tasks, "_release_sync_lock", lambda token: None)
+    monkeypatch.setattr(
+        vuln_intel_tasks,
+        "_sync_intel_payload",
+        lambda task_run_id=None: {
+            "tracked_rule_cves": 1,
+            "synced_cves": 1,
+            "updated_cves": 1,
+            "stale": False,
+            "stale_count": 0,
+            "last_synced_at": None,
+        },
+    )
+
+    result = vuln_intel_tasks.sync_vuln_intel_task.run()
+
+    assert result["tracked_rule_cves"] == 1
+    with SessionLocal() as db:
+        tasks = db.query(TaskRun).all()
+        assert len(tasks) == 1
+        assert tasks[0].task_type == TaskType.VULN_INTEL_SYNC
+        assert tasks[0].message == "漏洞情报同步任务已入队"
+
+
+def test_scheduled_vuln_intel_sync_reuses_active_task(monkeypatch) -> None:
+    _reset_index_table()
+    monkeypatch.setattr(vuln_intel_tasks, "SessionLocal", SessionLocal)
+    with SessionLocal() as db:
+        existing = vuln_library._create_vuln_intel_task_run(db)
+
+    result = vuln_intel_tasks.sync_vuln_intel_task.run()
+
+    assert result["skipped"] is True
+    assert result["task_run_id"] == existing
+    with SessionLocal() as db:
+        tasks = db.query(TaskRun).all()
+        assert len(tasks) == 1
+        assert tasks[0].id == existing
+
+
+def test_vuln_library_intel_sync_returns_409_when_schema_not_ready(monkeypatch) -> None:
+    monkeypatch.setattr(
+        vuln_library,
+        "RULE_SERVICE",
+        SimpleNamespace(get_status=lambda: SimpleNamespace(schema_ready=False, schema_error="数据库结构未升级，请先执行 alembic upgrade head")),
+    )
+
+    with SessionLocal() as db, pytest.raises(HTTPException) as exc_info:
+        vuln_library.sync_vuln_intel_catalog(SimpleNamespace(id="user-1", role=UserRole.ADMIN), db)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "数据库结构未升级，请先执行 alembic upgrade head"
 
 
 def test_vuln_library_export_supports_selected_ids_and_filters(tmp_path) -> None:

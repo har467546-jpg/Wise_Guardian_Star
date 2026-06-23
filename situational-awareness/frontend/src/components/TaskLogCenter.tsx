@@ -141,9 +141,11 @@ export default function TaskLogCenter() {
             { label: "SSH 授权深度检查", value: "info_collect" },
             { label: "风险验证", value: "risk_verify" },
             { label: "报告生成", value: "report_generate" },
+            { label: "授权凭据验证", value: "credential_verify" },
             { label: "Host Runner 安装", value: "runner_install" },
             { label: "交互式漏洞修复", value: "remediation_execute" },
             { label: "系统设置应用", value: "settings_apply" },
+            { label: "漏洞情报同步", value: "vuln_intel_sync" },
           ]} />
           <Select value={status} onChange={setStatus} style={{ width: 180 }} options={[
             { label: "全部任务状态", value: "all" },

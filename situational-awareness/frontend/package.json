@@ -9,6 +9,8 @@
     "lint": "node ./node_modules/next/dist/bin/next lint"
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "antd": "^5.28.0",
     "next": "15.5.2",
     "react": "19.1.1",

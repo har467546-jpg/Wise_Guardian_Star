@@ -19,6 +19,7 @@ from app.schemas.task import (
     TaskRunResponse,
 )
 from app.services.task_observability_service import serialize_task_detail, serialize_task_event, serialize_task_run
+from app.services.task_reconciliation_service import reconcile_stale_active_tasks
 
 router = APIRouter()
 
@@ -35,6 +36,7 @@ def get_task_events(
     db: Session = Depends(get_db_session),
     _: User = Depends(get_current_user),
 ) -> TaskEventListResponse:
+    reconcile_stale_active_tasks(db)
     items, total = list_task_events(
         db,
         page=page,
@@ -60,6 +62,7 @@ def get_task_list(
     db: Session = Depends(get_db_session),
     _: User = Depends(get_current_user),
 ) -> TaskRunListResponse:
+    reconcile_stale_active_tasks(db)
     items, total = list_task_runs(db, page=page, page_size=page_size, task_type=task_type, status=status)
     event_map = list_task_events_for_runs(db, [item.id for item in items])
     return TaskRunListResponse(
@@ -77,6 +80,7 @@ def get_task_event_list(
     db: Session = Depends(get_db_session),
     _: User = Depends(get_current_user),
 ) -> TaskEventListResponse:
+    reconcile_stale_active_tasks(db)
     task = get_task_run(db, task_id)
     if not task:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="任务不存在")
@@ -93,6 +97,7 @@ def get_task_status(
     db: Session = Depends(get_db_session),
     _: User = Depends(get_current_user),
 ) -> TaskRunDetailRead:
+    reconcile_stale_active_tasks(db)
     task = get_task_run(db, task_id)
     if not task:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="任务不存在")

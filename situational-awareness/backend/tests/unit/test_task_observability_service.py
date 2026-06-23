@@ -3,7 +3,8 @@ from datetime import datetime, timedelta, timezone
 from app.db.models.enums import TaskExecutionStatus, TaskType
 from app.db.models.task_event import TaskEvent
 from app.db.models.task_run import TaskRun
-from app.services.task_observability_service import serialize_task_detail, serialize_task_event
+from app.schemas.task import TaskRunRead
+from app.services.task_observability_service import serialize_task_detail, serialize_task_event, serialize_task_run
 
 
 def test_serialize_task_detail_builds_stage_timings_from_events() -> None:
@@ -60,6 +61,37 @@ def test_serialize_task_detail_builds_stage_timings_from_events() -> None:
     assert detail["stage_timings"][0]["duration_ms"] == 10000
     assert detail["stage_timings"][1]["duration_ms"] == 15000
     assert detail["event_count"] == 2
+
+
+def test_serialize_task_run_includes_dispatch_columns_for_schema_validation() -> None:
+    base = datetime(2026, 3, 14, 10, 0, tzinfo=timezone.utc)
+    task = TaskRun(
+        id="task-dispatch-1",
+        task_type=TaskType.ASSET_SCAN,
+        status=TaskExecutionStatus.RUNNING,
+        scope_type="discovery_job",
+        scope_id="job-1",
+        celery_task_id="celery-1",
+        execution_boundary="runner_dispatch",
+        runner_asset_id="asset-runner-1",
+        scanner_zone_id="zone-1",
+        progress=20,
+        message="扫描中",
+        retry_count=0,
+        result_json={},
+        error_json={},
+        created_at=base,
+        started_at=base,
+        finished_at=None,
+        updated_at=base,
+    )
+
+    payload = serialize_task_run(task, events=[], now=base)
+    read = TaskRunRead.model_validate(payload)
+
+    assert read.execution_boundary == "runner_dispatch"
+    assert read.runner_asset_id == "asset-runner-1"
+    assert read.scanner_zone_id == "zone-1"
 
 
 def test_serialize_task_detail_falls_back_when_no_events_exist() -> None:

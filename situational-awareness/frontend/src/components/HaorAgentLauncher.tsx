@@ -13,6 +13,7 @@ type HaorAgentLauncherProps = {
 };
 
 const HAOR_SUMMARY_POLL_INTERVAL_MS = 15_000;
+const AGENT_DISPLAY_NAME = "玄武";
 const EMPTY_HAOR_SUMMARY: AgentSessionSummary = {
   has_attention: false,
   attention_kind: "none",
@@ -86,11 +87,11 @@ export default function HaorAgentLauncher({ userRole }: HaorAgentLauncherProps) 
   return (
     <div className={`haor-fab-shell ${summary.has_attention ? "haor-fab-shell-attention" : ""}`}>
       <Badge dot={summary.has_attention} color="#dc2626" offset={[-8, 8]}>
-        <button type="button" className="haor-fab-button" onClick={() => setActivated(true)} aria-label="打开 haor 智能体">
+        <button type="button" className="haor-fab-button" onClick={() => setActivated(true)} aria-label={`打开 ${AGENT_DISPLAY_NAME} 智能体`}>
           <span className="haor-fab-ball">
             <span className="haor-fab-core" />
           </span>
-          <span className="haor-fab-label">haor</span>
+          <span className="haor-fab-label">{AGENT_DISPLAY_NAME}</span>
         </button>
       </Badge>
     </div>

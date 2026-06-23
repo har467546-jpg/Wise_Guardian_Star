@@ -18,6 +18,7 @@ from app.schemas.risk import RiskFindingMobileRead
 from app.schemas.task import TaskRunRead
 from app.services.device_alert_service import device_alert_hub
 from app.services.task_observability_service import serialize_task_run
+from app.services.task_reconciliation_service import reconcile_stale_active_tasks
 
 router = APIRouter()
 
@@ -97,6 +98,7 @@ def get_mobile_overview(
     db: Session = Depends(get_db_session),
     _: User = Depends(get_current_user),
 ) -> MobileOverviewRead:
+    reconcile_stale_active_tasks(db)
     recent_tasks, _ = list_task_runs(db, page=1, page_size=5)
     event_map = list_task_events_for_runs(db, [item.id for item in recent_tasks]) if recent_tasks else {}
     recent_risks = _list_recent_risks(db, limit=5)

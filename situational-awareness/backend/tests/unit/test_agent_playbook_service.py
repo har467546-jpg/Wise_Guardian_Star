@@ -129,7 +129,7 @@ def test_match_registered_playbook_replies_quickly_for_identity_smalltalk() -> N
 
     assert decision is not None
     assert decision.playbook_id == PLAYBOOK_QUICK_SMALLTALK
-    assert "haor" in decision.reply_markdown
+    assert "玄武" in decision.reply_markdown
 
 
 def test_match_registered_playbook_does_not_let_smalltalk_mask_business_intent() -> None:

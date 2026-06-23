@@ -31,6 +31,9 @@ class TaskRunRead(ORMModel):
     scope_type: str | None
     scope_id: str | None
     celery_task_id: str | None
+    execution_boundary: str | None
+    runner_asset_id: str | None
+    scanner_zone_id: str | None
     progress: int
     message: str | None
     retry_count: int

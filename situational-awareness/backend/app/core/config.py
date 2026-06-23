@@ -226,11 +226,19 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+pg8000://asset:asset@postgres:5432/assetdb"
     REDIS_URL: str = "redis://redis:6379/0"
     DEVICE_ALERTS_REDIS_CHANNEL: str = "sa:device_abnormal_alerts"
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_PER_MINUTE: int = 600
+    RATE_LIMIT_AUTH_PER_MINUTE: int = 60
+    RATE_LIMIT_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_REDIS_PREFIX: str = "sa:rate_limit"
+    RATE_LIMIT_EXEMPT_PATHS: str = "/health,/docs,/redoc,/openapi.json"
 
     CORS_ALLOW_ALL: bool = False
     CORS_ALLOW_ORIGINS: str = DEFAULT_PRIVATE_NETWORK_CORS_ORIGINS
     LOCAL_ASSET_IPS: str = "127.0.0.1,::1"
     SECURITY_ADMIN_CIDRS: str = ""
+    AUTO_CREATE_SCHEMA: bool = False
+    STRICT_SCHEMA_REVISION_CHECK: bool = False
 
     ENCRYPTION_KEY: str = ""
     SETTINGS_HELPER_URL: str = "http://settings-helper:8091/internal/apply"
@@ -269,6 +277,9 @@ class Settings(BaseSettings):
     DISCOVERY_NSE_TIMEOUT_SECONDS: int = 8
     DISCOVERY_NSE_HOST_CONCURRENCY: int = 8
     DISCOVERY_NSE_ENABLE_VULN_SCRIPTS: bool = True
+    DISCOVERY_WEB_PROBE_CONNECT_TIMEOUT_SECONDS: float = 1.5
+    DISCOVERY_WEB_PROBE_READ_TIMEOUT_SECONDS: float = 2.0
+    DISCOVERY_WEB_PROBE_HOST_CONCURRENCY: int = 16
     CAMPUS_DEFAULT_PORTSET_MODE: str = "top1000_plus_custom"
     CAMPUS_ALLOW_FULL_SCAN_DEFAULT: bool = False
     CAMPUS_ZONE_HOST_CONCURRENCY_LIMIT: int = 8
@@ -280,10 +291,14 @@ class Settings(BaseSettings):
     RISK_ACTIVE_VERIFY_CONNECT_TIMEOUT_SECONDS: int = 3
     RISK_ACTIVE_VERIFY_READ_TIMEOUT_SECONDS: int = 3
     RISK_ACTIVE_VERIFY_MAX_CONCURRENCY: int = 4
+    TASK_ACTIVE_STALE_AFTER_HOURS: int = 24
     RUNNER_PUBLIC_BASE_URL: str = ""
     VULN_INTEL_SYNC_TIMEOUT_SECONDS: int = 20
     VULN_INTEL_STALE_AFTER_HOURS: int = 36
-    VULN_INTEL_NVD_URL: str = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    VULN_INTEL_CVE_PROJECT_URL: str = "https://cveawg.mitre.org/api/cve"
+    VULN_INTEL_CVE_LIST_URL: str = ""
+    VULN_INTEL_OSV_URL: str = "https://api.osv.dev/v1/vulns"
+    VULN_INTEL_NVD_URL: str = ""
     VULN_INTEL_KEV_URL: str = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
     VULN_INTEL_EPSS_URL: str = "https://api.first.org/data/v1/epss"
     RUNNER_POLL_INTERVAL_SECONDS: int = 10
