@@ -1,6 +1,6 @@
 # situational-awareness-mobile
 
-独立 Flutter 移动端工程，定位为“运维分析端”，面向 `admin / analyst` 的日常查看与轻量操作。当前默认接入 `/root/Desktop/Project/situational-awareness` 这套后端；移动端首版明确不包含流量感知模块，也不试图替代桌面端的完整治理能力。
+独立 Flutter 移动端工程，定位为“运维分析端”，面向 `admin / analyst` 的日常查看与轻量操作。当前默认接入仓库内 `situational-awareness/` 这套后端；移动端首版明确不包含流量感知模块，也不试图替代桌面端的完整治理能力。
 
 ## 当前范围
 
@@ -53,7 +53,7 @@
 
 - 已生成标准 Flutter 原生工程，包含 `android/`、`ios/`、`test/`
 - 依赖已完成解析并生成 `pubspec.lock`
-- 已完成与 `/root/Desktop/Project/situational-awareness` 后端的真实联调，已验证登录、总览、风险、任务、修复、玄武相关接口
+- 已完成与 `situational-awareness/` 后端的真实联调，已验证登录、总览、风险、任务、修复、玄武相关接口
 - 已覆盖风险详情独立加载、登录页、响应式布局等页面级测试
 - 已完成依赖解析验证：`flutter pub get`
 - 当前 `flutter analyze` 已通过且无告警
@@ -94,7 +94,7 @@
 先进入工程目录：
 
 ```bash
-cd /root/Desktop/Project/situational-awareness-mobile
+cd situational-awareness-mobile
 ```
 
 拉取依赖：
@@ -103,12 +103,12 @@ cd /root/Desktop/Project/situational-awareness-mobile
 flutter pub get
 ```
 
-联调前先确认 `/root/Desktop/Project/situational-awareness` 的 Docker 链路已启动。这个移动端只负责消费接口，不会自动拉起后端服务。
+联调前先确认仓库内 `situational-awareness/` 的 Docker 链路已启动。这个移动端只负责消费接口，不会自动拉起后端服务。
 
 推荐先在后端目录启动并检查健康状态：
 
 ```bash
-cd /root/Desktop/Project/situational-awareness/infra
+cd ../situational-awareness/infra
 docker compose up -d --build
 curl http://127.0.0.1:8000/health
 ```
@@ -190,7 +190,7 @@ adb install -r build/app/outputs/flutter-apk/app-debug.apk
 如果 Flutter 运行在 Kali / Linux 虚拟机里，而 ADB server 在 Windows 宿主机上对外监听，可按当前环境这样安装到雷电或已连接设备：
 
 ```bash
-/root/Android/Sdk/platform-tools/adb -H 192.168.130.1 -P 5037 -s emulator-5554 install -r /root/Desktop/Project/situational-awareness-mobile/build/app/outputs/flutter-apk/app-debug.apk
+/root/Android/Sdk/platform-tools/adb -H 192.168.130.1 -P 5037 -s emulator-5554 install -r build/app/outputs/flutter-apk/app-debug.apk
 ```
 
 安装后可直接拉起应用：
@@ -206,14 +206,14 @@ adb install -r build/app/outputs/flutter-apk/app-debug.apk
 项目已提供一键构建并安装脚本：
 
 ```bash
-cd /root/Desktop/Project/situational-awareness-mobile
+cd situational-awareness-mobile
 tools/update_ldplayer.sh --api-base-url=http://10.0.2.2:8000/api/v1
 ```
 
 如果雷电运行在 Windows 宿主机，且当前 Linux 环境需要走宿主机 ADB server，可这样执行：
 
 ```bash
-cd /root/Desktop/Project/situational-awareness-mobile
+cd situational-awareness-mobile
 tools/update_ldplayer.sh --adb-host 192.168.130.1 --adb-port 5037 --device emulator-5554 --api-base-url=http://<宿主机可访问后端IP>:8000/api/v1
 ```
 
@@ -229,7 +229,7 @@ tools/update_ldplayer.sh --adb-host 192.168.130.1 --adb-port 5037 --device emula
 如果你只想传“雷电 IP:端口”和“后端 IP:端口”，可以直接用根目录下的 `Package_apk`：
 
 ```bash
-cd /root/Desktop/Project/situational-awareness-mobile
+cd situational-awareness-mobile
 ./Package_apk 192.168.130.1:5555 192.168.130.137:8000
 ```
 

@@ -29,7 +29,7 @@
   - 任务中心、日志中心
   - 玄武站内自治助手
 
-详细说明见：[situational-awareness/README.md](/root/Desktop/Project/situational-awareness/README.md)
+详细说明见：[situational-awareness/README.md](situational-awareness/README.md)
 
 ### 2. 移动端
 
@@ -44,7 +44,7 @@
   - 移动玄武助手入口
   - Android 前台 WebSocket 实时提醒 + 本地通知 + 后台定时同步
 
-详细说明见：[situational-awareness-mobile/README.md](/root/Desktop/Project/situational-awareness-mobile/README.md)
+详细说明见：[situational-awareness-mobile/README.md](situational-awareness-mobile/README.md)
 
 ## 桌面端与移动端分工
 
@@ -70,7 +70,7 @@
 ### 1. 启动桌面端与后端
 
 ```bash
-cd /root/Desktop/Project/situational-awareness/infra
+cd situational-awareness/infra
 docker compose up -d --build
 ```
 
@@ -83,7 +83,7 @@ docker compose up -d --build
 ### 2. 运行移动端
 
 ```bash
-cd /root/Desktop/Project/situational-awareness-mobile
+cd situational-awareness-mobile
 flutter pub get
 flutter run --dart-define=API_BASE_URL=http://<宿主机局域网IP>:8000/api/v1
 ```
@@ -96,12 +96,12 @@ flutter run --dart-define=API_BASE_URL=http://<宿主机局域网IP>:8000/api/v1
 ## 推荐阅读顺序
 
 1. 先看本文件，快速理解桌面端和移动端的整体分工
-2. 再看桌面端说明：[situational-awareness/README.md](/root/Desktop/Project/situational-awareness/README.md)
-3. 最后看移动端说明：[situational-awareness-mobile/README.md](/root/Desktop/Project/situational-awareness-mobile/README.md)
+2. 再看桌面端说明：[situational-awareness/README.md](situational-awareness/README.md)
+3. 最后看移动端说明：[situational-awareness-mobile/README.md](situational-awareness-mobile/README.md)
 
 ## 相关文档
 
-- 架构说明：[situational-awareness/docs/architecture.md](/root/Desktop/Project/situational-awareness/docs/architecture.md)
-- API 契约：[situational-awareness/docs/api-contract.md](/root/Desktop/Project/situational-awareness/docs/api-contract.md)
-- 数据库结构：[situational-awareness/docs/database-schema.md](/root/Desktop/Project/situational-awareness/docs/database-schema.md)
-- 运行手册：[situational-awareness/docs/runbook.md](/root/Desktop/Project/situational-awareness/docs/runbook.md)
+- 架构说明：[situational-awareness/docs/architecture.md](situational-awareness/docs/architecture.md)
+- API 契约：[situational-awareness/docs/api-contract.md](situational-awareness/docs/api-contract.md)
+- 数据库结构：[situational-awareness/docs/database-schema.md](situational-awareness/docs/database-schema.md)
+- 运行手册：[situational-awareness/docs/runbook.md](situational-awareness/docs/runbook.md)
