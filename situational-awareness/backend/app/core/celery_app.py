@@ -25,6 +25,7 @@ celery_app.conf.update(
         "app.tasks.verify_tasks",
         "app.tasks.vuln_intel_tasks",
         "app.tasks.secret_migration_tasks",
+        "app.tasks.model_pool_tasks",
     ],
 )
 
@@ -41,6 +42,7 @@ celery_app.conf.task_routes = {
     "app.tasks.verify_tasks.*": {"queue": "risk"},
     "app.tasks.vuln_intel_tasks.*": {"queue": "risk"},
     "app.tasks.secret_migration_tasks.*": {"queue": "maintenance"},
+    "app.tasks.model_pool_tasks.*": {"queue": "maintenance"},
 }
 
 celery_app.conf.beat_schedule = {
@@ -51,5 +53,17 @@ celery_app.conf.beat_schedule = {
     "daily-secret-cipher-migration": {
         "task": "app.tasks.secret_migration_tasks.migrate_legacy_secret_ciphertexts",
         "schedule": crontab(hour=3, minute=30),
+    },
+    "minute-model-pool-probe": {
+        "task": "app.tasks.model_pool_tasks.probe_unhealthy_model_pool_nodes",
+        "schedule": 60.0,
+    },
+    "minute-ai-gateway-cooldown-check": {
+        "task": "app.tasks.model_pool_tasks.check_cooldown_channels",
+        "schedule": 60.0,
+    },
+    "ten-second-ai-gateway-metrics-aggregation": {
+        "task": "app.tasks.model_pool_tasks.aggregate_gateway_metrics",
+        "schedule": 10.0,
     },
 }

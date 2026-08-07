@@ -31,6 +31,7 @@ from app.services.audit_log_service import (
     should_strict_audit_request,
     write_audit_log,
 )
+from app.services.ai.model_router_service import start_gateway_config_subscriber, stop_gateway_config_subscriber
 from app.services.platform_log_service import disable_platform_log_capture, enable_platform_log_capture, install_platform_log_capture
 from app.services.rate_limit_service import (
     build_rate_limit_headers,
@@ -158,8 +159,16 @@ def create_app() -> FastAPI:
         except Exception as exc:  # pragma: no cover - environment dependent
             logger.warning("Device alert hub startup skipped: %s", exc)
         try:
+            start_gateway_config_subscriber(service_name="backend")
+        except Exception as exc:  # pragma: no cover - environment dependent
+            logger.warning("AI Gateway config subscriber startup skipped: %s", exc)
+        try:
             yield
         finally:
+            try:
+                stop_gateway_config_subscriber()
+            except Exception:
+                pass
             if platform_log_capture_enabled:
                 disable_platform_log_capture()
             try:

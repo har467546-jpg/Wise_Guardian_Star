@@ -1,6 +1,7 @@
 from app.db.models.agent_message import AgentMessage
 from app.db.models.agent_goal import AgentGoal
 from app.db.models.agent_session import AgentSession
+from app.db.models.ai_channel import AIChannel
 from app.db.models.audit_log_entry import AuditLogEntry
 from app.db.models.asset import Asset, AssetPort, AssetTag
 from app.db.models.campus_data_source import CampusDataSource
@@ -31,6 +32,7 @@ __all__ = [
     "AgentMessage",
     "AgentGoal",
     "AgentSession",
+    "AIChannel",
     "AuditLogEntry",
     "Asset",
     "AssetPort",

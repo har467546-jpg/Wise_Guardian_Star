@@ -1,4 +1,5 @@
 from app.core.config import read_runtime_env_value, settings
+from app.services.ai.model_pool_service import generate_with_model_pool, model_pool_enabled
 from app.services.ai.providers import BaseProvider, LLMRequest, MockProvider, build_provider
 
 
@@ -27,6 +28,8 @@ class LLMGateway:
     def summarize(self, prompt: str) -> str:
         request = LLMRequest.from_text(prompt)
         try:
+            if model_pool_enabled():
+                return generate_with_model_pool(request, capability="any", purpose="general").content
             return self.provider.generate(request)
         except Exception as exc:
             fallback = MockProvider(f"AI 调用失败，已回退到模板摘要。原因: {exc}")

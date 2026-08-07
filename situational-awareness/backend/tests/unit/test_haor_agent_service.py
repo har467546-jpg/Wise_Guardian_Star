@@ -1764,6 +1764,55 @@ def test_run_model_once_retries_custom_proxy_with_chat_completions_on_contract_e
     assert build_calls == [(None, False), ("chat_completions", True)]
 
 
+def test_run_model_once_uses_model_pool_json_capability(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    session = SimpleNamespace(messages=[SimpleNamespace(role="user", message_type="text", content="继续")])
+    user = SimpleNamespace(role="admin")
+    captured: dict[str, object] = {}
+
+    def _fake_generate_with_model_pool(request, *, capability, purpose, wire_api_override=None, chat_json_mode=False):  # type: ignore[no-untyped-def]
+        captured["request"] = request
+        captured["capability"] = capability
+        captured["purpose"] = purpose
+        captured["wire_api_override"] = wire_api_override
+        captured["chat_json_mode"] = chat_json_mode
+        return SimpleNamespace(
+            provider_result=SimpleNamespace(
+                provider_name="custom_proxy",
+                model="gpt-json",
+                resolved_base_url="https://relay.example/v1",
+                provider=SimpleNamespace(wire_api="responses"),
+            ),
+            content='{"reply_markdown":"模型池决策成功。","conversation_state":"answer"}',
+            latency_ms=17,
+        )
+
+    def _unexpected_provider(**_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("legacy runtime provider should not be used when model pool is enabled")
+
+    monkeypatch.setattr(haor_agent_service, "_runtime_provider_mode", lambda: "custom_proxy")
+    monkeypatch.setattr(haor_agent_service, "model_pool_enabled", lambda: True)
+    monkeypatch.setattr(haor_agent_service, "generate_with_model_pool", _fake_generate_with_model_pool)
+    monkeypatch.setattr(haor_agent_service, "_build_runtime_provider", _unexpected_provider)
+
+    decision = haor_agent_service._run_model_once(
+        session=session,
+        user=user,
+        page_context={"pathname": "/", "query": {}},
+        browser_context={"pathname": "/", "query": {}, "semantic_page_context": {"page_kind": "generic"}},
+        browser_runtime={},
+        working_context={},
+        dialog_state={},
+        followup_hint={},
+        tool_traces=[],
+        allow_write_plans=True,
+        allow_auto_execute_actions=True,
+    )
+
+    assert decision.reply_markdown == "模型池决策成功。"
+    assert captured["capability"] == "json_mode"
+    assert captured["purpose"] == "agent_decision"
+
+
 def test_build_action_first_fallback_decision_resumes_from_recent_resume_hint() -> None:
     user = SimpleNamespace(role="admin")
     session = SimpleNamespace(

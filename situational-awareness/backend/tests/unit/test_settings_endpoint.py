@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api.deps import get_current_user
+from app.api.v1.endpoints import settings as settings_endpoint
 from app.db.base import Base
 from app.db.models.enums import TaskExecutionStatus, TaskType, UserRole
 from app.db.models.task_run import TaskRun
@@ -233,6 +234,26 @@ def test_get_settings_returns_secret_state(monkeypatch, tmp_path) -> None:  # ty
     assert body["llm_wire_api"] == "responses"
     assert body["llm_timeout_seconds"] == 60
     assert body["llm_api_key"]["configured"] is False
+
+
+def test_get_model_pool_status_requires_admin_and_returns_snapshot(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    client = _build_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        settings_endpoint,
+        "get_model_pool_status",
+        lambda: {
+            "enabled": True,
+            "nodes": [{"id": "primary", "healthy": True, "average_latency_ms": 123}],
+            "routing": {"agent_decision": ["primary"], "streaming_reply": ["primary"]},
+        },
+    )
+
+    response = client.get("/api/v1/settings/ai/model-pool/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is True
+    assert body["nodes"][0]["id"] == "primary"
     assert body["llm_api_key"]["editable"] is True
 
 

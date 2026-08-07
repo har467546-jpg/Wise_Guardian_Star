@@ -69,6 +69,12 @@ from app.schemas.agent import (
     AgentUIStepRequest,
 )
 from app.services.ai.providers import LLMMessage, LLMRequest, build_provider
+from app.services.ai.model_pool_service import (
+    ModelPoolCallResult,
+    generate_with_model_pool,
+    model_pool_enabled,
+    stream_with_model_pool,
+)
 from app.services.agent.async_state import AsyncStatePatch, merge_task_async_state, suspend_agent_session
 from app.services.agent.checkpoint_service import (
     delete_agent_session_checkpoint,
@@ -2883,12 +2889,20 @@ def _append_or_stream_assistant_message(
             tool_traces=tool_traces,
             working_context=working_context,
         )
-        provider = _build_runtime_provider().provider
         try:
+            if model_pool_enabled():
+                stream_result = stream_with_model_pool(
+                    reply_request,
+                    capability="streaming",
+                    purpose="streaming_reply",
+                )
+                raw_chunks = stream_result.chunks
+            else:
+                raw_chunks = _build_runtime_provider().provider.stream_generate(reply_request)
             resolved_reply = _stream_upstream_assistant_reply(
                 stream_emitter,
                 turn_id=turn_id,
-                raw_chunks=provider.stream_generate(reply_request),
+                raw_chunks=raw_chunks,
             )
             if resolved_reply:
                 final_content = resolved_reply
@@ -5203,6 +5217,70 @@ def _build_runtime_provider(
     )
 
 
+def _model_pool_provider_mode(provider_result: Any) -> str:
+    return _sanitize_line(str(getattr(provider_result, "provider_name", "") or ""), max_length=64) or _runtime_provider_mode()
+
+
+def _model_pool_provider_wire_api(provider_result: Any) -> str:
+    provider = getattr(provider_result, "provider", None)
+    return _sanitize_line(str(getattr(provider, "wire_api", "") or ""), max_length=32) or _sanitize_line(
+        str(read_runtime_env_value("LLM_WIRE_API", str(settings.LLM_WIRE_API or "responses")) or ""),
+        max_length=32,
+    )
+
+
+def _record_agent_model_call(
+    turn_trace: HaorTurnTrace | None,
+    *,
+    provider_result: Any,
+    latency_ms: int,
+    request_text: str,
+    response_text: str,
+    parsed: bool,
+    error: str | None = None,
+) -> None:
+    record_model_call(
+        turn_trace,
+        provider_name=_model_pool_provider_mode(provider_result),
+        model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
+        wire_api=_model_pool_provider_wire_api(provider_result),
+        latency_ms=latency_ms,
+        request_text=request_text,
+        response_text=response_text,
+        parsed=parsed,
+        error=error,
+    )
+
+
+def _generate_agent_model_content(
+    request: LLMRequest,
+    *,
+    provider_result: Any | None = None,
+    wire_api_override: str | None = None,
+    chat_json_mode: bool = False,
+) -> tuple[Any, str, int]:
+    if model_pool_enabled():
+        result = generate_with_model_pool(
+            request,
+            capability="json_mode",
+            purpose="agent_decision",
+            wire_api_override=wire_api_override,
+            chat_json_mode=chat_json_mode,
+        )
+        return result.provider_result, result.content, result.latency_ms
+    if provider_result is not None:
+        started_at = start_timer()
+        content = provider_result.provider.generate(request)
+        return provider_result, content, elapsed_ms(started_at)
+    provider_result = _build_runtime_provider(
+        wire_api_override=wire_api_override,
+        chat_json_mode=chat_json_mode,
+    )
+    started_at = start_timer()
+    content = provider_result.provider.generate(request)
+    return provider_result, content, elapsed_ms(started_at)
+
+
 def _extract_upstream_error_detail(response: httpx.Response) -> str:
     raw_text = response.text.strip()
     normalized_text = re.sub(r"\s+", " ", raw_text)
@@ -5396,7 +5474,6 @@ def _run_model_once(
             followup_hint=followup_hint,
             tool_traces=tool_traces,
         )
-    provider_result = _build_runtime_provider()
     request = _build_model_request(
         session=session,
         user=user,
@@ -5417,35 +5494,23 @@ def _run_model_once(
     )
     followup_reply_kind = _sanitize_line(str(followup_hint.get("reply_kind") or ""), max_length=32)
     request_text = request.flattened_text()
-    started_at = start_timer()
-    provider_name = (
-        _sanitize_line(str(getattr(provider_result, "provider_name", "") or _runtime_provider_mode()), max_length=64)
-        or _runtime_provider_mode()
-    )
-    wire_api = _sanitize_line(str(getattr(provider_result.provider, "wire_api", "") or ""), max_length=32) or _sanitize_line(
-        str(read_runtime_env_value("LLM_WIRE_API", str(settings.LLM_WIRE_API or "responses")) or ""),
-        max_length=32,
-    )
     try:
-        content = provider_result.provider.generate(request)
+        provider_result, content, latency_ms = _generate_agent_model_content(request)
     except Exception as exc:
         record_agent_error(
             error_type="model_inference_error",
             stage="model_generate",
             session_id=getattr(session, "id", None),
-            model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
-            details={"provider_name": provider_name, "wire_api": wire_api},
+            model="",
+            details={"provider_name": "model_pool" if model_pool_enabled() else _runtime_provider_mode()},
             exc=exc,
         )
         raise
-    latency_ms = elapsed_ms(started_at)
     try:
         decision = _parse_model_decision(content)
-        record_model_call(
+        _record_agent_model_call(
             turn_trace,
-            provider_name=provider_name,
-            model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
-            wire_api=wire_api,
+            provider_result=provider_result,
             latency_ms=latency_ms,
             request_text=request_text,
             response_text=content,
@@ -5453,11 +5518,9 @@ def _run_model_once(
         )
         return decision
     except Exception as exc:
-        record_model_call(
+        _record_agent_model_call(
             turn_trace,
-            provider_name=provider_name,
-            model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
-            wire_api=wire_api,
+            provider_result=provider_result,
             latency_ms=latency_ms,
             request_text=request_text,
             response_text=content,
@@ -5466,6 +5529,8 @@ def _run_model_once(
         )
         if not _is_model_decision_contract_error(exc):
             raise
+        provider_name = _model_pool_provider_mode(provider_result)
+        wire_api = _model_pool_provider_wire_api(provider_result)
         _log_model_decision_contract_issue(
             provider_name=provider_name,
             wire_api=wire_api,
@@ -5512,16 +5577,15 @@ def _run_model_once(
                 reflection_errors=reflection_errors,
             )
             reflection_request_text = reflection_request.flattened_text()
-            reflection_started_at = start_timer()
-            reflection_content = provider_result.provider.generate(reflection_request)
-            reflection_latency_ms = elapsed_ms(reflection_started_at)
+            reflection_provider_result, reflection_content, reflection_latency_ms = _generate_agent_model_content(
+                reflection_request,
+                provider_result=provider_result,
+            )
             try:
                 reflection_decision = _parse_model_decision(reflection_content)
-                record_model_call(
+                _record_agent_model_call(
                     turn_trace,
-                    provider_name=provider_name,
-                    model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
-                    wire_api=wire_api,
+                    provider_result=reflection_provider_result,
                     latency_ms=reflection_latency_ms,
                     request_text=reflection_request_text,
                     response_text=reflection_content,
@@ -5529,11 +5593,9 @@ def _run_model_once(
                 )
                 return reflection_decision
             except Exception as reflection_exc:
-                record_model_call(
+                _record_agent_model_call(
                     turn_trace,
-                    provider_name=provider_name,
-                    model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
-                    wire_api=wire_api,
+                    provider_result=reflection_provider_result,
                     latency_ms=reflection_latency_ms,
                     request_text=reflection_request_text,
                     response_text=reflection_content,
@@ -5542,10 +5604,12 @@ def _run_model_once(
                 )
                 if not _is_model_decision_contract_error(reflection_exc):
                     raise
+                reflection_provider_name = _model_pool_provider_mode(reflection_provider_result)
+                reflection_wire_api = _model_pool_provider_wire_api(reflection_provider_result)
                 _log_model_decision_contract_issue(
-                    provider_name=provider_name,
-                    wire_api=wire_api,
-                    resolved_base_url=_sanitize_line(str(getattr(provider_result, "resolved_base_url", "") or ""), max_length=255),
+                    provider_name=reflection_provider_name,
+                    wire_api=reflection_wire_api,
+                    resolved_base_url=_sanitize_line(str(getattr(reflection_provider_result, "resolved_base_url", "") or ""), max_length=255),
                     objective_kind=objective_kind,
                     followup_reply_kind=followup_reply_kind,
                     raw_preview=sanitize_text(reflection_content, max_length=800) or "",
@@ -5556,10 +5620,10 @@ def _run_model_once(
                     error_type="model_contract_error",
                     stage=f"reflection_retry_{reflection_attempt}",
                     session_id=getattr(session, "id", None),
-                    model=_sanitize_line(str(getattr(provider_result, "model", "") or ""), max_length=128),
+                    model=_sanitize_line(str(getattr(reflection_provider_result, "model", "") or ""), max_length=128),
                     details={
-                        "provider_name": provider_name,
-                        "wire_api": wire_api,
+                        "provider_name": reflection_provider_name,
+                        "wire_api": reflection_wire_api,
                         "objective_kind": objective_kind,
                         "raw_preview": sanitize_text(reflection_content, max_length=800) or "",
                     },
@@ -5571,15 +5635,13 @@ def _run_model_once(
                         "raw_response_preview": sanitize_text(reflection_content, max_length=800) or "",
                     }
                 )
-        if _sanitize_line(str(getattr(provider_result, "provider_name", "") or _runtime_provider_mode()), max_length=64) != "custom_proxy":
+        if not model_pool_enabled() and _sanitize_line(str(getattr(provider_result, "provider_name", "") or _runtime_provider_mode()), max_length=64) != "custom_proxy":
             raise
-        retry_provider_result = _build_runtime_provider(
+        retry_provider_result, retry_content, retry_latency_ms = _generate_agent_model_content(
+            request,
             wire_api_override="chat_completions",
             chat_json_mode=True,
         )
-        retry_started_at = start_timer()
-        retry_content = retry_provider_result.provider.generate(request)
-        retry_latency_ms = elapsed_ms(retry_started_at)
         retry_provider_name = _sanitize_line(
             str(getattr(retry_provider_result, "provider_name", "") or _runtime_provider_mode()),
             max_length=64,

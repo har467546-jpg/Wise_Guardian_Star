@@ -21,12 +21,14 @@ from app.schemas.settings import (
 from app.tasks.secret_migration_tasks import migrate_legacy_secret_ciphertexts_task
 from app.services.platform_settings_service import (
     complete_platform_settings_apply,
+    get_platform_llm_api_key_state,
     get_platform_settings_read,
     list_platform_ai_models,
     queue_platform_settings_apply,
     validate_platform_ai_settings,
     verify_settings_helper_token,
 )
+from app.services.ai.model_pool_service import get_model_pool_status
 
 router = APIRouter()
 
@@ -67,6 +69,15 @@ def list_platform_ai_model_options(
     _: User = Depends(get_admin_user),
 ) -> PlatformAIModelsResponse:
     return list_platform_ai_models(payload)
+
+
+@router.get("/ai/model-pool/status")
+def get_platform_ai_model_pool_status(
+    _: User = Depends(get_admin_user),
+) -> dict[str, object]:
+    payload = dict(get_model_pool_status())
+    payload["llm_api_key"] = get_platform_llm_api_key_state().model_dump()
+    return payload
 
 
 @router.post("/security/secret-cipher-migration", response_model=TaskRunResponse, status_code=status.HTTP_202_ACCEPTED)

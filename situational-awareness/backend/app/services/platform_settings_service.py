@@ -221,6 +221,10 @@ def _current_api_key_state() -> PlatformSecretFieldStateRead:
     )
 
 
+def get_platform_llm_api_key_state() -> PlatformSecretFieldStateRead:
+    return _current_api_key_state()
+
+
 def _runtime_env_snapshot() -> dict[str, str]:
     runtime_path = ensure_runtime_env_file()
     env_map = _parse_env_file(runtime_path)

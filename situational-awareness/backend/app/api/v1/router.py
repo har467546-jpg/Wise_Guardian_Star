@@ -9,6 +9,7 @@ from app.api.v1.endpoints import (
     data_exchange,
     dashboard,
     discovery,
+    gateway,
     logs,
     mobile,
     monitoring,
@@ -25,6 +26,7 @@ api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 api_router.include_router(agent.router, prefix="/agent", tags=["agent"])
+api_router.include_router(gateway.router, prefix="/gateway", tags=["gateway"])
 api_router.include_router(discovery.router, prefix="/discovery", tags=["discovery"])
 api_router.include_router(data_exchange.router, prefix="/data-exchange", tags=["data-exchange"])
 api_router.include_router(campus.router, prefix="/campus", tags=["campus"])

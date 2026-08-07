@@ -370,6 +370,9 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = ""
     LLM_WIRE_API: str = "responses"
     LLM_TIMEOUT_SECONDS: int = 60
+    LLM_MODEL_POOL: str = ""
+    LLM_MODEL_POOL_REDIS_PREFIX: str = "sa:model_pool"
+    AI_GATEWAY_REDIS_PREFIX: str = "ai_pool"
     HAOR_REPLY_REWRITE_ENABLED: bool = False
 
     model_config = SettingsConfigDict(
